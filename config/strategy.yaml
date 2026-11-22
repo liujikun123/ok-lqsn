@@ -1,0 +1,156 @@
+# 策略配置：先读数值 → 匹配规则 → 激活一套优先级方案
+#
+# 【上下文变量】（表达式里可以直接用，注意都是英文名）
+#   stamina        当前体力/精力
+#   stamina_max    体力上限
+#   stamina_ratio  体力比例 0.0~1.0
+#   gold           金币
+#   diamond        钻石
+#   tokens         今日剩余训练/参赛次数
+#   weekday        星期几，1=周一 … 7=周日
+#   is_weekend     true / false
+#   hour           当前小时 0~23
+#   date_str       日期字符串 YYYY-MM-DD
+#   days_left      本周还剩几天（周日=0）
+#
+# 【规则】从上往下匹配，第一条成立的就用它，所以越特殊的放越前面。
+# 表达式支持：and or not、比较、in [..]、+ - * /，不能调用任何函数（这是刻意限制）。
+
+rules:
+  - id: exhausted
+    desc: 体力见底，只做零消耗的事
+    when: stamina_ratio < 0.2
+    plan: 保底
+
+  - id: weekend_push
+    desc: 周末且体力充足，全速冲属性
+    when: is_weekend and stamina_ratio >= 0.8
+    plan: 周末冲量
+
+  - id: weekend_normal
+    desc: 周末体力一般，正常推进
+    when: is_weekend
+    plan: 周末常规
+
+  - id: monday_start
+    desc: 周一开局，先把体能拉起来
+    when: weekday == 1 and stamina_ratio >= 0.5
+    plan: 周一开局
+
+  - id: weekday_normal
+    desc: 工作日默认
+    when: "True"
+    plan: 均衡
+
+plans:
+  周末冲量:
+    training_priority: [体能, 投射, 运控, 防守]   # 从高到低，第一个能满足条件的就选它
+    stamina_reserve: 0            # 保留多少体力不花
+    notes_mode: 沿用我的           # 沿用我的 / 自动选择 / 按契合度最优
+    event_tendency: 收益最大       # 收益最大 / 风险最低 / 均衡
+    allow_negative_event: false   # 事件里是否接受负面结果
+    max_rounds: 3                 # 本轮最多打几场
+
+  周末常规:
+    training_priority: [体能, 投射, 运控]
+    stamina_reserve: 20
+    notes_mode: 沿用我的
+    event_tendency: 均衡
+    allow_negative_event: false
+    max_rounds: 2
+
+  周一开局:
+    training_priority: [体能, 防守, 投射]
+    stamina_reserve: 30
+    notes_mode: 自动选择
+    event_tendency: 风险最低
+    allow_negative_event: false
+    max_rounds: 2
+
+  均衡:
+    training_priority: [体能, 投射, 运控, 防守]
+    stamina_reserve: 20
+    notes_mode: 沿用我的
+    event_tendency: 均衡
+    allow_negative_event: false
+    max_rounds: 2
+
+  保底:
+    training_priority: [运控]      # 只挑最省的那项
+    stamina_reserve: 0
+    notes_mode: 沿用我的
+    event_tendency: 风险最低
+    allow_negative_event: false
+    max_rounds: 0                 # 0 = 不打训练，只领日常
+
+# 全局兜底行为
+safety:
+  unknown_page: 暂停通知      # 暂停通知 / 跳过继续  —— 遇到不认识页面时
+  gray_next_button: 暂停通知  # 「下一步」是灰色（未选人）时
+  value_jump_limit: 40        # 同一数值两帧之间跳变超过这个幅度，判定 OCR 读错，沿用上一帧
+  ocr_missing_required: 暂停通知  # 关键数值（体力）读不到时
+
+# ============ 玩家 2026-11-22 确认的规则（脚本按这个执行）============
+tuning:
+  # 扭蛋：只买「笔记继承」，一局一次，出现后本次不再检查
+  egg:
+    wanted: [笔记继承, 笔记]
+    max_price: 120
+    once_per_run: true
+
+  # 周末出行
+  trip:
+    priority: [笔记, 公园]           # 笔记 > 公园休息；玩家没提过的地点不作为优先项
+    exclude: [游戏厅]                # 游戏厅 = 拼图小游戏，规则里没要求去，直接排除
+    park_first_fill_stamina: true    # 公园：中间(+30精力+属性) / 右边(+70精力)，先补满精力
+    fallback_order: [公园, 散步, 野餐, 划船, 餐厅, 步行街]   # 分数并列/都读不到标签时的顺序
+
+  # 加强训练三选一
+  enhance:
+    strategy: max_bonus              # 优先最高加成（+102 > +78 > +48）
+
+  # 训练核心页打分（2026-11-23 连拍扫查后重写）
+  #   【已验证的事实】这页选之前能读到的只有三样：
+  #     1) 球场上出场的队友名标签（投射 2 人 / 弹跳 1 人 / 运控 0 人，各技能确实不同）
+  #        「球队经理」是场边常驻角色，不算队友
+  #     2) 技能等级 Lv.1 / Lv.2 / MAX
+  #     3) 失败率（失败 = 白扔体力）
+  #   【已推翻的假设】原来以为有「器材卡片 + 金光/彩光」，实际那批卡片只在
+  #     点完「决定」后的开训动画里出现，选之前读不到，所以 equipment 权重置 0。
+  #   打分 = 队友数 × teammate + 等级分，再按失败率打折
+  core_score:
+    teammate: 1.0
+    level_bonus:
+      Lv.1: 0.0
+      Lv.2: 0.5
+      MAX: 1.0
+    fail_weight: 1.0                 # score *= (1 - 失败率/100 × fail_weight)
+    main_char: 希雅
+    ignore_names: [球队经理, 经理, 教练]
+    equipment: 0                     # 读不到，保留字段但不起作用
+    weekday_check_yellow: true       # 只点带角标的技能
+
+  # 随机事件倾向：技能 > 精力(未溢出) > 属性；无数值的三个竖排选项默认 属性 > 精力 > 金钱
+  event:
+    priority: [技能, 精力, 属性]
+    no_value_default_order: [属性, 精力, 金钱]
+    skip_when_no_choice: true
+    unknown_fallback: first_option   # 判断不了就选第一个，影响不大
+    reject_probability: true         # 玩家 2026-11-23：概率型奖励（30%概率 属性+60）不要
+
+  # 商店
+  shop:
+    auto_buy: false                  # 先不自动买
+    free_red_packet: true            # 新品到货时看有没有 0 元红包，优先买
+    stamina_item_when_below: 30      # 精力<30 且非周末，买精力道具
+    stamina_item_only_weekday: true
+
+  # 周六：只能用本次训练人员的专属技能，一般只扭蛋或休息
+  saturday:
+    only_egg_or_rest: true
+    exclusive_skill: true
+
+  # 循环
+  loop:
+    max_rounds: 1                    # 先跑通一次
+

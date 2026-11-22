@@ -1,0 +1,242 @@
+# 状态机定义（设计稿 v0）
+#
+# 页面 = 状态(state)，按钮 = 迁移(transition)。
+# 判定顺序：从上到下匹配，第一个「所有 required 都命中 / 任一 any_of 命中」的状态胜出。
+# 现在代码里还是 `AutoTask.PAGE_RULES` 的老写法，本文件是迁移目标（见 docs/01-架构设计.md §5）。
+#
+# 字段说明
+#   id        状态 ID，代码里用
+#   name      中文名，日志里显示
+#   any_of    命中任意一个字符串 → 认为是本状态
+#   all_of    必须同时命中（用于区分长得很像的页）
+#   not_any   出现这些词就排除本状态（防误判）
+#   confirm   需要图像特征确认（见 features 段）
+#   actions   可点动作；kind: text=按文字找 / badge=找角标 / card=找卡片 / anywhere=点屏幕中间
+#   target    点了之后进入的状态
+#   verified  是否已在真机验证过（true/false/partial）
+#   note      备注（踩过的坑写这里）
+
+version: 0
+resolution: [1920, 1080]
+
+states:
+
+  # ---------- 大厅与开局 ----------
+  lobby:
+    name: 大厅
+    any_of: [社团GO, 图鉴, 成就, 薪资]
+    not_any: [第1周, 失败率, 决定]
+    verified: true
+    actions:
+      - {label: 训练, kind: text, target: script_select}
+
+  script_select:
+    name: 训练剧本
+    any_of: [训练剧本, 大师模式, 高级3阶, 托管]
+    verified: true
+    actions:
+      - {label: 启程, kind: text, target: lineup_select}
+
+  lineup_select:
+    name: 选人
+    any_of: [历史玩家阵容, 剩余, 中锋, 分卫, 大前, 小前, 控卫]
+    verified: true
+    note: 阵容/笔记/器材由玩家手工配好，脚本只负责点「下一步」
+    actions:
+      - {label: 下一步, kind: text, target: train_confirm, guard: 按钮必须是黄色}
+
+  train_confirm:
+    name: 开始训练确认
+    any_of: [开始训练]
+    all_of: [继续]
+    verified: true
+    actions:
+      - {label: 开始训练, kind: text, target: gear_bonus}
+
+  gear_bonus:
+    name: 器材初始加成（纯展示）
+    any_of: [器材初始加成]
+    verified: true
+    actions:
+      - {label: 点击屏幕, kind: anywhere, target: daily_hub}
+
+  # ---------- 每天循环的枢纽 ----------
+  daily_hub:
+    name: 每日行动页
+    any_of: [星期, 剩余, 休息]
+    all_of: [第]          # 「第N周」
+    not_any: [失败率, 决定, 训练评分]
+    verified: true
+    note: |
+      整周唯一需要决策的页面。按天不同会多出「商店/新品上市」「出行(周末)」「比赛+VS(比赛日)」。
+      精力 a/b 在顶栏，星期X 与「剩余N天」也在顶部。
+    actions:
+      - {label: 训练, kind: text, target: training_core, guard: 精力足够}
+      - {label: 休息, kind: text, target: daily_hub, guard: 精力不足}
+      - {label: 商店, kind: text, target: shop, guard: 有新品上市}
+      - {label: 出行, kind: text, target: trip_place, guard: 周末}
+      - {label: 比赛, kind: text, target: pre_match, guard: 有VS}
+
+  # ---------- 训练 ----------
+  training_core:
+    name: 训练核心
+    any_of: [失败率, 决定]
+    all_of: [Lv]           # 胶囊上有 Lv.N
+    verified: partial
+    note: |
+      只点右上角带「橙色圆底白小人」角标的技能胶囊。
+      队友 = 球场上站着的角色名标签（主力「希雅」不算）；
+      器材 = 画面中间那排卡片；金光/彩光 = 卡片外框光效。
+      打分在 strategy.yaml 的 tuning.core_score。
+    actions:
+      - {label: 带角标的技能, kind: badge, target: training_core, guard: 逐个数编队}
+      - {label: 决定, kind: text, target: train_result}
+
+  train_result:
+    name: 训练结果
+    any_of: [属性提升了, 精力降低了]
+    verified: partial
+    actions:
+      - {label: 点击屏幕继续, kind: anywhere, target: event_page}
+
+  event_page:
+    name: 随机事件
+    confirm: event_cards      # 必须靠图像特征：下半屏成排黄卡
+    not_any: [失败率, 决定]
+    verified: true
+    note: |
+      **没有标题字**，靠文字永远认不出（踩坑 #4）。
+      底部 2~3 张黄卡，每张 = 标题 + 效果，必须整块打分。
+    actions:
+      - {label: 卡片, kind: card, target: daily_hub, guard: 按 tuning.event 打分}
+      - {label: 跳过, kind: text, target: daily_hub}
+
+  enhance_train:
+    name: 加强训练
+    any_of: [请选择一种加强训练, 加强训练成功]
+    verified: partial
+    actions:
+      - {label: 最高加成(+102), kind: card, target: daily_hub}
+      - {label: 确定, kind: text, target: daily_hub}
+
+  # ---------- 商店 ----------
+  shop:
+    name: 商店
+    any_of: [上新时间, 剩余：]
+    verified: true
+    actions:
+      - {label: 0元红包, kind: card, target: shop, guard: 优先买}
+      - {label: X关闭, kind: text, target: daily_hub}
+
+  # ---------- 周末出行 ----------
+  trip_place:
+    name: 出行地点
+    any_of: [公园, 步行街, 游戏厅, 餐厅]
+    verified: true
+    note: 游戏厅 = 拼图小游戏，规则里不去，已在 exclude 名单（踩坑 #12）
+    actions:
+      - {label: 公园/笔记, kind: card, target: park_sub}
+      - {label: 前往XX, kind: text, target: minigame, guard: 选完地点后必点}
+
+  park_sub:
+    name: 公园子页
+    any_of: [在公园干点什么好呢]
+    verified: true
+    actions:
+      - {label: 野餐(精力++), kind: card, target: trip_go}
+      - {label: 划船(属性+), kind: card, target: trip_go}
+
+  trip_go:
+    name: 前往确认
+    any_of: [前往]
+    verified: partial
+    actions:
+      - {label: 前往野餐, kind: text, target: minigame}
+
+  minigame:
+    name: 小游戏
+    any_of: [拼图碎片, 收回碎片, 点击旋转拼图碎片]
+    verified: true
+    note: 规则里不玩，直接「放弃」→ 处理二次确认 → 校验是否真退出
+    actions:
+      - {label: 放弃, kind: text, target: daily_hub}
+
+  # ---------- 比赛 ----------
+  pre_match:
+    name: 赛前准备
+    any_of: [赛前准备, 跳过比赛, 前往比赛]
+    verified: partial
+    actions:
+      - {label: 跳过比赛, kind: text, target: match_mvp, guard: 玩家默认跳过}
+
+  match_mvp:
+    name: 比赛 MVP
+    any_of: [MVP, 篮板, 助攻]
+    verified: partial
+    actions:
+      - {label: 下一步, kind: text, target: match_result}
+
+  match_result:
+    name: 结算
+    any_of: [结算, 零用钱]
+    verified: partial
+    actions:
+      - {label: 下一步, kind: text, target: goal_done}
+
+  goal_done:
+    name: 目标达成
+    any_of: [目标达成, 获得奖励]
+    verified: partial
+    actions:
+      - {label: 点击屏幕继续, kind: anywhere, target: daily_hub}
+
+  # ---------- 养成 ----------
+  note_learn:
+    name: 笔记学习
+    any_of: [契合度, 学习]
+    verified: false
+    actions:
+      - {label: 学习, kind: text, target: daily_hub}
+
+  gacha:
+    name: 扭蛋
+    any_of: [请选择1个扭蛋, 能力详情]
+    verified: false
+    note: 只买含「笔记」的，一局一次（踩坑：当天时点已过，未实机验证）
+    actions:
+      - {label: 笔记扭蛋, kind: card, target: gacha_confirm}
+      - {label: 确定, kind: text, target: daily_hub}
+
+  # ---------- 收尾 ----------
+  week_summary:
+    name: 本周总结
+    any_of: [本周总结, 下一周]
+    verified: false
+    actions:
+      - {label: 下一周, kind: text, target: daily_hub}
+
+  train_end:
+    name: 训练结束
+    any_of: [训练评分, 恭喜获得, 训练结束]
+    verified: false
+    actions:
+      - {label: 下一步, kind: text, target: train_end}
+      - {label: 记录笔记, kind: text, target: lobby}
+
+# 图像特征（文字指纹搞不定的页面用这些）
+features:
+  event_cards:
+    desc: 下半屏成排黄色卡片，按列聚类，每卡取「标题行 + 效果行」
+    region: [0.08, 0.55, 0.92, 0.95]     # x1,y1,x2,y2
+    method: yellow_ratio > 0.30, 同排 >= 2 块
+  skill_badge:
+    desc: 技能胶囊右上角的橙色圆底白小人
+    search: 相对胶囊文字框「右 40~190px、上 110~25px」
+    method: 橙色掩膜 + 轮廓，16~52px 近圆块
+  gear_card:
+    desc: 画面中间横排的器材卡片（金橙色边框）
+    region: [0.15, 0.40, 0.70, 0.85]
+    method: 金色掩膜 + 闭运算 + 轮廓，面积 > 12000 且长宽比 0.8~1.8
+  card_glow:
+    desc: 卡片外框光效（金 / 彩）
+    method: 卡片内侧边框环取样 → HSV 色相分布，>=3 个色相占比超 6% 判「彩」，否则「金」
