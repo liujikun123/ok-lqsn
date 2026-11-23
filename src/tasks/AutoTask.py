@@ -58,7 +58,7 @@ PAGE_PHASE = {
     "选项": PHASE_TRAINING, "剧情事件": PHASE_TRAINING,
     "炒股小游戏": PHASE_TRAINING, "小游戏": PHASE_TRAINING,
     "商店": PHASE_TRAINING, "专注恢复": PHASE_TRAINING,
-    "体力恢复": PHASE_TRAINING,
+    "体力恢复": PHASE_TRAINING, "本周总结": PHASE_SETTLING,
 }
 
 # 「心·技·体」属性面板 —— OCR 极不稳定：实测读出过「心·支·体」「心·枝·体」，
@@ -845,6 +845,15 @@ class AutoTask(MyBaseTask):
         if "恭喜获得" in joined:
             return "恭喜获得"
         # 5. 训练中的功能页
+        #    注意：「契合度」同时出现在「笔记选择」(开训前选笔记) 和「笔记学习」(训练中) 两页，
+        #    不能见「契合度」就判笔记学习 —— 那会把开训前的选笔记页判错，走去找「学习」按钮，
+        #    结果卡在选人三连之外（2026-11-23 真实截图 OCR 测出）。先让选笔记页的独占词过关。
+        if has("选择笔记", "选择队友", "选择器材"):
+            if "选择队友" in joined:
+                return "选择队友"
+            if "选择器材" in joined:
+                return "器材选择"
+            return "笔记选择"
         if "契合度" in joined:
             return "笔记学习"
         if "请选择1个扭蛋" in joined:
@@ -855,19 +864,33 @@ class AutoTask(MyBaseTask):
             return "加强训练"
         if "上新时间" in joined:
             return "商店"
-        # 5.9 开训前的选人三连。文案独特，必须排在大厅和「训练核心」之前
-        if "选择队友" in joined:
-            return "选择队友"
-        if "选择器材" in joined:
-            return "器材选择"
-        if "选择笔记" in joined:
-            return "笔记选择"
+        # 5.9 开训前的选人三连已统一提到第 5 条之前（契合度冲突）；此处只留确认编队。
         if "确认编队" in joined or "活动加成总计" in joined:
             return "确认编队"
         if "开始训练" in joined:
             return "开始训练确认"
         # 6. 训练结果（有独特词，先判；否则会被下面的「核心页」按技能名抢走）
         if has("属性提升了", "精力降低", "触发训练后事件", "器材+", "新境界"):
+            return "训练结果"
+        # 6.9 独占词快车道：这些页面底部也挂着六项技能（投射/弹跳/…），
+        #     若掉到下面 7.2「右侧技能 ≥4」就会被误判成训练核心，对着不存在的
+        #     技能胶囊猛点空转。它们的标题词是唯一的，必须先拦。
+        #     素材来自 logs/ok-script.log 真实「未知页面」记录（1104 次里的大头）。
+        if has("本周总结", "球队评分"):
+            return "本周总结"
+        if "点击屏幕继续" in joined:
+            return "点击继续"
+        # 属性成长面板：is_attr_panel 命中就判训练结果，不再要求 ≥3 个属性词 ——
+        # 实测有整页只剩「倍率加成 心·技·体 へ」这种（OCR 把属性行全吞了），
+        # 严格计数会掉到未知页连点中间。它是点一下就过的非交互页，判训练结果最安全。
+        # 【关键排除】开训前的「额外队友/选择队友」选人页顶部也写着「额外队友」，
+        # 而「额外队友」正是 is_attr_panel 的词表之一 —— 不排除就会把它判成训练结果，
+        # 结果页分支找不到「点击屏幕继续」只能点屏幕中央，15 步卡死（14:20 实测）。
+        # 选人页有「筛选」开关或右侧 ≥2 张等级牌卡，属性面板两者都没有。
+        pick_page = (("筛选" in joined and has("下一步", "编队", "玩家阵容", "额外队友"))
+                     or (frame is not None and self._right_card_count(frame) >= 2
+                         and has("下一步", "编队", "额外队友")))
+        if is_attr_panel(joined) and not pick_page:
             return "训练结果"
         # 7. 训练核心：**右侧竖排**技能胶囊 ≥4 个才算。
         #    不能依赖「决定」二字 —— 它是黄底白字，OCR 时有时无。
@@ -3925,7 +3948,10 @@ class AutoTask(MyBaseTask):
                 self._do_shop(items, frame)
             elif page == "训练核心":
                 self._do_training_core(items, frame)
-            elif page == "点击继续":
+            elif page in ("点击继续", "本周总结"):
+                # 本周总结是比赛周结算的滚动动画页（球队评分数字一直在变），
+                # 没有明确按钮，和「点击屏幕继续」遮罩一样点一下推进即可。
+                # 以前判未知页靠点屏幕中间，评分能滚完但白占十几步且不进日志。
                 it = self._find(items, ["点击屏幕继续"]) or self._find(items, ["点击继续"])
                 if it:
                     self._click_item(it, "[点击屏幕继续]")
