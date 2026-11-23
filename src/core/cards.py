@@ -13,7 +13,9 @@ import cv2
 import numpy as np
 
 # 卡片所在的横条（画面比例）
-ROI = (0.15, 0.40, 0.70, 0.85)   # x1, y1, x2, y2
+# 器材卡实际只摆在球场中部偏左：历史样本 x 0.32~0.44、y 0.54~0.73，
+# 三张横排时最右到 x≈0.44。右边界收到 0.58，避开右侧技能列与底部属性条。
+ROI = (0.18, 0.42, 0.58, 0.82)   # x1, y1, x2, y2
 
 
 def _gold_mask(roi):
@@ -35,9 +37,15 @@ def find_cards(frame):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
+    min_w, max_w = 0.060 * w, 0.140 * w      # 1080p 实测：卡片宽 150~220px
+    min_h, max_h = 0.100 * h, 0.260 * h      # 高 140~210px
     for c in cnts:
         x, y, ww, hh = cv2.boundingRect(c)
         if ww * hh < 12000:
+            continue
+        # 尺寸上限是必须的：2026-11-23 10:32 在「赛前准备」页误检到 5 张卡，
+        # 其中一张 379x434 是左侧球队大卡片 —— 会把奖励算到错误技能上。
+        if not (min_w <= ww <= max_w and min_h <= hh <= max_h):
             continue
         if not (0.8 < hh / max(ww, 1) < 1.8):
             continue

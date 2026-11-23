@@ -57,7 +57,9 @@ class AutoTask(MyBaseTask):
             "扭蛋目标关键词": "笔记",
             "扭蛋最高价": 120,
             "加强训练策略": "最高加成",
-            "商店自动购买": False,
+            "商店自动购买": True,
+            # ↑ 打开不等于乱买：只买 0 元红包 + 精力低于阈值时的精力药，
+            #   具体见 _do_shop 与 strategy.yaml 的 tuning.shop。
             "未知页面兜底": "点屏幕中间",
             "排除地点": "游戏厅",
             "小游戏处理": "放弃",
@@ -92,6 +94,15 @@ class AutoTask(MyBaseTask):
         self.stock_picked = False
         self.slots_autofill = 0
         self.slots_empty = 0
+        # 商店有没有精力道具卖：None=本期还没进过店 / True=有 / False=没有。
+        # 「失败率全部>30 且无精力药 → 改练意识」这条规则要用它，没进店就不敢乱判。
+        self.shop_has_stamina = None
+        self.shop_bought = 0
+        # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
+        self.main_char_round = None
+        # 已知主角名池：只用于剔除 OCR 粘连词（「百希雅」= 百目鬼 + 希雅），
+        # 不作为「谁是主训」的判断依据。每轮认出新主训就补进来。
+        self.known_main_chars = ["希雅", "闪堂"]
         self.route = {}
         self.in_training = False
         self.saw_training = False
@@ -257,6 +268,42 @@ class AutoTask(MyBaseTask):
     def _all(self, items, pat):
         rx = re.compile(pat)
         return [it for it in items if rx.search(it["t"])]
+
+    def _yellow_btn_center(self, frame, it):
+        """在文字框周围找**真实的黄色按钮矩形**，返回其中心（找不到返回 None）。
+
+        2026-11-23 实测（行为卡页「请选择1个技能」）：OCR 给「确定」的框中心是 (1567,978)，
+        而按钮实体在 y 980~1052、中心 (1583,1016) —— 照着 OCR 坐标点会落在按钮上方空白处。
+        这一页连点 15 次都没反应，最后靠「连续 15 步无变化」停机。
+        所以凡是"黄底大字"的主按钮（确定/决定/开始训练…），一律以黄色矩形为准。
+        """
+        if frame is None:
+            return None
+        h, w = frame.shape[:2]
+        x1 = max(int(it["cx"] - 0.30 * w), 0)
+        x2 = min(int(it["cx"] + 0.30 * w), w)
+        y1 = max(int(it["cy"] - 0.06 * h), 0)
+        y2 = min(int(it["cy"] + 0.14 * h), h)
+        patch = frame[y1:y2, x1:x2]
+        if patch.size == 0:
+            return None
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        m = cv2.inRange(hsv, np.array((16, 110, 160)), np.array((42, 255, 255)))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for c in cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw < 0.08 * w or bh < 0.025 * h:
+                continue
+            if not (2.5 <= bw / float(bh) <= 14):
+                continue
+            if best is None or bw * bh > best[0]:
+                best = (bw * bh, bx, by, bw, bh)
+        if not best:
+            return None
+        _, bx, by, bw, bh = best
+        return (bx + x1 + bw / 2.0, by + y1 + bh / 2.0)
 
     def _click_item(self, it, why=""):
         self.log_info(f"点击「{it['t']}」@({int(it['cx'])},{int(it['cy'])}) {why}")
@@ -483,6 +530,19 @@ class AutoTask(MyBaseTask):
         #     于是对着公园页猛点「决定」坐标，卡死 15 步（2026-11-23 06:11 实测）。
         if "在公园干点什么好呢" in joined:
             return "公园子页"
+        # 1.55 确认编队页（2026-11-23 10:37 实测）
+        #      打开训练后先弹这一页：左侧「训练队伍」五人、右侧「训练笔记 / 器材」，
+        #      底部「将消耗 89/30 开始训练，确定要继续吗？」+ 黄色大按钮「开始训练」。
+        #      之前没有这条规则，每次都卡在这儿得人工点（玩家：我配好了，你直接点开始训练）。
+        if "确认编队" in joined or ("开始训练" in joined and "将消耗" in joined)                 or ("训练队伍" in joined and "开始训练" in joined):
+            return "确认编队"
+        # 1.6 剧情提议「加练」对话（2026-11-23 10:28 实测）
+        #     画面是训练馆 + 一段正文 + 两个黄按钮「稍等一下 / 那就开始吧」，
+        #     底部还挂着队伍属性面板（投射/弹跳/… 六项），于是被下面
+        #     「右侧技能 ≥4」当成训练核心 → 对着不存在的技能胶囊猛点，
+        #     采样 0/5 帧、整轮作废。必须在训练核心之前拦下来。
+        if ("那就开始吧" in joined and "稍等一下" in joined) or "提议再" in joined                 or ("加练" in joined and ("那就开始吧" in joined or "稍等一下" in joined)):
+            return "训练提议"
         # 2. 比赛整条链
         if has("赛前准备", "跳过比赛", "前往比赛"):
             return "赛前准备"
@@ -560,6 +620,19 @@ class AutoTask(MyBaseTask):
         trip_hits = [it for it in items if it["t"] in self.TRIP_NAMES]
         if "在公园干点什么好呢" in joined:
             return "公园子页"
+        # 1.55 确认编队页（2026-11-23 10:37 实测）
+        #      打开训练后先弹这一页：左侧「训练队伍」五人、右侧「训练笔记 / 器材」，
+        #      底部「将消耗 89/30 开始训练，确定要继续吗？」+ 黄色大按钮「开始训练」。
+        #      之前没有这条规则，每次都卡在这儿得人工点（玩家：我配好了，你直接点开始训练）。
+        if "确认编队" in joined or ("开始训练" in joined and "将消耗" in joined)                 or ("训练队伍" in joined and "开始训练" in joined):
+            return "确认编队"
+        # 1.6 剧情提议「加练」对话（2026-11-23 10:28 实测）
+        #     画面是训练馆 + 一段正文 + 两个黄按钮「稍等一下 / 那就开始吧」，
+        #     底部还挂着队伍属性面板（投射/弹跳/… 六项），于是被下面
+        #     「右侧技能 ≥4」当成训练核心 → 对着不存在的技能胶囊猛点，
+        #     采样 0/5 帧、整轮作废。必须在训练核心之前拦下来。
+        if ("那就开始吧" in joined and "稍等一下" in joined) or "提议再" in joined                 or ("加练" in joined and ("那就开始吧" in joined or "稍等一下" in joined)):
+            return "训练提议"
         if exact("步行街") or len(trip_hits) >= 2:
             return "出行"
         if any(t.startswith("前往") for t in texts):
@@ -761,7 +834,12 @@ class AutoTask(MyBaseTask):
         h, w = frame.shape[:2]
         ok = self._find(items, ["确定", "确认"], exact=True)
         if ok and self._is_yellow_btn(frame, ok):
-            self._click_item(ok, "[确定行为卡]")
+            spot = self._yellow_btn_center(frame, ok)
+            if spot:
+                self.log_info(f"点击「确定」@({int(spot[0])},{int(spot[1])}) [按黄色按钮定位]")
+                self.click(spot[0], spot[1])
+            else:
+                self._click_item(ok, "[确定行为卡]")
             return True
         # 有些屏（注册球员详情）没有「确定」，只有「下一步」
         nxt = self._find(items, ["下一步"], exact=True)
@@ -1060,18 +1138,81 @@ class AutoTask(MyBaseTask):
         return True
 
     def _do_shop(self, items, frame):
-        """商店：只处理 0 元红包；其余按配置不动。"""
-        if not self.config.get("商店自动购买"):
+        """商店：只做两件事 —— 买 0 元红包、精力低于阈值买精力药；其余一律不动。
+
+        玩家 2026-11-23 口径：
+          - 「只买 0 元的」：新品到货的免费/红包，其他商品不碰。
+          - 「精力值低于 50 的时候买精力药」：阈值 50（原 30），不分工作日/周末。
+          - 顺带记录**这家店到底卖不卖精力道具**，训练核心页那条
+            「失败率全部>30 且无精力药 → 改练意识」要用这个结论。
+            注意：只统计当前可见的商品，商店能滚动的话可能看不全，日志会标明。
+        """
+        cfg = self._tuning().get("shop") or {}
+        texts = [it["t"] for it in items]
+
+        # 1) 先回答「有没有精力道具在卖」——这条结论比买不买更重要
+        stamina_items = [it for it in items
+                         if "精力" in it["t"] and "精力上限" not in it["t"]
+                         and "精力消耗" not in it["t"]]
+        self.shop_has_stamina = bool(stamina_items)
+        self.log_info(f"商店：可见范围内{'有' if stamina_items else '没有'}精力道具"
+                      f"（文字 {texts[:10]}）")
+
+        if not self.config.get("商店自动购买", True):
             return self._leave(items, frame)
-        free = self._all(items, r"0\s*元|免费|红包")
-        if free:
-            self._click_item(free[0], "[0元红包]")
-            self.sleep(self.config.get("等待秒数"))
-            f2 = self._frame()
-            if f2 is not None:
-                self._click_confirm(self._texts(f2), f2)
-            return True
+
+        max_buy = int(cfg.get("max_buy_per_run", 2))
+        if self.shop_bought >= max_buy:
+            self.log_info(f"本期商店已买 {self.shop_bought} 次（上限 {max_buy}），不再买")
+            return self._leave(items, frame)
+
+        # 2) 0 元红包优先
+        if cfg.get("free_red_packet", True):
+            free = self._all(items, r"0\s*元|免费|红包")
+            if free:
+                self.shop_bought += 1
+                self._click_item(free[0], "[0元红包]")
+                self.sleep(self.config.get("等待秒数"))
+                f2 = self._frame()
+                if f2 is not None:
+                    self._click_confirm(self._texts(f2), f2)
+                return True
+
+        # 3) 精力低于阈值 → 买精力药
+        below = int(cfg.get("stamina_item_when_below", 50))
+        st = self.stamina
+        if stamina_items and st is not None and st < below:
+            it = stamina_items[0]
+            price = self._price_near(items, it, frame)
+            cap = int(cfg.get("stamina_item_max_price", 0) or 0)
+            if cap and price is not None and price > cap:
+                self.log_warning(f"精力道具 {price} 元超过上限 {cap}，不买")
+            else:
+                self.shop_bought += 1
+                self._click_item(it, f"[精力{st}<{below}-买精力药 {price if price is not None else '?'}元]")
+                self.sleep(self.config.get("等待秒数"))
+                f2 = self._frame()
+                if f2 is not None:
+                    self._click_confirm(self._texts(f2), f2)
+                return True
+        elif stamina_items and st is not None:
+            self.log_info(f"精力 {st} ≥ {below}，不买精力药")
+        elif not stamina_items:
+            self.log_info("商店没有精力道具，跳过")
+
         return self._leave(items, frame)
+
+    def _price_near(self, items, item, frame):
+        """道具卡片上/下的「N 元」价格，读不到返回 None。"""
+        best, best_d = None, 1e9
+        for it in items:
+            m = re.search(r"(\d+)\s*元", it["t"].replace(" ", ""))
+            if not m:
+                continue
+            d = abs(it["cy"] - item["cy"]) + abs(it["cx"] - item["cx"]) * 0.3
+            if d < best_d:
+                best, best_d = int(m.group(1)), d
+        return best if best_d < 400 else None
 
     def _leave(self, items, frame):
         """退出当前页面：先找关闭/取消，再点右上角 X。"""
@@ -1176,6 +1317,45 @@ class AutoTask(MyBaseTask):
             self.click_relative(0.939, 0.115)
         self.sleep(1.2)
         return True
+
+    def _do_confirm_team(self, items, frame):
+        """确认编队页：点「开始训练」真正开训。
+
+        玩家 2026-11-23：「我把人员配好了，你直接点开始训练就行」。
+        这页只做确认，不改人、不动笔记/器材（配人是玩家自己的事）。
+        """
+        it = self._find(items, ["开始训练"], exact=True) or self._find(items, ["开始训练"])
+        if it:
+            spot = self._yellow_btn_center(frame, it)
+            if spot:
+                self.log_info(f"点击「开始训练」@({int(spot[0])},{int(spot[1])}) [按黄色按钮定位]")
+                self.click(spot[0], spot[1])
+            else:
+                self._click_item(it, "[确认编队-开始训练]")
+            return True
+        self.log_warning("确认编队页没读到「开始训练」，点右下角大黄按钮")
+        self.click_relative(0.808, 0.848)
+        return True
+
+    def _do_train_offer(self, items, frame):
+        """剧情里「要不要再练一组」的提议：选「那就开始吧」。
+
+        玩家 2026-11-23 的取向是尽量练（推荐属性 +10 比跳过划算）；
+        万一只读到「稍等一下」就点它，别停在这儿。
+        """
+        for want in ("那就开始吧", "开始吧", "就这样吧"):
+            it = self._find(items, [want], exact=True)
+            if it:
+                self._click_item(it, f"[训练提议-{want}]")
+                return True
+        it = self._find(items, ["稍等一下", "稍后再说"], exact=True)
+        if it:
+            self.log_info("提议页没读到「那就开始吧」，选「稍等一下」跳过")
+            self._click_item(it, "[训练提议-稍等]")
+            return True
+        self.log_warning("训练提议页没读到按钮，点下方中间推进")
+        self.click_relative(0.5, 0.62)
+        return False
 
     def _do_train_confirm(self, items, frame):
         """训练确认弹窗：优先「继续训练」恢复上一次中断的进度。
@@ -1432,9 +1612,13 @@ class AutoTask(MyBaseTask):
         return [(x1 + c["cx"], y1 + c["cy"]) for c in clusters if len(c["ys"]) >= 40]
 
     def _read_pct(self, items):
-        """读「失败率 X%」。"""
+        """读「失败率 X%」。
+
+        2026-11-23 离线复检 sweep 截图发现：OCR 有时把「失败率0%」切成
+        「失败率0」+「%」两个框，带 % 的正则会漏读 → 先按无 % 的写法兜一层。
+        """
         for it in items:
-            m = re.search(r"失败率\s*(\d+)\s*%", it["t"].replace(" ", ""))
+            m = re.search(r"失败率\s*(\d+)", it["t"].replace(" ", ""))
             if m:
                 return int(m.group(1))
         for it in items:
@@ -1445,9 +1629,14 @@ class AutoTask(MyBaseTask):
 
     SKILLS = ["投射", "弹跳", "防守", "体能", "运控", "意识"]
     # 被训练的「主力」，他自己不算队友（录制 122 张训练核心帧里 119 张都有她）
+    # 只用于识别**粘连词**（「百希雅」=百目鬼+希雅，含主力名且超 2 字 → 判为拼接产物）。
+    # 2026-11-23 起不再用它从队友里剔人：主训每局会换，靠 _resident_names 自动判。
     MAIN_CHAR = "希雅"
-    # 球场边站着但不算队友的角色（2026-11-23 连拍扫查确认「球队经理」每场都在）
-    TEAM_NON_MATES = ("球队经理", "经理", "教练", "替补", "解说")
+    # 场上但不算队友的角色。
+    # 玩家 2026-11-23 明确：「经理也是算作队友的」→ 把球队经理/经理从名单里去掉，
+    # 场上站着的都算（含主训本人）。恒在场的角色对每个技能都是 +1，不影响排名，
+    # 剔掉反而会因为某帧 OCR 漏读而让那个技能少算一分。
+    TEAM_NON_MATES = ("替补", "解说")
     # 出现在球场上但明显不是人名的词：加成浮层条目 + 出行地点名
     MATE_STOP_WORDS = ("加成", "队友", "表情", "倍率", "一致", "额外", "组合", "概率",
                        "上限", "游戏厅", "公园", "餐厅", "步行街", "散步", "野餐", "划船")
@@ -1518,7 +1707,10 @@ class AutoTask(MyBaseTask):
             return False
         if any(w in t for w in self.MATE_STOP_WORDS):
             return False
-        if len(t) > 2 and self.MAIN_CHAR in t:
+        # 粘连词：含**任意一个已知主角名**且超过 2 字 → 判为「两个名字粘一起」。
+        # 不再只看写死的 MAIN_CHAR：主训每局会换（希雅 / 闪堂 …），
+        # 名字池随每轮识别结果自动扩充，见 _remember_main_char。
+        if len(t) > 2 and any(n in t for n in self.known_main_chars):
             return False
         return True
 
@@ -1542,7 +1734,10 @@ class AutoTask(MyBaseTask):
         return True
 
     def _do_training_core(self, items, frame):
-        """训练核心页：只点右上角带角标的技能 → 数编队（队友 / 器材 / 金光彩光）→ 打分 → 决定。"""
+        """训练核心页：只点右上角带角标的技能 → 读队友 / 器材 / 失败率 → 打分 → 决定。
+
+        每轮都从画面上重新认「主训人员」（每个技能都在场的名字），不写死名字。
+        """
         h, w = frame.shape[:2]
         rows = [it for it in items if it["t"] in self.SKILLS and it["cx"] / w > 0.70]
         rows.sort(key=lambda x: x["cy"])
@@ -1571,21 +1766,23 @@ class AutoTask(MyBaseTask):
         for idx, (r, _spot) in enumerate(targets, 1):
             self.log_info(f"—— 点开「{r['t']}」（{idx}/{len(targets)}）看编队")
             self._click_item(r, "[展开编队]")
-            self.sleep(0.9)
-
-            # 连拍投票取稳定读数：过渡期 OCR 会把相邻名字粘成一个（百目鬼+希雅→「百希雅」）
-            mates, pct, level = self._sample_core(r)
-            score = self._score_core(mates, level, pct, cfg)
+            # 选中态会一直保留，起手等 0.4s 就够（由 _sample_core 的 warmup 控制）
+            names, pct, level, equips = self._sample_core(r)
+            if not names and pct is None and level is None:
+                # 2026-11-23 实测：「意识」这一档常点了没反应（选中的还是上一个技能），
+                # 因为它贴在最底下、离属性条太近。往上挪 26px 重点一次再读。
+                self.log_warning(f"「{r['t']}」没读到编队（可能点偏了），往上挪 26px 重点一次")
+                self.click(r["cx"], r["cy"] - 26)
+                names, pct, level, equips = self._sample_core(r)
             f2 = self._frame()
             if f2 is not None and self.config.get("保存截图"):
                 self._shot(f2, f"core_{idx}")
-            self.log_info(f"「{r['t']}」{level or '?'} 失败率={pct}% 队友{len(mates)}{mates} "
-                          f"→ 得分 {score:.2f}")
             # 三项全空 = 这次采样整个失败了（取帧全 None / 画面还在渲染），
             # 不能当成「0 队友 0 分」参与排名，否则会把本来最好的选项排到最后。
-            valid = not (level is None and pct is None and not mates)
-            scored.append({"row": r, "pct": pct, "score": score,
-                           "mates": len(mates), "level": level, "valid": valid})
+            valid = not (level is None and pct is None and not names)
+            scored.append({"row": r, "pct": pct, "mates": 0, "level": level,
+                           "valid": valid, "names": set(names), "score": 0.0,
+                           "equips": equips})
 
         if not scored:
             self.log_warning("带角标的技能都没读到编队，按当前默认项决定")
@@ -1600,12 +1797,43 @@ class AutoTask(MyBaseTask):
             self.log_warning("全部技能采样都失败，按当前默认项决定")
             return self._decide(items, frame)
 
+        # 主训人员：出现在**每个**技能里的那个名字（玩家：不能写死名字）。
+        #   ・只用来「知道这轮主训是谁」并打进日志，**不从队友里剔除** ——
+        #     玩家同时要求「经理也算队友」，而恒在场的名字对每个技能都是 +1，排名不受影响。
+        main_char = self._main_char_of_round(scored, cfg)
+        if main_char:
+            self.main_char_round = main_char
+            self._remember_main_char(main_char)
+            self.log_info(f"本轮主训人员：{main_char}（每个技能都在场，按队友计入）")
+        else:
+            self.log_warning("没认出主训人员（只采到一个技能 / OCR 漏读），按场上名字直接算队友")
+
+        for d in scored:
+            real = set(d["names"])          # 经理 / 主训 / 队友全算（玩家 2026-11-23）
+            d["mates"] = len(real)
+            d["score"] = self._score_core(sorted(real), d["level"], d["pct"], cfg,
+                                          d.get("equips"))
+            eq = d.get("equips") or []
+            self.log_info(f"「{d['row']['t']}」{d['level'] or '?'} 失败率={d['pct']}% "
+                          f"队友{d['mates']}{sorted(real)} 器材{len(eq)}{eq} "
+                          f"→ 得分 {d['score']:.2f}")
+
         scored.sort(key=lambda d: (-d["score"],
                                    d["pct"] if d["pct"] is not None else 999))
-        best = scored[0]
         self.log_info("编队排名：" + " | ".join(
-            f"{d['row']['t']} {d['score']:.2f}分(队友{d['mates']}/{d['level'] or '?'}) 失败率{d['pct']}%"
+            f"{d['row']['t']} {d['score']:.2f}分(队友{d['mates']} 器材{len(d.get('equips') or [])}"
+            f"/{d['level'] or '?'}) 失败率{d['pct']}%"
             for d in scored))
+
+        # 玩家规则（2026-11-23）：
+        #   能练的技能失败率**全部**高于阈值时，练下去就是白扔精力；
+        #   如果商店又确认买不到精力药（精力补不回来），改练「意识」（成功率最高）。
+        #   商店本期没进去看过 = 不知道有没有药，这条规则不生效，按原排名走。
+        forced = self._force_skill_when_risky(scored, cfg)
+        best = forced or scored[0]
+        if forced and scored[0] is not forced:
+            self.log_info(f"按规则覆盖排名：改练「{forced['row']['t']}」"
+                          f"（原第一「{scored[0]['row']['t']}」）")
 
         self._click_item(best["row"], f"[最优编队 {best['row']['t']} 得分{best['score']:.1f}]")
         self.sleep(1.0)
@@ -1614,35 +1842,112 @@ class AutoTask(MyBaseTask):
             return True
         return self._decide(self._texts(f3), f3)
 
-    def _sample_core(self, row, frames=6, gap=0.3):
-        """点开技能后连拍多帧，把「队友名 / 失败率 / 技能等级」投票成稳定值。
+    def _remember_main_char(self, name):
+        """把认出来的主角名补进粘贴词过滤池（去重，最多留 8 个）。"""
+        pool = getattr(self, "known_main_chars", None)
+        if pool is None:
+            self.known_main_chars = [name]
+            return
+        if name not in pool:
+            pool.append(name)
+            del pool[:-8]
 
-        为什么必须连拍：
-            2026-11-23 05:15 用 CoreSweepTask 逐帧扫查确认，点开技能的过渡动画约 1 秒，
-            期间 OCR 会把相邻两个名字标签粘成一个（「百目鬼」+「希雅」→「百希雅」、
-            「晞雅鬼」），单帧读数会在 0~3 个队友之间乱跳。多帧取众数才稳。
+    def _main_char_of_round(self, scored, cfg):
+        """本轮主训人员是谁 —— 出现在**每个**技能里的那个名字。
+
+        玩家 2026-11-23 两条要求：
+          1.「每轮训练你要知道主训人员是谁，不能写死名字」
+             主训每局会换（上一局希雅、这一局闪堂），所以按「每个技能都在场」自动判。
+          2.「经理也是算作队友的」
+             所以判出来**只记录、不剔除**；恒在场 = 对每个技能都 +1，排名不受影响。
+
+        判不出来（只采到一个技能、或 OCR 漏读）就返回 None，不猜。
+        多个候选（主训 + 常驻经理都满场）时取出现帧数最多的那个。
         """
+        if len(scored) < 2:
+            return None
+        ratio = float(cfg.get("resident_ratio", 1.0) or 1.0)
+        cnt = {}
+        for d in scored:
+            for n in d["names"]:
+                cnt[n] = cnt.get(n, 0) + 1
+        need = max(2, round(len(scored) * ratio))
+        cands = {n: c for n, c in cnt.items() if c >= need}
+        if not cands:
+            return None
+        return max(cands.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
+
+    def _force_skill_when_risky(self, scored, cfg):
+        """失败率全高于阈值 + 商店没精力道具 → 改练指定技能（默认「意识」）。"""
+        force = cfg.get("force_when_risky") or {}
+        if not force.get("enabled", True):
+            return None
+        thr = int(force.get("fail_over", 30))
+        want = str(force.get("skill", "意识"))
+        if any(d["pct"] is None for d in scored):
+            # 有技能没读到失败率 → 不能断定「全部高风险」，那条未读到的可能正是安全项
+            self.log_info("有技能没读到失败率，无法断定全部高风险 → 按原排名")
+            return None
+        known = [d["pct"] for d in scored if d["pct"] is not None]
+        if not known or not all(p > thr for p in known):
+            return None
+        if self.shop_has_stamina is None:
+            self.log_info(f"失败率全部 >{thr}%，但本期没进过商店，不知道有没有精力药 → 按原排名")
+            return None
+        if self.shop_has_stamina:
+            self.log_info(f"失败率全部 >{thr}%，但商店有精力道具在卖 → 按原排名")
+            return None
+        cand = next((d for d in scored if d["row"]["t"] == want), None)
+        if not cand:
+            self.log_warning(f"失败率全部 >{thr}% 且商店无精力道具，但「{want}」今天没角标 → 按原排名")
+            return None
+        self.log_info(f"失败率全部 >{thr}% 且商店无精力道具 → 改练「{want}」（成功率最高）")
+        return cand
+
+    def _sample_core(self, row, frames=5, gap=0.2, warmup=0.4, max_tries=8):
+        """点开技能后等 0.4 秒（选中态出来），再连拍几帧投票成稳定值。
+
+        2026-11-23 10:14 CoreSweepTask 逐帧扫查的结论（玩家提示「不用特定时间窗口」）：
+            点完技能后**选中态会一直保留**，不是一闪而过的浮层：
+              · 帧00（+0.34s）偶有缺字，帧01（+0.5s）起「失败率 N%」稳定出现；
+              · 球场上的队友名（佐久间 / 希雅）和主训（闪堂）、中间器材卡也一直在。
+            所以只需 0.4s 起手 + 3~5 帧确认，不需要长窗口，也不需要死等 1.2s
+            （那版会拍到别的东西，实测 6 帧全空）。
+
+        为什么要多帧投票：
+            过渡期 OCR 会把相邻两个名字标签粘成一个（「百目鬼」+「希雅」→「百希雅」），
+            单帧读数会在 0~3 个队友之间乱跳。凑够 2 帧失败率 + 2 帧名字就提前收工。
+        """
+        self.sleep(warmup)
         pcts, name_sets, levels = [], [], []
+        # 器材：训练核心页中部会摆 1~3 张卡（玩家：「中间一个器材（鞋子），不是很明显吗」），
+        # 卡面是这次训练带的支援单位，外框金/彩光 = 品质。选中态一直保留，所以每帧都能读。
+        equips = []
         used = 0
-        for _ in range(frames):
+        tries = 0
+        while used < frames and tries < max_tries:
+            tries += 1
             f = self._frame_retry()
             if f is None:
                 self.sleep(gap)
                 continue
             its = self._texts(f)
-            # 这一帧得还像训练核心页（右侧技能胶囊至少认得出 2 个）才拿来采样。
-            # 否则可能是切场景的中途帧，读到的「人」全是别的页面的文字
-            # （05:29 就出现过把出行页的「游戏厅」当队友）。
             hits = len({it["t"].replace(" ", "") for it in its
                         if it["t"].replace(" ", "") in self.SKILLS})
-            # 点开技能后编队面板会盖住右侧技能列，hits 可能掉到 0~1。
-            # 所以「还像训练核心」不能只靠技能名数量，失败率/Lv 标签在也算。
-            # （2026-11-23 06:22 实测：只留技能名判定时，整轮采样 5 帧全被跳过，
-            #   于是每个技能都报「队友0 失败率None」→ 编队打分又变成全 0。）
-            looks_core = hits >= 2 or any(
-                ("失败率" in it["t"]) or re.match(r"^(LV\.?\s*\d+|MAX)", it["t"].replace(" ", "").upper())
-                for it in its
-            )
+            # 浮层盖住右列时 hits 会掉到 0~1，所以「还像训练核心页」不能只看技能名：
+            # 技能名 ≥1 / 有「失败率」/ 有 Lv·MAX / 场上 ≥2 个队友名，任一命中就算。
+            # 但也不能放太松，否则切场景的中途帧会把别的页面文字当队友
+            # （05:29 出现过把出行页的「游戏厅」当队友）。
+            names = self._court_names(its, f)
+            has_pct = any("失败率" in it["t"] for it in its)
+            has_lv = any(re.match(r"^(LV\.?\s*\d+|MAX)", it["t"].replace(" ", "").upper())
+                         for it in its)
+            # 反例加固（2026-11-23 10:32 实测）：采样中途点了按钮切到「赛前准备」，
+            # 那一帧把阵容页的位置名（分卫/大前/控卫）当成队友、把球队大卡当成器材，
+            # 结果唯一一项得分 8 分，直接定案选错技能。只要出现比赛/结算类的字眼就丢帧。
+            off_core = any(w in " ".join(it["t"] for it in its)
+                           for w in ("赛前准备", "跳过比赛", "前往比赛", "MVP", "目标达成"))
+            looks_core = (not off_core) and (hits >= 1 or has_pct or has_lv or len(names) >= 2)
             if not looks_core:
                 self.sleep(gap)
                 continue
@@ -1650,10 +1955,20 @@ class AutoTask(MyBaseTask):
             p = self._read_pct(its)
             if p is not None and p <= 100:      # 210%、230% 这类是 OCR 把两个数字粘了
                 pcts.append(p)
-            name_sets.append(set(self._court_names(its, f)))
+            name_sets.append(set(names))
             lv = self._skill_level(its, row)
             if lv:
                 levels.append(lv)
+            try:
+                cs = find_cards(f)
+                equips.append(tuple(card_glow(f, c) for c in cs))
+                if used == 1:
+                    self.log_info(f"采样帧 {f.shape[1]}x{f.shape[0]} 器材 {len(cs)} "
+                                  f"{[(int(c['x']), int(c['y']), card_glow(f, c)) for c in cs]}")
+            except Exception as e:      # 器材读失败不能拖累编队采样
+                self.log_info(f"器材检测失败（忽略）：{e}")
+            if len(pcts) >= 2 and len(name_sets) >= 2:
+                break                            # 已经够投票了，别再多拍
             self.sleep(gap)
 
         mates = []
@@ -1664,7 +1979,11 @@ class AutoTask(MyBaseTask):
                     cnt[n] = cnt.get(n, 0) + 1
             # 出现 2 帧以上就算：名字标签是淡入的，前 1~2 帧读不到很正常；
             # 粘连词/误读已经由 _is_mate_name 过滤，这里不用太严。
-            mates = [n for n, c in cnt.items() if c >= 2 and n != self.MAIN_CHAR]
+            # 【2026-11-23 10:14 扫查修正】这里**不再按 MAIN_CHAR 剔人**：
+            # 主训人员每局都可能换（这一局是「闪堂」，上一局是「希雅」），
+            # 写死一个名字必然剔错。谁该忽略交给 _do_training_core 用「每个技能都有」
+            # 的常驻名来判。
+            mates = [n for n, c in cnt.items() if c >= 2]
 
         pct = None
         if pcts:
@@ -1679,9 +1998,16 @@ class AutoTask(MyBaseTask):
             for v in levels:
                 cnt[v] = cnt.get(v, 0) + 1
             level = max(cnt.items(), key=lambda kv: kv[1])[0]
+        equip = ()
+        if equips:
+            cnt = {}
+            for e in equips:
+                cnt[e] = cnt.get(e, 0) + 1
+            # 票数最高者；同票取张数多的（宁可少算支援也不漏）
+            equip = max(cnt.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
         if used < frames:
-            self.log_info(f"编队采样 {used}/{frames} 帧可用（其余帧不像训练核心页，已丢弃）")
-        return mates, pct, level
+            self.log_info(f"编队采样 {used}/{frames} 帧有效（试了 {tries} 次，废帧已丢弃）")
+        return mates, pct, level, list(equip)
 
     def _skill_level(self, items, row):
         """技能胶囊右边那个 Lv.1 / Lv.2 / MAX。"""
@@ -1695,21 +2021,38 @@ class AutoTask(MyBaseTask):
                 best, best_d = t, d
         return best
 
-    def _score_core(self, mates, level, pct, cfg):
-        """编队打分 = 出场队友数 + 技能等级，再按失败率打折。
+    def _score_core(self, mates, level, pct, cfg, equips=None):
+        """编队打分 = 出场队友数，再按失败率打折。
 
-        2026-11-23 事实修正（CoreSweepTask 逐帧扫查）：
-          这页**根本没有器材卡片**，也没有金光/彩光。原来配置里的 equipment 项
-          在真机上恒为 0，导致 6 个技能的得分只剩「队友数 0~3」，几乎打平，
-          最终退化成按 y 坐标选第一个 —— 这就是「编队打分做不出来」的真正原因。
-          器材卡只在**开训动画**里出现（选完才播），选之前读不到，所以不再计入。
+        2026-11-23 玩家口径（当次确定）：
+          - **技能等级不计分**（Lv.1/Lv.2/MAX 三档全部当 0），只是照旧读出来打在日志里，
+            方便人工复核；配置里 level_bonus 三项已置 0。
+          - 失败率 = 乘法折扣：分数 ×(1 - 失败率/100 × fail_weight)，fail_weight=1.0
+            意味着 30% 失败率直接打七折、50% 打五折 —— 「失败 = 白扔一次精力」按比例扣。
+          - 失败率**全部**高于 30% 且商店无精力道具时，不走这套打分，改由
+            _force_skill_when_risky() 强制练「意识」。
 
-        现在真正可读、且各技能确实不同的信号只有三个：
-          1. 球场上出场的队友数量（投射 2 人 / 弹跳 1 人 / 运控 0 人，实测不同）
-          2. 技能等级 Lv.1 / Lv.2 / MAX
-          3. 失败率（失败=白扔体力，按比例打折）
+        【2026-11-23 第二次纠正】「这页没有器材卡」是错的（玩家当场指出
+        「中间一个器材（鞋子），不是很明显吗」）。实机 70 帧复核：中场确实摆着
+        1~3 张支援卡，选之前就在画面上（选中态一直保留），外框金/彩光可判。
+        检测用 src/core/cards.py 的 find_cards + card_glow。
+
+        现在参与计分的信号有四个：
+          1. 场上出场队友数（含经理、含主训本人）  ← 每个 +teammate 分
+          2. 器材卡数量 × 光效档位（金 1.0 / 彩 1.5 / 普通 0.5）
+          3. 失败率（失败 = 白扔体力）→ 整包乘法打折
+          4. 技能等级 Lv.1/Lv.2/MAX ← 只记录，**不计分**（玩家口径）
         """
         base = len(mates) * float(cfg.get("teammate", 1.0))
+
+        # 器材：训练核心页中场摆着的 1~3 张支援卡，按外框光效计分。
+        #   玩家原口径：「队友 +1、器材 0.5、金光 1、彩光 1.5」
+        #   （2026-11-23 早先误判成「器材读不到」，实机截图证明选之前就画在场上，
+        #     检测用 src/core/cards.py，离线 70 帧稳定：单张卡 x≈620、框色判定正常。）
+        if equips:
+            tbl = cfg.get("equipment_tier") or {}
+            for g in equips:
+                base += float(tbl.get(g, cfg.get("equipment", 0.5)))
 
         lv_table = cfg.get("level_bonus") or {}
         key = "MAX" if (level or "").upper().startswith("MAX") else ""
@@ -2088,6 +2431,15 @@ class AutoTask(MyBaseTask):
         self.stock_picked = False
         self.slots_autofill = 0
         self.slots_empty = 0
+        # 商店有没有精力道具卖：None=本期还没进过店 / True=有 / False=没有。
+        # 「失败率全部>30 且无精力药 → 改练意识」这条规则要用它，没进店就不敢乱判。
+        self.shop_has_stamina = None
+        self.shop_bought = 0
+        # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
+        self.main_char_round = None
+        # 已知主角名池：只用于剔除 OCR 粘连词（「百希雅」= 百目鬼 + 希雅），
+        # 不作为「谁是主训」的判断依据。每轮认出新主训就补进来。
+        self.known_main_chars = ["希雅", "闪堂"]
         self.route = {}
         self.in_training = False
         self.saw_training = False
@@ -2285,6 +2637,10 @@ class AutoTask(MyBaseTask):
                 self._do_trip(items, frame)
             elif page == "公园子页":
                 self._do_trip(items, frame)
+            elif page == "训练提议":
+                self._do_train_offer(items, frame)
+            elif page == "确认编队":
+                self._do_confirm_team(items, frame)
             elif page == "前往":
                 self._do_go(items, frame)
             elif page == "商店":
