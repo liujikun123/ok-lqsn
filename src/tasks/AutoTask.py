@@ -27,6 +27,40 @@ STOP_WORDS = ["关闭", "取消", "返回"]
 
 WEEKDAYS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7}
 
+# ── 显式阶段机（2026-11-23 玩家要求：别再靠「见过什么页」隐式推断局内/局外）──
+# 三个阶段表达「一轮训练」的生命周期，替代原来 saw_training + in_training 两个布尔：
+#   HALL     = 在大厅，还没开训（或刚跑完一轮回到大厅）
+#   TRAINING = 已进局，正在局内页面流转（每日页/训练/选人/事件/比赛…）
+#   SETTLING = 已看到收尾页（训练结束/结果/评分），正往大厅走；回到大厅才算一轮完成
+# 只有 TRAINING/SETTLING 阶段回到大厅才 +1 轮；停在 HALL 的公告/弹窗不算。
+PHASE_HALL = "HALL"
+PHASE_TRAINING = "TRAINING"
+PHASE_SETTLING = "SETTLING"
+
+# 页面 → 阶段。用于每步校正阶段，不依赖「见过非大厅页」这种宽泛判断。
+# 大厅/未知/纯遮挡浮层不改阶段；其余页面按此表进入 TRAINING 或 SETTLING。
+PAGE_PHASE = {
+    # 明确的收尾页 → SETTLING
+    "训练结束": PHASE_SETTLING, "训练评分": PHASE_SETTLING,
+    "恭喜获得": PHASE_SETTLING, "比赛MVP": PHASE_SETTLING,
+    "结算": PHASE_SETTLING, "目标达成": PHASE_SETTLING,
+    "行程结果": PHASE_SETTLING, "点击继续": PHASE_SETTLING,
+    # 局内主流程 → TRAINING
+    "每日页": PHASE_TRAINING, "训练核心": PHASE_TRAINING,
+    "选择队友": PHASE_TRAINING, "笔记选择": PHASE_TRAINING,
+    "器材选择": PHASE_TRAINING, "确认编队": PHASE_TRAINING,
+    "开始训练确认": PHASE_TRAINING, "训练结果": PHASE_TRAINING,
+    "训练确认": PHASE_TRAINING, "行为卡": PHASE_TRAINING,
+    "笔记学习": PHASE_TRAINING, "加强训练": PHASE_TRAINING,
+    "训练提议": PHASE_TRAINING, "扭蛋选择": PHASE_TRAINING,
+    "扭蛋机": PHASE_TRAINING, "出行": PHASE_TRAINING,
+    "公园子页": PHASE_TRAINING, "赛前准备": PHASE_TRAINING,
+    "选项": PHASE_TRAINING, "剧情事件": PHASE_TRAINING,
+    "炒股小游戏": PHASE_TRAINING, "小游戏": PHASE_TRAINING,
+    "商店": PHASE_TRAINING, "专注恢复": PHASE_TRAINING,
+    "体力恢复": PHASE_TRAINING,
+}
+
 # 「心·技·体」属性面板 —— OCR 极不稳定：实测读出过「心·支·体」「心·枝·体」，
 # 甚至整行只剩「属性加成」「颜外队友」。所以不能精确匹配。
 XIN_JI_TI = re.compile(r"心\s*[·・.．]?\s*[技枝伎支]\s*[·・.．]?\s*体")
@@ -139,6 +173,7 @@ class AutoTask(MyBaseTask):
         self.route = {}
         self.in_training = False
         self.saw_training = False
+        self.phase = PHASE_HALL
         self.choice_idx = 0
         self.stamina_refills = 0
         self.stamina_misses = 0
@@ -686,6 +721,51 @@ class AutoTask(MyBaseTask):
         out.sort(key=lambda x: x["cy"])
         return out
 
+    def _right_card_count(self, frame):
+        """右侧 2/3 区域里「带黄色等级牌的成员卡」数量 —— 纯图像，不看 OCR。
+
+        选人页（选择队友 / 额外队友）特征是右侧竖排 4 张卡，每张卡顶部有
+        一小块黄色「LV110」等级牌；训练核心页右侧是技能胶囊（不是卡 + 等级牌），
+        训练结果页右侧基本空白。用这个把「选人页」和「属性面板/结果页」分开，
+        补 OCR 只靠「额外队友」四字容易误判的短板（2026-11-23 14:20 实测）。
+
+        返回 ≥2 说明像选人页。
+        """
+        if frame is None:
+            return 0
+        h, w = frame.shape[:2]
+        x1, x2 = int(w * 0.70), int(w * 0.99)
+        y1, y2 = int(h * 0.08), int(h * 0.70)
+        sub = frame[y1:y2, x1:x2]
+        if sub.size == 0:
+            return 0
+        try:
+            import cv2
+            hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+            m = cv2.inRange(hsv, np.array([18, 110, 170]), np.array([40, 255, 255]))
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 7), np.uint8))
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # 等级牌：小而扁的黄块（宽 30~180、高 14~60），按 y 聚成不同行
+            ys = []
+            for c in cnts:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                if not (20 <= bw <= 200 and 10 <= bh <= 70):
+                    continue
+                if cv2.contourArea(c) < bw * bh * 0.45:
+                    continue
+                ys.append(by)
+            # 不同 y（相隔 > 40px）算不同卡
+            ys.sort()
+            rows = 0
+            last = -999
+            for y in ys:
+                if y - last > 40:
+                    rows += 1
+                    last = y
+            return rows
+        except Exception:
+            return 0
+
     def _classify(self, items, frame=None):
         """判定当前页面。顺序 = 优先级，别随意调换。"""
         texts = [it["t"] for it in items]
@@ -802,6 +882,15 @@ class AutoTask(MyBaseTask):
         # 7.35 开训动画（只有「训练开始」一行字）
         if "训练开始" in joined:
             return "训练结果"
+        # 7.3 开训前的「额外队友 / 选择队友」选人页：右侧 4 张队友卡 + 底部六属性，
+        #     顶部也写着「额外队友」，会被下面 7.4 的 is_attr_panel 当成训练后属性面板
+        #     误判成「训练结果」→ 结果页分支只找「点击屏幕继续」，找不到就点屏幕中央
+        #     空白，15 步后卡死（2026-11-23 14:20 实测一步没动就停）。
+        #     独特区别：这页右上角有「筛选」开关，训练后的属性面板没有。
+        pick_visual = frame is not None and self._right_card_count(frame) >= 2
+        if (("筛选" in joined and has("下一步", "编队", "玩家阵容"))
+                or (pick_visual and has("下一步", "编队", "额外队友"))):
+            return "选择队友"
         # 7.4 训练后的属性成长面板（心·技·体 + 六个属性条 + 倍率加成）
         #     它不是可交互页，点一下/下一步就过；判成「未知」会走兜底连点中间，
         #     一轮下来能占十几步（实测未知页 23% 里一大半是它）。
@@ -870,6 +959,12 @@ class AutoTask(MyBaseTask):
                 and re.search(r"\d{1,3}\s*/\s*\d{1,3}", joined)
                 and not has("MVP", "赛前准备", "目标达成", "点击屏幕继续", "心·", "·体")):
             return "每日页"
+        # 12.2 视觉兜底：OCR 一个字都没认全，但右侧有 ≥2 张带等级牌的成员卡
+        #      → 这是选人页（选择队友/额外队友）。纯靠 OCR 时这类页常被漏读成未知，
+        #      白点中间空转；用画面硬特征补上（2026-11-23 玩家要求 OCR 之外加视觉信号）。
+        if frame is not None and self._right_card_count(frame) >= 2 \
+                and not has("MVP", "结算", "赛前准备"):
+            return "选择队友"
         # 兜底：只剩「第N周」不代表就是每日页（很多结果页也带顶栏），
         # 交给未知页兜底（点屏幕中间推进）比硬当成每日页安全。
         return "未知"
@@ -2102,21 +2197,48 @@ class AutoTask(MyBaseTask):
         self.click_relative(0.5, 0.5)
         return True
 
-    # 两种资源的上限指纹（用来在 OCR 吃掉「/」时反推）
-    CAPS = (150, 130)      # 局外体力 / 局内精力
+    # 两种资源的上限指纹 —— **只作兜底**，不再当作分类的唯一依据。
+    # 2026-11-23 玩家指出：局内精力上限会被道具提升（商店就有「精力上限+」），
+    # 写死 130 一旦上限涨到 140+ 就认不出；局外专注也会溢出显示 202/150。
+    # 现在的分类优先看**页面上下文**（hint），只有拿不到上下文时才退回数字指纹。
+    CAPS = (150, 130)      # 局外体力 / 局内精力（兜底反推用）
     FOCUS_CAP = 150
     STAMINA_CAP = 130
 
-    def _ab_kind(self, a, b):
-        """判断这个 a/b 是哪种资源；不是已知资源就返回 None。
+    # 页面 → 资源类型。这两个页面各自只会出现一种资源，是比数字更硬的判定：
+    #   每日页顶栏 ⚡ = 局内精力（上限可能被道具提升）；
+    #   专注恢复弹窗 = 局外专注（账号级体力，上限 150、可溢出）。
+    PAGE_RESOURCE = {
+        "每日页": "stamina",
+        "专注恢复": "focus",
+        "体力恢复": "focus",
+    }
 
-        只认「贴着已知上限」的 b（允许 OCR ±8 的误差）。
-        2026-11-23 06:51 实测：不加这个校验，页面上随便一个 218/271、303/164
-        都会被当成体力写进 `out_focus`，日志里 221/150 和 303/164 交替出现。
+    def _ab_kind(self, a, b, hint=None):
+        """判断 a/b 是哪种资源。
+
+        优先级：
+          1. 页面上下文 hint（最硬）—— 调用方知道当前页只会显示哪一种资源；
+          2. 数字指纹兜底 —— b 贴着已知上限（±8）才认，避免把 303/164 这种
+             随机数字当体力写进 out_focus（2026-11-23 06:51 踩过）。
+        上限会变（精力上限+道具 / 专注溢出），所以指纹不再是唯一依据。
         """
+        if hint in ("focus", "stamina"):
+            return hint
+        # 无上下文时先挡 OCR 噪声：当前值远超上限（>1.5 倍）说明这两个数
+        # 不是同一个 a/b（如 303/164、218/271 这类页面上别处的数字串一起）。
+        # 正常溢出（202/150 = 1.35 倍）不受影响。
+        if a > b * 1.5:
+            return None
         if 143 <= b <= 158:
             return "focus"
         if 122 <= b <= 138:
+            return "stamina"
+        # 上限被提升过：b 比已知上限大一段也认（如精力上限涨到 160/170）。
+        # 只认「刚好比 cap 大、且差得不离谱」，避免把任意大数当资源。
+        if 158 < b <= self.FOCUS_CAP + 60:
+            return "focus"
+        if 138 < b <= self.STAMINA_CAP + 60:
             return "stamina"
         return None
 
@@ -2155,23 +2277,24 @@ class AutoTask(MyBaseTask):
                         return a, cap
         return None
 
-    def _read_stamina(self, items, frame):
+    def _read_stamina(self, items, frame, page=None):
         """分别读两种资源 —— 完全不同的东西，绝不能混用。
 
         资源对照（2026-11-23 玩家两次当面纠正 + MCP 探针实测）：
-          * **局内「精力」上限 130**：每日页顶栏 ⚡ 38/130。训练消耗它，
-            决定「今天训练还是休息」；**只有局内事件(精力+10)和周日公园
-            (+30/+70) 能补，药水补不了它**。
-          * **局外「专注」上限 150**：账号级体力，不够就开不了训练，
-            弹「专注恢复」时用药水补（不用钻石）。不参与训练/休息决策。
+          * **局内「精力」上限约 130，会被道具提升**：每日页顶栏 ⚡ 38/130。
+            训练消耗它，决定「今天训练还是休息」；**只有局内事件(精力+10)
+            和周日公园(+30/+70) 能补，药水补不了它**。
+          * **局外「专注」上限 150、可溢出**：账号级体力，不够开不了训练，
+            弹「专注恢复」时用道具补（不用钻石）。不参与训练/休息决策。
 
-        判定方式：**按上限区分，不能按位置**。
-        两个数字都出现在顶栏区域，光看 y 坐标会读反（130 被当成专注）。
-        150 和 130 这两个上限目前稳定，用它们当指纹：
-          b >= 145 → 局外专注
-          40 <= b <= 140 → 局内精力
+        分类优先级（2026-11-23 玩家指出上限会变，弃用「只靠数字指纹」）：
+          1. **页面上下文**：每日页一定是局内精力、专注弹窗一定是局外专注；
+          2. 数字指纹（b 贴着上限）兜底；上限疑似被提升时按相邻区间放宽。
+        上限优先用本次 OCR 读到的 b（道具提升后能跟上），只有明显是 OCR 抖动
+        （比已知上限差 1~6，如 134/136）时才保留旧上限，避免卡住不更新。
         """
         h = frame.shape[0]
+        hint = self.PAGE_RESOURCE.get(page) if page else None
         for it in items:
             ab = self._parse_ab(it["t"])
             if not ab:
@@ -2180,14 +2303,28 @@ class AutoTask(MyBaseTask):
             # 体力可以溢出（202/150 是实测见到的真实状态），所以不能要求 a <= b
             if not (0 <= a <= b * 2):
                 continue
-            kind = self._ab_kind(a, b)
+            kind = self._ab_kind(a, b, hint=hint)
             if kind == "focus":
-                self.out_focus, self.out_focus_max = a, self.FOCUS_CAP
+                self.out_focus = a
+                self.out_focus_max = self._settle_cap(b, self.out_focus_max,
+                                                      self.FOCUS_CAP)
             elif kind == "stamina":
-                # 上限固定 130，不用读到的 b —— OCR 有时读成 134/136，
-                # 一旦把 134 当成上限，后面读到 130 就再也更新不了当前值
-                # （2026-11-23 06:51 实测：精力卡在 108 不动）。
-                self.stamina, self.stamina_max = a, self.STAMINA_CAP
+                self.stamina = a
+                self.stamina_max = self._settle_cap(b, self.stamina_max,
+                                                    self.STAMINA_CAP)
+
+    def _settle_cap(self, read, old, default):
+        """决定用哪个上限：优先本次读到的 b，过滤掉 OCR 的小抖动。
+
+        read=134、default=130（差 4）→ 判成抖动，沿用旧值/默认；
+        read=160、default=130（差 30）→ 是真提升，采纳 160。
+        """
+        base = old or default
+        if read and abs(read - base) <= 4:
+            return base                     # 抖动（±4，覆盖实测的 134/136/127），保留原上限
+        if read and read >= base + 5:
+            return read                     # 上限真的提升了
+        return base
 
     def _orange_spots(self, frame):
         """右侧技能列上的黄色小圆标：找橙色像素团的中心。"""
@@ -2852,8 +2989,10 @@ class AutoTask(MyBaseTask):
         focus = cap = None
         for it in its:
             ab = self._parse_ab(it["t"])
-            if ab and self._ab_kind(*ab) == "focus":
-                focus, cap = ab[0], self.FOCUS_CAP
+            # 这是专注恢复弹窗，上下文必然是局外专注 —— 直接给 hint，
+            # 不再靠数字指纹（上限会变/溢出）。
+            if ab and self._ab_kind(*ab, hint="focus") == "focus":
+                focus, cap = ab[0], (ab[1] or self.FOCUS_CAP)
         opened = any(it["t"].strip() in ("使用", "使用道具", "专注恢复") for it in its)
         return focus, cap, opened
 
@@ -2941,8 +3080,8 @@ class AutoTask(MyBaseTask):
         cur = cap = None
         for it in items:
             ab = self._parse_ab(it["t"])
-            if ab and self._ab_kind(*ab) == "focus":
-                cur, cap = ab[0], self.FOCUS_CAP
+            if ab and self._ab_kind(*ab, hint="focus") == "focus":
+                cur, cap = ab[0], (ab[1] or self.FOCUS_CAP)
         if cur is None and not any("专注" in it["t"] for it in items):
             close("页面上没有专注(150)数值，判定不是局外体力弹窗，不喝药")
             return True
@@ -3271,6 +3410,7 @@ class AutoTask(MyBaseTask):
         self.route = {}
         self.in_training = False
         self.saw_training = False
+        self.phase = PHASE_HALL            # 显式阶段；断点恢复时会被 _load_state 覆盖
         self.choice_idx = 0
         self.stamina_refills = 0
         self.stamina_misses = 0
@@ -3419,7 +3559,7 @@ class AutoTask(MyBaseTask):
     # 状态机本来就是按页面流转的（任何一屏都能接着跑），所以断点只需记住
     # 「今天探没探笔记 / 进没进过店 / 这是第几轮」这类**记账**，不用记完整画面。
     RESUME_FIELDS = (
-        "saw_training", "in_training", "weekday", "core_checked",
+        "saw_training", "in_training", "phase", "weekday", "core_checked",
         "trip_picked", "trip_probe", "trip_probe_done", "trip_probe_disabled",
         "trip_back_tries", "shop_day", "shop_week", "shop_bought",
         "shop_has_stamina", "notes_done", "minigame_tries", "stock_idx",
@@ -3468,8 +3608,15 @@ class AutoTask(MyBaseTask):
             for k in self.RESUME_FIELDS:
                 if k in data and data[k] is not None:
                     setattr(self, k, data[k])
+            # 兼容旧断点（没有 phase 字段）：从 saw_training 推导，
+            # 免得老档恢复后阶段留在 HALL、回大厅白丢一轮。
+            if "phase" not in data or not data.get("phase"):
+                if getattr(self, "saw_training", False):
+                    self.phase = PHASE_TRAINING
+                else:
+                    self.phase = PHASE_HALL
             self.log_info(f"★ 断点恢复：从「{data.get('page')}」第 {data.get('step')} 步接上"
-                          f"（{age / 60:.0f} 分钟前存的）", notify=True)
+                          f"（阶段 {self.phase}，{age / 60:.0f} 分钟前存的）", notify=True)
         except Exception as e:
             self.log_warning(f"断点文件读取失败（{e}），按新跑")
 
@@ -3515,6 +3662,35 @@ class AutoTask(MyBaseTask):
         except Exception:
             pass
 
+    def _set_phase(self, to, page="", reason=""):
+        """显式阶段转换：HALL → TRAINING → SETTLING → (回大厅计一轮) → HALL。
+
+        为什么要有这个方法（2026-11-23 玩家要求）：
+          旧版靠 `page not in ("大厅","未知")` 就 `saw_training=True` —— 公告页、
+          小游戏、误判页都会把「训练已开跑」点亮，回大厅就白计一轮；而且
+          `saw_training`/`in_training` 两个布尔语义含糊，断点恢复后也说不清在哪。
+          现在阶段有明确定义和转换日志，非法跳跃只警告不强改，便于从日志追。
+
+        同时兼容旧字段：TRAINING/SETTLING 阶段 `saw_training=True`，
+        `in_training` 只在真正点进训练时为 True（保持原有的下游判断不变）。
+        """
+        old = getattr(self, "phase", PHASE_HALL)
+        if old == to:
+            return False
+        # 允许的转换；回退到 HALL 是新一轮开始或收工，都合法
+        allowed = {
+            PHASE_HALL: (PHASE_TRAINING,),
+            PHASE_TRAINING: (PHASE_SETTLING, PHASE_HALL),
+            PHASE_SETTLING: (PHASE_HALL,),
+        }
+        if to not in allowed.get(old, ()):
+            self.log_warning(f"阶段跳跃 {old}→{to}（页面 {page}），按 {to} 处理：{reason}")
+        self.phase = to
+        self.saw_training = to in (PHASE_TRAINING, PHASE_SETTLING)
+        self.log_info(f"阶段 {old}→{to}" + (f"（{page}）" if page else "")
+                      + (f" {reason}" if reason else ""))
+        return True
+
     def _begin_round(self):
         """开始新的一轮之前，把「按天/按局」的状态清掉。
 
@@ -3525,6 +3701,7 @@ class AutoTask(MyBaseTask):
         """
         self.saw_training = False
         self.in_training = False
+        self.phase = PHASE_HALL
         self.weekday = None
         self.core_checked = False
         self.trip_picked = False
@@ -3582,9 +3759,11 @@ class AutoTask(MyBaseTask):
                     continue
             else:
                 blank = 0
-            self._read_stamina(items, frame)
-            self.weekday = self._read_week(items)[1]
+            # 先判页面，再读资源：_read_stamina 要用页面上下文 hint 区分
+            # 局内精力/局外专注（上限会变，不能再只靠数字指纹）。
             page = self._classify(items, frame)
+            self._read_stamina(items, frame, page=page)
+            self.weekday = self._read_week(items)[1]
             # 事件页没有标题字，顶栏又带着「第N周」，很容易被认成每日页。
             # 成排黄卡片是它最硬的图像特征，所以在这里纠正一次。
             if page in ("未知", "每日页", "训练结束", "剧情事件", "选项") \
@@ -3635,10 +3814,12 @@ class AutoTask(MyBaseTask):
                     self.click_relative(0.02, 0.5)
                 continue
 
-            # 只要见过非大厅/非未知的页面，就说明「这一轮训练已经开跑」，
-            # 之后再回到大厅才算跑完（不然后续训练还没开始就被判成跑完）。
-            if page not in ("大厅", "未知"):
-                self.saw_training = True
+            # 显式阶段推进：按页面查表，而不是「见过任何非大厅页就算开跑」。
+            # 公告页/小游戏/纯浮层不在 PAGE_PHASE 里 → 不改阶段，
+            # 这样在大厅弹个公告再关掉，不会被误当成训练已开跑、回大厅白计一轮。
+            want_phase = PAGE_PHASE.get(page)
+            if want_phase:
+                self._set_phase(want_phase, page=page)
 
             result = True
             if page in ("专注恢复", "体力恢复"):
@@ -3658,8 +3839,10 @@ class AutoTask(MyBaseTask):
             elif page == "每日页":
                 self._do_daily(items, frame)
             elif page == "大厅":
-                if self.saw_training:
+                # 只有「阶段确实进过局」才计一轮；停在大厅看公告/弹窗不算。
+                if getattr(self, "phase", PHASE_HALL) in (PHASE_TRAINING, PHASE_SETTLING):
                     self.rounds_done += 1
+                    self._set_phase(PHASE_HALL, page=page, reason="回大厅，完成一轮")
                     if self.rounds_done >= max_rounds:
                         self.log_info(f"★ 第 {self.rounds_done} 轮训练已跑完（共 {max_rounds} 轮），"
                                       f"回到大厅 —— 收工", notify=True)
@@ -3674,12 +3857,14 @@ class AutoTask(MyBaseTask):
                 it = self._find(items, ["训练中", "训练"], exact=True) or self._find(items, ["训练中"])
                 if it:
                     self.in_training = True
+                    self._set_phase(PHASE_TRAINING, page=page, reason="点进训练入口")
                     self._click_item(it, "[进入训练]")
                 else:
                     # OCR 漏读「训练」两个字也不能就这么收工：大厅入口固定在右下角
                     # （1920x1080 实测 0.764, 0.883），按比例点一下。
                     self.log_info("大厅没读到「训练」文字，按固定坐标点右下角入口")
                     self.in_training = True
+                    self._set_phase(PHASE_TRAINING, page=page, reason="按固定坐标点进训练")
                     hh, ww = frame.shape[:2]
                     self.click(int(ww * 0.764), int(hh * 0.883))
                     self.sleep(1.5)
@@ -3750,7 +3935,12 @@ class AutoTask(MyBaseTask):
                 it = self._find(items, ["点击屏幕继续"])
                 if it:
                     self._click_item(it, "[训练结果-继续]")
-                else:
+                elif not self._click_confirm(items, frame):
+                    # 兜底：开训前的「额外队友 / 选择队友」页顶部也写着「额外队友」，
+                    # 会被 is_attr_panel 当成属性面板的 OCR 变体词而误判成训练结果。
+                    # 这页真正的出口是右下角一个黄色「下一步」，不是屏幕正中央。
+                    # 先找黄色主按钮点掉它；确实没有才退回点中间，避免连点空白 15 步卡死。
+                    self.log_warning("结果页没找到「点击屏幕继续」也没有黄色主按钮，点屏幕中央兜底")
                     self.click_relative(0.5, 0.5)
             elif page in ("选择队友", "笔记选择", "器材选择"):
                 # 先过「选满了没」这道闸门：有空白加号槽就补/停，绝不自己开训
