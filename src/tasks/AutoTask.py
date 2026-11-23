@@ -1890,6 +1890,12 @@ class AutoTask(MyBaseTask):
         st = self.stamina
         eq = getattr(self, "last_equip_count", 0) or 0
 
+        # 玩家 2026-11-23 16:25：优先留 120 块给笔记继承扭蛋（egg.max_price=120），
+        # 否则笔记刷出来买不起。金币读得到时，任何有价格的商品买了会跌破底线就不买。
+        # 0 元馈赠不花钱，永远放行；读不到金币时不敢乱花，跳过付费项。
+        keep = int(cfg.get("keep_gold", self.GOLD_KEEP))
+        gold = getattr(self, "gold", None)
+
         # 紧急档：精力见底时先买饮料保命（否则今天直接练不动，牛奶再划算也没用）。
         # 精力还宽裕时才按 order 走，牛奶（永久降低训练精力消耗）排在饮料前面。
         urgent_rule = rules.get("stamina") or {}
@@ -1905,7 +1911,11 @@ class AutoTask(MyBaseTask):
 
         for cat in order:
             rule = rules.get(cat) or {}
-            if rule.get("on", True) is False:
+            # ⚠️ YAML 1.1 把裸键 `on` 解析成布尔 True（`on: false` 变成 {True: False}），
+            # `rule.get("on")` 永远读不到 → 之前的 on:false 全是摆设。改用 enabled，
+            # 同时兼容历史文件里被解析成 True 键的写法。
+            enabled = rule.get("enabled", rule.get(True, rule.get("on", True)))
+            if enabled is False:
                 continue
             pool = [o for o in offers if o["kind"] == cat]
             if not pool:
@@ -1928,6 +1938,17 @@ class AutoTask(MyBaseTask):
             if cap is not None and o["price"] is not None and o["price"] > float(cap):
                 self.log_warning(f"「{o['name']}」{o['price']} 元 > 上限 {cap} 元 → 不买")
                 continue
+            # 留 120 给笔记：付费商品买完会跌破底线就不买；0 元白拿放行。
+            price = o["price"]
+            if price is not None and price > 0:
+                if gold is None:
+                    self.log_warning(f"「{o['name']}」要 {price} 元，但顶栏金币读不到 "
+                                     f"→ 不敢花（要留 {keep} 给笔记）")
+                    continue
+                if gold - price < keep:
+                    self.log_warning(f"「{o['name']}」{price} 元：金币 {gold}-{price}="
+                                     f"{gold - price} < 留底 {keep}（笔记继承）→ 不买")
+                    continue
             return o, cat
         return None, "没有符合白名单的商品"
 
@@ -2353,6 +2374,11 @@ class AutoTask(MyBaseTask):
     }
     RESOURCE_B_MAX = 320   # 道具提升+溢出后的硬上限；属性条 b 都是 1600+，一律挡在外面
 
+    # 顶栏金币（零用钱）：实测 1936x1119 截图 rel(0.567, 0.042)，纯数字 15/155/95/35。
+    # 玩家 2026-11-23 16:25 要求：优先留 120 块，笔记继承扭蛋刷出来才买得起（egg.max_price=120）。
+    GOLD_ROI = (0.52, 0.01, 0.63, 0.10)
+    GOLD_KEEP = 120
+
     def _ab_kind(self, a, b, hint=None):
         """判断 a/b 是哪种资源。
 
@@ -2474,6 +2500,34 @@ class AutoTask(MyBaseTask):
                 self.stamina = a
                 self.stamina_max = self._settle_cap(b, self.stamina_max,
                                                     self.STAMINA_CAP)
+
+    def _read_gold(self, items, frame):
+        """读顶栏金币（零用钱）—— 固定位置，只认 GOLD_ROI 里的纯数字。
+
+        玩家 2026-11-23 16:25：「优先级改一下，优先保证有 120 块钱，
+        要不然笔记刷出来买不了」。笔记继承扭蛋上限 120（strategy.yaml egg.max_price），
+        商店若把钱花到 120 以下，笔记刷出来就只能眼看着错过。
+
+        实测金币在顶栏 rel(0.567, 0.042)，是纯数字（15/155/95/35），旁边
+        rel 0.649 的「-130」是购买飘字，靠 ROI 右边界 0.63 排除。
+        不做「按全局找最大纯数字」这种事——那是之前精力读成鬼值的老毛病。
+        """
+        if frame is None:
+            return None
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = self.GOLD_ROI
+        for it in items:
+            cx, cy = it.get("cx", 0) / w, it.get("cy", 0) / h
+            if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+                continue
+            t = (it["t"] or "").strip().replace(",", "")
+            # 金币是纯数字；带斜杠/中文的是精力或其他槽位，别认
+            if re.fullmatch(r"\d{2,6}", t):
+                gold = int(t)
+                # 金币不会是 3 位数以下的精力上限误读（这里只要位置对就认）
+                self.gold = gold
+                return gold
+        return None
 
     def _settle_cap(self, read, old, default):
         """决定用哪个上限：优先本次读到的 b，过滤掉 OCR 的小抖动。
@@ -4003,6 +4057,7 @@ class AutoTask(MyBaseTask):
             # 局内精力/局外专注（上限会变，不能再只靠数字指纹）。
             page = self._classify(items, frame)
             self._read_stamina(items, frame, page=page)
+            self._read_gold(items, frame)          # 顶栏金币，用于买东西时留 120 给笔记
             self.weekday = self._read_week(items)[1]
             # 页面级转移软约束：明显不可能的跳转记警告+截图，照常处理不拦截
             self._check_transition(last_page, page, frame=frame, step=step)

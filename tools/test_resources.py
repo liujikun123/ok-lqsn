@@ -34,17 +34,21 @@ class Stub:
     PAGE_RESOURCE = AutoTask.PAGE_RESOURCE
     RESOURCE_ROI = AutoTask.RESOURCE_ROI
     RESOURCE_B_MAX = AutoTask.RESOURCE_B_MAX
+    GOLD_ROI = AutoTask.GOLD_ROI
+    GOLD_KEEP = AutoTask.GOLD_KEEP
 
     def __init__(self):
         self.stamina = None
         self.stamina_max = None
         self.out_focus = None
         self.out_focus_max = None
+        self.gold = None
 
     _ab_kind = AutoTask._ab_kind
     _parse_ab = AutoTask._parse_ab
     _settle_cap = AutoTask._settle_cap
     _read_stamina = AutoTask._read_stamina
+    _read_gold = AutoTask._read_gold
 
 
 def items(*texts, kind="stamina"):
@@ -128,6 +132,24 @@ check("284/1784 不被截断误读", Stub()._parse_ab("284/1784"), None)
 s = Stub()
 s._read_stamina([{"t": "202/150", "cx": 960, "cy": 500, "b": Box()}], frame, page="专注恢复")
 check("专注弹窗中央数字仍能读", (s.out_focus, s.out_focus_max), (202, 150))
+
+print("--- 9. 顶栏金币固定位置读取（留 120 给笔记） ---")
+# 金币在 rel(0.567,0.042)，1936x1119 → abs(1098,47)。旁边 0.649 的「-130」飘字要排除。
+def gold_item(text, relx=0.567, rely=0.042):
+    return {"t": text, "cx": relx * 1936, "cy": rely * 1119, "b": Box()}
+
+s = Stub()
+s._read_gold([gold_item("155")], frame)
+check("金币槽 155 → gold=155", s.gold, 155)
+s._read_gold([gold_item("-130", 0.649)], frame)
+check("旁边 -130 飘字不在 ROI → 不覆盖金币", s.gold, 155)
+s._read_gold([gold_item("284/1784", 0.30, 0.042)], frame)
+check("精力槽的 a/b 不在金币 ROI → 不影响", s.gold, 155)
+s._read_gold([gold_item("第7周", 0.567, 0.042)], frame)
+check("金币槽里带中文 → 不认", s.gold, 155)
+s2 = Stub()
+check("frame=None 时返回 None", s2._read_gold([gold_item("99")], None), None)
+check("留底常量 = 120", Stub.GOLD_KEEP, 120)
 
 print(f"\n结果: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

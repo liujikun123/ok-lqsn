@@ -206,6 +206,9 @@ tuning:
     auto_buy: true
     snapshot: true                   # 每次进店存一张图（screenshots/auto/*_shop.png）便于校准
     max_buy_per_run: 4               # 一次进店最多买几件
+    # 玩家 2026-11-23 16:25：「优先保证有 120 块钱，要不然笔记刷出来买不了」。
+    # 笔记继承扭蛋上限 120（下面 egg.max_price），商店任何付费商品买完跌破 120 就不买。
+    keep_gold: 120
     # 玩家 2026-11-23 12:47：「周日就不要去商店了，周日能逛公园回复，
     # 再去商店买精力药不就溢出了」→ 这几个星期几一律不进店（7 = 周日）
     skip_weekdays: [7]
@@ -214,10 +217,14 @@ tuning:
       free:    {max_price: 0}                     # 老板的馈赠 / 馈赠+：标价 0，白拿 80 零用钱
       milk:    {max_price: 100}                   # 特训牛奶：减少训练精力消耗 = 变相多练一天
       stamina: {max_price: 50, when_below: 50, urgent_below: 35}  # wiki：只买 50 以下的；<35 见底时优先于牛奶
-      crit:    {max_price: 120, need_equip: true} # 器材暴击（带负面）：只有器材上站人才买
-      book:    {max_price: 120}                   # 教科书（训练等级）
-      stat:    {max_price: 80}                    # 属性秘籍（投射/弹跳/运控/体能/防守/意识）
-      charm:   {max_price: 80}                    # 表情 +5% 护符
+      # 以下四项是之前「查 wiki 扩白名单」自作主张加的，和玩家最早定的
+      # 「商店只买 0 元 + 精力<50 买药」冲突（16:25 玩家质问为何买秘籍）→ 默认关掉。
+      # 想重新开启把对应 enabled 改成 true 即可（仍受 keep_gold=120 约束）。
+      # 注意：键名必须用 enabled，不能用 on —— YAML 1.1 会把裸 on 解析成布尔 True。
+      crit:    {enabled: false, max_price: 120, need_equip: true}
+      book:    {enabled: false, max_price: 120}
+      stat:    {enabled: false, max_price: 80}    # 属性秘籍：玩家 16:25 明确不该买
+      charm:   {enabled: false, max_price: 80}
 
   # 体力 / 专注药水（玩家 2026-11-23 12:47：「是否允许使用体力药水」要做成工作台开关）
   #   一次训练固定消耗 30 专注；不够时游戏弹「训练所需专注还差 N，是否进行回复」
