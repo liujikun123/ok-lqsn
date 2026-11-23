@@ -148,6 +148,21 @@ r = s._do_unknown(items("9"), fade)
 check("紫过场帧 → 继续等待", r, True)
 check("紫过场帧无 unknown_texts", len(s.unknown_texts), 0)
 
+# C. LOGO 转场（2026-11-23 17:12 实跑）：训练结果→大厅之间播蓝色剪影动画，
+#    OCR 只读出一个「m」。full std≈37（不符合 A/B），但顶部无 HUD、蓝色占比高。
+logo = _np.full((1080, 1920, 3), 238, dtype="uint8")  # 米白背景 BGR
+# 顶部无 HUD（保持纯色）；中间画大片蓝色剪影 BGR(200,120,30)=蓝色
+_cv2.rectangle(logo, (450, 150), (1450, 900), (200, 120, 30), -1)
+_blue = ((logo[:, :, 0] > 140) & (logo[:, :, 2] < 130)).mean()
+check("LOGO过场蓝色占比足够", round(float(_blue), 3) > 0.15, True)
+check("LOGO过场帧被识别", s._is_loading_frame(logo, items("m")), True)
+check("正常页不误判为LOGO", s._is_loading_frame(normal_frame, items("训练", "投射")), False)
+s = Stub()
+r = s._do_unknown(items("m"), logo)
+check("LOGO过场 → 继续等待", r, True)
+check("LOGO过场无点击", [x for x in s.logs if x[0] == "click"], [])
+check("LOGO过场无 unknown_texts", len(s.unknown_texts), 0)
+
 print("--- 3.5 页面转移软约束（只警告不拦截）---")
 s = Stub()
 # 明确不可能：选人环节退回每日页

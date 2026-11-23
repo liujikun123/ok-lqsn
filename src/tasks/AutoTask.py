@@ -3596,7 +3596,11 @@ class AutoTask(MyBaseTask):
         A. 白屏加载：顶部 HUD 在、主体整屏白。body std≈4，hud std≈42。
         B. 纯过场背景：紫色渐变+光斑，连 HUD 都没有，OCR 只从光斑里读出「9」。
            full std≈22、hud std≈16（远低于正常页的 90+），文字 ≤2 段。
-        正常游戏页 full std 通常 >80，两种条件都碰不到，不会误伤。
+        C. LOGO 转场（2026-11-23 17:12 实跑）：训练结果→大厅之间播蓝色剪影+篮球
+           LOGO 动画，OCR 只读出「m」1 段就暂停。这帧有对比度(full std≈37)、
+           不符合 A/B，但顶部无 HUD(hud std≈1.2)、大片蓝色剪影(占比≈27%)、
+           背景米白(mean≈216)。离线扫全部截图只有这类帧命中，零误伤。
+        正常游戏页 full std 通常 >80，三种条件都碰不到，不会误伤。
         """
         if frame is None:
             return False
@@ -3615,6 +3619,13 @@ class AutoTask(MyBaseTask):
             if items is not None and gray.std() < 30.0 and hud_std < 25.0 \
                     and 60.0 < float(gray.mean()) < 250.0 and len(items) <= 2:
                 return True
+            # C. LOGO 转场：蓝色剪影占画面 1/4、顶部无 HUD、米白背景、几乎没文字
+            if items is not None and len(items) <= 2 and hud_std < 5.0 \
+                    and 180.0 < float(gray.mean()) < 250.0:
+                bl, rr = frame[:, :, 0], frame[:, :, 2]
+                blue_ratio = float(((bl > 140) & (rr < 130) & (bl - rr > 50)).mean())
+                if blue_ratio > 0.15:
+                    return True
             return False
         except Exception:
             return False
