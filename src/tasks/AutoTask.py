@@ -95,6 +95,10 @@ class AutoTask(MyBaseTask):
         self.trip_probe_done = None      # 已经探过的那天，例如 "6-7"
         self.trip_probe_disabled = False # 出行页退不出去 → 以后不再探，直接按原顺序
         self.trip_back_tries = 0         # 本次退出出行页试了几次
+        # 商店：以前 _do_shop 写好了却**从来没被调用过**（每日页没接入口），
+        # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
+        # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
+        self.shop_day = None
         self.unknown_count = 0
         self.minigame_tries = 0
         self.stock_idx = 0
@@ -817,12 +821,21 @@ class AutoTask(MyBaseTask):
             self._click_btn(match, "[比赛日-进赛前准备]", frame)
             return True
 
-        stamina_min = int(self.config.get("训练精力下限") or 40)
+        stamina_min = int(self.config.get("训练精力下限") or 12)
         st = self.stamina if self.stamina is not None else 999
         enough = st >= stamina_min
         train = self._btn_in_area(items, ["训练"], frame)
         rest = self._btn_in_area(items, ["休息"], frame)
         go = self._btn_in_area(items, ["出行"], frame)
+        shop = self._btn_in_area(items, ["商店"], frame)
+
+        # 商店（玩家 2026-11-23：只买 0 元 + 精力 <50 买精力药）
+        #   以前这里没接入口，整轮一次店都没进过 → 精力药从来没买过。
+        #   放在训练前：先把能补的精力补上，再决定练什么。
+        if shop and self._want_shop(items):
+            self.shop_day = self._day_key(items)
+            self._click_btn(shop, f"[进商店 精力{self.stamina} 看精力药/0元]", frame)
+            return True
 
         if train and enough:
             # 玩家 2026-11-23：「出行看有没有笔记，大于训练」。
@@ -1159,6 +1172,24 @@ class AutoTask(MyBaseTask):
         if self.trip_probe_disabled or not day_key:
             return False
         return self.trip_probe_done != day_key
+
+    def _want_shop(self, items):
+        """今天要不要进商店看一眼。
+
+        玩家口径（2026-11-23）：只买 0 元的东西；精力 < 50 时买精力药。
+        所以只有「精力低于阈值」才值得特地点进去（进店后 _do_shop 会顺手拿 0 元）。
+        按天记账，一天最多进一次，避免每日页 ↔ 商店来回打转。
+        """
+        shop_cfg = self._tuning().get("shop") or {}
+        if not self.config.get("商店自动购买", True):
+            return False
+        if self.shop_day is not None and self.shop_day == self._day_key(items):
+            return False
+        if self.shop_bought >= int(shop_cfg.get("max_buy_per_run", 2)):
+            return False
+        st = self.stamina if self.stamina is not None else 0
+        below = int(shop_cfg.get("stamina_item_when_below", 50))
+        return st < below
 
     def _place_tag(self, n, items, frame):
         """取某个出行地点名下方那行收益标签（精力+/属性+/笔记 …）。"""
@@ -1954,6 +1985,9 @@ class AutoTask(MyBaseTask):
         else:
             self.log_warning("没认出主训人员（只采到一个技能 / OCR 漏读），按场上名字直接算队友")
 
+        # ===== 失败率硬门槛（玩家 2026-11-23：手动打从来不失败）=====
+        scored = self._apply_fail_limit(scored, cfg)
+
         for d in scored:
             real = set(d["names"])          # 经理 / 主训 / 队友全算（玩家 2026-11-23）
             d["mates"] = len(real)
@@ -1963,6 +1997,12 @@ class AutoTask(MyBaseTask):
             self.log_info(f"「{d['row']['t']}」{d['level'] or '?'} 失败率={d['pct']}% "
                           f"队友{d['mates']}{sorted(real)} 器材{len(eq)}{eq} "
                           f"→ 得分 {d['score']:.2f}")
+
+        # ===== 意识加权 = 精力泵（玩家 2026-11-23）=====
+        # 意识训练**不消耗精力、反而小幅回精力**，而且是所有技能里成功率最高的。
+        # 所以精力见底时它不是「次优解」，而是唯一能让「周一到周六每天都训练」成立的选择。
+        # 精力充足时不加权，避免抢掉正常成长。
+        self._apply_consciousness_boost(scored, cfg)
 
         scored.sort(key=lambda d: (-d["score"],
                                    d["pct"] if d["pct"] is not None else 999))
@@ -2166,6 +2206,51 @@ class AutoTask(MyBaseTask):
             if d < best_d:
                 best, best_d = t, d
         return best
+
+    def _apply_fail_limit(self, scored, cfg):
+        """失败率硬门槛：只要存在 ≤limit 的技能，>limit 的一律踢出排名。
+
+        玩家 2026-11-23 口径「手动从来不失败」——原来只做乘法折扣，折扣再低也可能
+        选到 40%、50% 的项。现在改成硬过滤；全都高于门槛时才退回原排名，
+        否则那天就彻底没得练了。
+        读不到失败率（pct=None）也算不安全：不能假定它 0%。
+        """
+        lim = cfg.get("fail_limit")
+        if lim is None or not scored:
+            return scored
+        safe = [d for d in scored if d["pct"] is not None and float(d["pct"]) <= float(lim)]
+        if not safe:
+            self.log_warning(f"所有技能失败率都 >{lim}%，只能按原排名（今天做不到 0 失败）")
+            return scored
+        if len(safe) < len(scored):
+            drop = [(d["row"]["t"], d["pct"]) for d in scored if d not in safe]
+            self.log_warning(f"失败率 >{lim}% 直接排除（玩家口径：从不失败）→ {drop}")
+        return safe
+
+    def _apply_consciousness_boost(self, scored, cfg):
+        """精力低 → 给「意识」加权。
+
+        玩家 2026-11-23：**意识训练不消耗精力，反而会少量增加精力**，成功率也最高。
+        所以它是「低精力也能继续训练」的钥匙 —— 周一到周六全训练靠的就是它。
+        精力 ≥ stamina_below 时不加权，免得白白占掉成长位。
+        """
+        cons = cfg.get("consciousness") or {}
+        if not cons.get("enabled", True) or not scored:
+            return
+        st_now = self.stamina if self.stamina is not None else 999
+        low = float(cons.get("stamina_below", 45))
+        if st_now >= low:
+            return
+        target = str(cons.get("skill") or "意识")
+        hit = [d for d in scored if d["row"]["t"] == target]
+        if not hit:
+            self.log_info(f"精力 {st_now} < {low}，但「{target}」今天没有角标，按原排名")
+            return
+        boost = float(cons.get("boost", 99))
+        for d in hit:
+            d["score"] += boost
+        self.log_info(f"精力 {st_now} < {low} → 「{target}」加权 +{boost:g}"
+                      f"（不耗精力、小幅回精力、成功率最高）")
 
     def _score_core(self, mates, level, pct, cfg, equips=None):
         """编队打分 = 出场队友数，再按失败率打折。
@@ -2578,6 +2663,10 @@ class AutoTask(MyBaseTask):
         self.trip_probe_done = None      # 已经探过的那天，例如 "6-7"
         self.trip_probe_disabled = False # 出行页退不出去 → 以后不再探，直接按原顺序
         self.trip_back_tries = 0         # 本次退出出行页试了几次
+        # 商店：以前 _do_shop 写好了却**从来没被调用过**（每日页没接入口），
+        # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
+        # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
+        self.shop_day = None
         self.unknown_count = 0
         self.minigame_tries = 0
         self.stock_idx = 0

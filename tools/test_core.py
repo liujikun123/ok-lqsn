@@ -14,6 +14,7 @@ class Stub:
     """只挂被测方法需要的最小状态，不初始化 ok 框架。"""
 
     shop_has_stamina = None
+    stamina = None
 
     def log_info(self, msg):
         print(f"    info | {msg}")
@@ -25,6 +26,8 @@ class Stub:
 Stub._score_core = AutoTask._score_core
 Stub._force_skill_when_risky = AutoTask._force_skill_when_risky
 Stub._main_char_of_round = AutoTask._main_char_of_round
+Stub._apply_fail_limit = AutoTask._apply_fail_limit
+Stub._apply_consciousness_boost = AutoTask._apply_consciousness_boost
 
 CFG = {"teammate": 1.0, "level_bonus": {"Lv.1": 0.0, "Lv.2": 0.0, "MAX": 0.0},
        "fail_weight": 1.0, "resident_ratio": 1.0,
@@ -90,6 +93,41 @@ def main():
 
     no_pct = [item("投射", 2, "LV.1", None), item("意识", 1, "LV.1", 40)]
     allok &= check("失败率读不到 → 不强制", s._force_skill_when_risky(no_pct, CFG), None)
+
+    print("--- 失败率硬门槛：有 0% 的就不练 >0% 的（玩家：从不失败）---")
+    cfgl = dict(CFG, fail_limit=0)
+    pool = [item("投射", 3, "LV.1", 0), item("防守", 2, "LV.1", 30),
+            item("弹跳", 2, "LV.1", 0), item("意识", 1, "LV.1", None)]
+    kept = s._apply_fail_limit(pool, cfgl)
+    allok &= check("只剩 0% 的两项", sorted(d["row"]["t"] for d in kept), ["弹跳", "投射"])
+
+    allbad = [item("投射", 2, "LV.1", 40), item("防守", 2, "LV.1", 50)]
+    allok &= check("全都 >0% → 保留全部（没得挑）",
+                   len(s._apply_fail_limit(allbad, cfgl)), 2)
+
+    allok &= check("不配 fail_limit → 不过滤", len(s._apply_fail_limit(pool, CFG)), 4)
+
+    print("--- 意识加权：精力 < 45 时拉满（不耗精力、小幅回精力）---")
+    cfgc = dict(CFG, consciousness={"enabled": True, "skill": "意识",
+                                    "stamina_below": 45, "boost": 99})
+    picks = [item("防守", 3, "LV.1", 0), item("意识", 1, "LV.1", 0)]
+    s.stamina = 20
+    s._apply_consciousness_boost(picks, cfgc)
+    best = max(picks, key=lambda d: d["score"])["row"]["t"]
+    allok &= check("精力 20 → 意识反超 3 队友的防守", best, "意识")
+
+    picks2 = [item("防守", 3, "LV.1", 0), item("意识", 1, "LV.1", 0)]
+    s.stamina = 100
+    s._apply_consciousness_boost(picks2, cfgc)
+    allok &= check("精力 100 → 不加权，防守仍第一",
+                   max(picks2, key=lambda d: d["score"])["row"]["t"], "防守")
+
+    picks3 = [item("防守", 3, "LV.1", 0), item("体能", 2, "LV.1", 0)]
+    s.stamina = 20
+    s._apply_consciousness_boost(picks3, cfgc)
+    allok &= check("意识今天没角标 → 原排名不变",
+                   max(picks3, key=lambda d: d["score"])["row"]["t"], "防守")
+    s.stamina = None
 
     print("--- 主训人员：每个技能都在场的名字（不写死、且仍算队友）---")
     skills = [{"names": {"佐久间", "闪堂"}}, {"names": {"希雅", "闪堂"}},
