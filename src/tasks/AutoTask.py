@@ -85,6 +85,13 @@ PAGE_FORBIDDEN = {
 # 否则单看两个字有极小概率误伤，故这里放宽、最终判页在 _classify 里还要数属性词。
 XIN_JI_TI = re.compile(r"心\s*[·・.．]?\s*[技枝伎支]\s*[·・.．]?\s*体?")
 ATTR_WORDS = ("投射", "弹跳", "运控", "体能", "防守", "意识")
+# 2026-11-23 21:34 实跑：事件二选一的收益说明不只给六项属性，还会给资源
+# 「精力+30」「体力+30」「金币+…」。7.6b 原来只认 ATTR_WORDS，于是
+# 「精力+30 / 体能+30」这页只数到 1 条收益（≥2 才判选项），被 7.6 抢成
+# 「行程结果」→ _do_next 找不到主按钮就点屏幕中间，空转 15 步收工。
+# 单独扩一张收益词表，不要污染 ATTR_WORDS —— 那是六项属性，训练结果/
+# 属性面板的「属性词计数」规则靠它，混进资源词会把正常页判成训练结果。
+GAIN_WORDS = ATTR_WORDS + ("精力", "体力", "专注", "金钱", "金币", "资金")
 
 
 def is_attr_panel(text):
@@ -113,6 +120,10 @@ def _num(text):
 
 
 class AutoTask(MyBaseTask):
+
+    # 底部出现「成排黄卡片」时，允许把误判纠正成事件页的页面集合。
+    # 抽成常量便于回归测试断言（21:34 二选一事件页被判「行程结果」卡死）。
+    EVENT_CORRECT_PAGES = ("未知", "每日页", "训练结束", "剧情事件", "选项", "行程结果")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1070,11 +1081,14 @@ class AutoTask(MyBaseTask):
         #     (cy>0.78h) 且横向分开。这两条也含「属性+数字」，会被 7.6 抢成行程结果
         #     → 找不到继续按钮、点中间空转 15 步。所以先于 7.6 判成选项页。
         #     出行结果页的涨幅在正文区(cy≈0.5h)，不会命中，区分可靠。
+        # 21:34 补充：收益也可能是资源词（「算了，先放过她 精力+30」/
+        #     「让她挑战一下极限 体能+30」），OCR 还会带个爱心前缀读成「❤体能+30」。
+        #     用 GAIN_WORDS 覆盖属性 + 资源，正则用 search 天然容忍前缀符号。
         if frame is not None:
             gain_items = [it for it in items
                           if it["cy"] > 0.78 * frame.shape[0]
                           and re.search(r"(?:%s)\s*[+＋]\s*\d+|\d+%%\s*概率.*(?:%s)\s*[+＋]\s*\d+"
-                                        % ("|".join(ATTR_WORDS), "|".join(ATTR_WORDS)), it["t"])]
+                                        % ("|".join(GAIN_WORDS), "|".join(GAIN_WORDS)), it["t"])]
             if len(gain_items) >= 2:
                 return "选项"
         gain = re.search(r"(?:%s)\s*[+＋-]\s*\d+" % "|".join(ATTR_WORDS), joined)
@@ -4432,8 +4446,12 @@ class AutoTask(MyBaseTask):
             self._check_transition(last_page, page, frame=frame, step=step)
             # 事件页没有标题字，顶栏又带着「第N周」，很容易被认成每日页。
             # 成排黄卡片是它最硬的图像特征，所以在这里纠正一次。
-            if page in ("未知", "每日页", "训练结束", "剧情事件", "选项") \
-                    and self._event_cards(frame, items):
+            # 2026-11-23 21:34：二选一事件页（精力+30/体能+30）被 7.6 判成
+            # 「行程结果」也会卡死，而结果类页面原本不在白名单 → 把「行程结果」
+            # 加进来。真·行程结果页（涨幅飘字 + 剧情立绘）底部没有成排黄卡片，
+            # _event_cards 返回空，不会误纠正。这里是视觉兜底，与 7.6b 的文字
+            # 判定互为双保险：任一帧 OCR 读残或黄色比例抖动都能被另一条接住。
+            if page in self.EVENT_CORRECT_PAGES and self._event_cards(frame, items):
                 self.log_info(f"判定 {page} 但底部有成排黄卡片 → 按事件页处理")
                 page = "剧情事件"
             if page != "未知":
