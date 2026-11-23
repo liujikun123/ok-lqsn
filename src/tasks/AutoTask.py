@@ -265,21 +265,37 @@ class AutoTask(MyBaseTask):
           * 点击走 Pynput 的真实鼠标事件，框架的 `clickable()` = 窗口 is_foreground()，
             **窗口不在前台时点击直接被丢弃**（只打一行 info，不报错）。
           表现就是「日志一直在走、游戏一动不动」，很像卡死。
-        这里最多每 3 秒抢一次前台，避免每步都暴力 SetForegroundWindow。
+        2026-11-23 17:00 根治焦点问题（玩家用向日葵远程看画面，焦点被切走）：
+          原来这里 3 秒节流，节流窗口内焦点被抢走就完全不检查、不重抢，
+          于是 Pynput 点击连丢十几步 → 页面卡住不动。现在拆成两段：
+            · 廉价检查（每次都做，微秒级）：FindWindow + GetForegroundWindow，
+              在前台就立刻返回，不做任何重量操作；
+            · 重量抢回（仅不在前台时）：AttachThreadInput + SetForegroundWindow。
+          主循环每步、每次 click/send_key 前都调它，保证点击那一刻游戏一定在前台。
         """
-        now = time.time()
-        if now - getattr(self, "_last_fg_try", 0.0) < 3.0:
-            return
         try:
             import win32gui
             h = win32gui.FindWindow(None, "篮球少女：飞跃巅峰")
             if not h or win32gui.GetForegroundWindow() == h:
-                return
+                return True
         except Exception:
-            return
-        self._last_fg_try = now
-        self.log_info("游戏窗口不在前台 → 点击会被丢弃，正在抢回前台")
-        self._force_visible()
+            return False
+        # 不在前台：日志做节流（避免向日葵反复切时刷屏），但抢前台动作每次都做
+        now = time.time()
+        if now - getattr(self, "_last_fg_log", 0.0) >= 3.0:
+            self._last_fg_log = now
+            try:
+                fg_title = win32gui.GetWindowText(win32gui.GetForegroundWindow())
+            except Exception:
+                fg_title = "?"
+            self.log_warning(f"游戏窗口不在前台（当前：{fg_title!r}）→ 点击会被丢弃，抢回中")
+        # 抢前台本身也可能失败（AttachThreadInput 被拒等）；吞掉异常让点击继续走
+        # ——就算这次点击被框架丢弃，也好过整个任务抛异常崩掉。
+        try:
+            return self._force_visible()
+        except Exception as e:
+            self.log_warning(f"抢回前台失败：{e}")
+            return False
 
     def _start_watchdog(self):
         """看门狗：跑的过程中窗口被隐藏/最小化，next_frame() 会**永久阻塞**，
@@ -470,6 +486,24 @@ class AutoTask(MyBaseTask):
             return None
         _, bx, by, bw, bh = best
         return (bx + x1 + bw / 2.0, by + y1 + bh / 2.0)
+
+    # ---------- 焦点根治：所有点击/按键前强制确认游戏前台 ----------
+
+    def click(self, *args, **kwargs):
+        """覆盖框架 click：点击那一刻必须保证游戏在前台。
+
+        框架 PynputInteraction.click() 开头就 `if not clickable(): return`——
+        窗口不在前台时点击被静默丢弃（只打日志、不报错），表现就是「点了一直没反应」。
+        click_relative / click_box 内部最终都调到 self.click，覆盖这里一处即可全覆盖。
+        向日葵远程、切窗口看资料、输入法候选框都会抢焦点，所以必须每次点击前确认。
+        """
+        self._ensure_foreground()
+        return super().click(*args, **kwargs)
+
+    def send_key(self, *args, **kwargs):
+        """键盘同理：PynputInteraction.send_key() 也检查 clickable()。"""
+        self._ensure_foreground()
+        return super().send_key(*args, **kwargs)
 
     def _click_item(self, it, why=""):
         self.log_info(f"点击「{it['t']}」@({int(it['cx'])},{int(it['cy'])}) {why}")
@@ -4430,9 +4464,9 @@ class AutoTask(MyBaseTask):
             # 注意：不能用 repeat —— 它比的是 (页面, 文字段数)，而文字段数每帧都在抖，
             # 永远累加不到阈值。改用「页面名连续没变」来判卡死。
             # 2026-11-23 15:34 实跑：每日页连点「训练」15 步页面不变，手动点一下就进——
-            # 原因是窗口焦点被抢、pynput 点击被丢弃，而 _ensure_foreground 的 3 秒节流
-            # 期间没重抢。这里在卡住 4 步时**绕过节流强制置前**，给一次自愈机会。
-            if same_count in (4, 9):
+            # 原因是窗口焦点被抢、pynput 点击被丢弃。现在 click() 每次都守前台，
+            # 这里保留 4/8/12 步的强制置前作双保险（万一 _force_visible 那几帧没抢成功）。
+            if same_count in (4, 8, 12):
                 self.log_warning(f"页面「{page}」连续 {same_count} 步没变化，"
                                  f"强制把游戏窗口拉到前台再试（点击可能被丢弃）")
                 self._force_visible()

@@ -488,6 +488,16 @@ class Workbench(QMainWindow):
         self.btn_stop.setEnabled(st == "running")
         self.statusBar().showMessage({"running": "运行中…", "stopping": "正在停止…",
                                       "idle": "空闲"}.get(st, st))
+        # 焦点根治：任务一启动就把工作台最小化，前台让给游戏。
+        # Pynput 是前台点击，工作台停在前面（或你点它看日志）会把焦点抢走，
+        # Pynput 的 click() 检测到不在前台就静默丢弃 → 游戏一动不动。
+        # 最小化后从任务栏点回来即可看日志/停止，不影响训练。
+        if st == "running" and (self.cfg.get("run") or {}).get("minimize_on_run", True):
+            try:
+                self.showMinimized()
+                self.append_log("info", "工作台已最小化，前台已让给游戏（任务栏可点回来）")
+            except Exception:
+                pass
 
     def on_done(self, code: int, label: str) -> None:
         self.refresh_game_state()
