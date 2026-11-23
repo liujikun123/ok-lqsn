@@ -652,6 +652,11 @@ class AutoTask(MyBaseTask):
         # 2. 比赛整条链
         if has("赛前准备", "跳过比赛", "前往比赛"):
             return "赛前准备"
+        # 2.1 加时赛（第 7 周赢了之后追加的那三场）的赛前宣传页：只有
+        #     「EXTRA MISSION · VS XX学园」+「1天战胜XX」这类标题，没有任何按钮文字，
+        #     以前判成未知页，靠兜底连点中间 2~3 步才过去。
+        if "EXTRA MISSION" in joined or ("VS" in joined and has("战胜", "全国", "学园", "公学")):
+            return "赛前准备"
         if exact("MVP") or "MVP" in joined:
             return "比赛MVP"
         if has("目标达成", "日标达成"):
@@ -706,6 +711,14 @@ class AutoTask(MyBaseTask):
                         if it["cx"] > w * 0.72 and it["t"].replace(" ", "") in self.SKILLS}
         if len(right_skills) >= 4 or (exact("决定") and has("失败率")):
             return "训练核心"
+        # 7.35 开训动画（只有「训练开始」一行字）
+        if "训练开始" in joined:
+            return "训练结果"
+        # 7.4 训练后的属性成长面板（心·技·体 + 六个属性条 + 倍率加成）
+        #     它不是可交互页，点一下/下一步就过；判成「未知」会走兜底连点中间，
+        #     一轮下来能占十几步（实测未知页 23% 里一大半是它）。
+        if "心·技·体" in joined and has("投射", "弹跳", "运控", "体能", "防守", "意识"):
+            return "训练结果"
         # 7.5 出行/工资之类的结果屏：成功！+ 获得 + 下一步（顶栏也有第N周，会误判成每日页）
         if has("成功！", "成功!") and has("获得", "工资") and exact("下一步"):
             return "行程结果"
@@ -802,6 +815,19 @@ class AutoTask(MyBaseTask):
         h, w = frame.shape[:2]
         cands = [it for it in items if it["t"].strip() == "商店"
                  and it["cy"] > h * 0.15 and it["cx"] > w * 0.05]
+        if not cands:
+            # OCR 会把「商店」拆成「商」「店」两个框（2026-11-23 12:21 实测：
+            # 每日页文字是 ['...','商','店','休息',...]），精确匹配永远落空。
+            # 把同一行、左右相邻的「商」「店」合起来当按钮。
+            shang = [it for it in items if it["t"].strip() == "商"]
+            dian = [it for it in items if it["t"].strip() == "店"]
+            for a in shang:
+                for b in dian:
+                    if abs(a["cy"] - b["cy"]) < 45 and 0 < b["cx"] - a["cx"] < 130:
+                        cands.append({"t": "商店",
+                                      "cx": (a["cx"] + b["cx"]) / 2,
+                                      "cy": (a["cy"] + b["cy"]) / 2,
+                                      "b": a["b"]})
         if not cands:
             return None
         cands.sort(key=lambda x: (x["cx"] > w * 0.60 and x["cy"] > h * 0.45,
