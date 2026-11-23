@@ -29,3 +29,4 @@ venv/
 Thumbs.db
 .DS_Store
 desktop.ini
+config/.backup/

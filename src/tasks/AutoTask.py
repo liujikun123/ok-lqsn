@@ -27,6 +27,20 @@ STOP_WORDS = ["关闭", "取消", "返回"]
 
 WEEKDAYS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7}
 
+# 「心·技·体」属性面板 —— OCR 极不稳定：实测读出过「心·支·体」「心·枝·体」，
+# 甚至整行只剩「属性加成」「颜外队友」。所以不能精确匹配。
+XIN_JI_TI = re.compile(r"心\s*[·・.．]?\s*[技枝伎支]\s*[·・.．]?\s*体")
+ATTR_WORDS = ("投射", "弹跳", "运控", "体能", "防守", "意识")
+
+
+def is_attr_panel(text):
+    """是不是「心·技·体」属性加成面板（含 OCR 读花的变体）。"""
+    if XIN_JI_TI.search(text):
+        return True
+    if any(w in text for w in ("属性加成", "额外队友", "顏外队友", "颜外队友", "倍率加成")):
+        return True
+    return False
+
 
 def _game_visible():
     import win32gui
@@ -275,10 +289,19 @@ class AutoTask(MyBaseTask):
         except Exception as e:
             self.log_warning(f"前置窗口失败: {e}")
 
+    SHOT_TAGS = {"选择队友": "pick", "笔记选择": "note", "器材选择": "equip",
+                 "训练核心": "core", "每日页": "day", "商店": "shop"}
+
     def _shot(self, frame, tag):
         try:
             import cv2
             os.makedirs("screenshots/auto", exist_ok=True)
+            tag = str(tag)
+            for k, v in self.SHOT_TAGS.items():
+                tag = tag.replace(k, v)
+            # cv2.imwrite 不吃非 ASCII 文件名（实测写出来是 "鍣ㄦ潗閫夋嫨" 这种乱码）
+            tag = "".join(c if (c.isascii() and (c.isalnum() or c in "-_")) else "_"
+                          for c in tag)
             p = f"screenshots/auto/{time.strftime('%H%M%S')}_{tag}.png"
             cv2.imwrite(p, frame)
             return p
@@ -780,7 +803,7 @@ class AutoTask(MyBaseTask):
         # 7.4 训练后的属性成长面板（心·技·体 + 六个属性条 + 倍率加成）
         #     它不是可交互页，点一下/下一步就过；判成「未知」会走兜底连点中间，
         #     一轮下来能占十几步（实测未知页 23% 里一大半是它）。
-        if "心·技·体" in joined and has("投射", "弹跳", "运控", "体能", "防守", "意识"):
+        if is_attr_panel(joined) and sum(1 for w in ATTR_WORDS if w in joined) >= 3:
             return "训练结果"
         # 7.5 出行/工资之类的结果屏：成功！+ 获得 + 下一步（顶栏也有第N周，会误判成每日页）
         if has("成功！", "成功!") and has("获得", "工资") and exact("下一步"):
@@ -835,6 +858,15 @@ class AutoTask(MyBaseTask):
         #     只认「第N周」不行 —— 行程结果、野餐中、粉丝对话这些页顶栏也带第N周，
         #     被当成每日页后找不到按钮，就会一直警告空转（2026-11-23 06:13 实测）。
         if re.search(r"第\s*\d+\s*周", joined) and self._action_btn(items, frame):
+            return "每日页"
+        # 12.1 按钮文字被读花/被提示条挤掉的每日页（2026-11-23 13:0x 实跑：
+        #      ['第1周','星期二','3 113/130','60','6','数早三','购买并使用防守秘籍']
+        #      被当未知页，白点好几步）。「第N周 + 星期X + 精力 a/b」这三件套
+        #      是这游戏里每日页独有的，凑齐就认；再用其他页的硬特征排掉。
+        if (re.search(r"第\s*\d+\s*周", joined)
+                and re.search(r"星期[一二三四五六日天]", joined)
+                and re.search(r"\d{1,3}\s*/\s*\d{1,3}", joined)
+                and not has("MVP", "赛前准备", "目标达成", "点击屏幕继续", "心·", "·体")):
             return "每日页"
         # 兜底：只剩「第N周」不代表就是每日页（很多结果页也带顶栏），
         # 交给未知页兜底（点屏幕中间推进）比硬当成每日页安全。
@@ -1300,6 +1332,9 @@ class AutoTask(MyBaseTask):
     def _can_probe_trip(self, day_key):
         """今天还能不能为「看笔记」去点出行。"""
         if self.trip_probe_disabled or not day_key:
+            return False
+        # 工作台上的开关：关掉就回到「训练优先」的老顺序（有训练先训练，出行只在精力不够时）
+        if not bool((self._tuning().get("trip") or {}).get("probe_notes_first", True)):
             return False
         return self.trip_probe_done != day_key
 
@@ -2466,7 +2501,7 @@ class AutoTask(MyBaseTask):
         self.log_info(f"失败率全部 >{thr}% 且商店无精力道具 → 改练「{want}」（成功率最高）")
         return cand
 
-    def _sample_core(self, row, frames=6, gap=0.18, warmup=0.35, max_tries=10,
+    def _sample_core(self, row, frames=6, gap=0.18, warmup=0.35, max_tries=18,
                      min_frames=4):
         """点开技能后等 0.4 秒（选中态出来），再连拍几帧投票成稳定值。
 
@@ -2509,20 +2544,29 @@ class AutoTask(MyBaseTask):
             # 反例加固（2026-11-23 10:32 实测）：采样中途点了按钮切到「赛前准备」，
             # 那一帧把阵容页的位置名（分卫/大前/控卫）当成队友、把球队大卡当成器材，
             # 结果唯一一项得分 8 分，直接定案选错技能。只要出现比赛/结算类的字眼就丢帧。
-            off_core = any(w in " ".join(it["t"] for it in its)
+            _txt = " ".join(it["t"] for it in its)
+            off_core = is_attr_panel(_txt) or any(w in _txt
                            for w in ("赛前准备", "跳过比赛", "前往比赛", "MVP", "目标达成",
                                      # 2026-11-23 12:10 实跑发现：点技能后有时先弹「心·技·体」
                                      # 属性/加成大浮层，把编队面板整个盖住。这类帧以前会被
                                      # 当成训练核心页的错误读数，现在明确丢掉（48% 的采样
                                      # 0 帧有效就是栽在这上面）。
-                                     "心·技·体", "属性加成", "表情升级", "倍率加成"))
+                                     "表情升级"))
             looks_core = (not off_core) and (hits >= 1 or has_pct or has_lv or len(names) >= 2)
             if not looks_core:
-                # 连续 4 帧都不像训练核心页 = 页面已经走了（训练结束弹出「器材事件」
-                # 这类随机事件最常见），再采下去只是白烧 10 次 × 0.18s + OCR 时间。
+                # 【2026-11-23 13:1x 实跑修正】点开技能后游戏先播一段「加成展示」动画
+                # （画面上只剩「倍率加成」「属性加成」「C」这类字，1~3 秒才消失）。
+                # 以前把这类帧也算进 bad_streak，4 帧（≈0.7s）就判「页面切走了」收工，
+                # 于是 0 帧有效的占比 20%。现在分两种：
+                #   · 加成/倍率/属性面板这类**已知过渡动画** → 耐心等，不算失败；
+                #   · 真·切走（出现赛前准备/MVP 等）→ 才累加 bad_streak 早退。
+                if is_attr_panel(_txt) or ("倍率加成" in _txt) or (len(its) <= 3 and used == 0):
+                    self.sleep(0.35)          # 等动画播完（循环开头的 tries 已经计过数）
+                    continue
                 bad_streak += 1
                 if bad_streak >= 4 and used == 0:
-                    self.log_warning("连续 4 帧都不像训练核心页 → 页面已经切走，停止采样")
+                    self.log_warning(f"连续 4 帧都不像训练核心页 → 页面已经切走，停止采样"
+                                     f"（画面文字 {[it['t'] for it in its][:8]}）")
                     break
                 self.sleep(gap)
                 continue
@@ -2784,7 +2828,10 @@ class AutoTask(MyBaseTask):
             2. 要补只喝**小瓶 +30**（刚好一次），小瓶没库存才退大瓶。
         """
         mode = str(self._cfg("专注恢复", "体力恢复", default="用道具"))
-        limit = int(self._cfg("每轮最多补专注次数", "每轮最多补体力次数", default=4))
+        s_cfg = self._tuning().get("stamina") or {}
+        allow_item = bool(s_cfg.get("use_item", True))     # 玩家要的「是否允许使用体力药水」
+        limit = int(s_cfg.get("max_per_round")
+                    or self._cfg("每轮最多补专注次数", "每轮最多补体力次数", default=1))
         close_xy = (0.927, 0.135)          # 右上角 X
         use_item = self._find(items, ["使用道具"], exact=True)
 
@@ -2792,6 +2839,11 @@ class AutoTask(MyBaseTask):
             self.log_warning(f"专注恢复：{reason}，关闭弹窗")
             self.click_relative(*close_xy)
             self.stamina_refills = 0        # 这次补药结束，下次弹窗重新计瓶数
+
+        # ---- 玩家开关：不允许喝药就直接关弹窗（工作台里就是这颗开关）----
+        if not allow_item:
+            close("配置 stamina.use_item=false，不允许使用精力药水")
+            return True
 
         # ---- 详情页：按下「使用道具」才算真喝掉 ----
         if use_item and mode != "关闭":
@@ -3114,9 +3166,19 @@ class AutoTask(MyBaseTask):
 
         max_steps = int(self.config.get("最大步数") or 1500)
         wait = float(self.config.get("等待秒数") or 1.3)
-        stop_after_run = bool(self.config.get("跑完一轮就停", True))
+        # 循环轮数：`tuning.loop.max_rounds`（工作台上的那颗「循环轮数」）
+        #   「跑完一轮就停」是老的单轮开关，仍然有最高优先级 —— 它一开就是 1 轮，
+        #   这样以前的行为一字不变，不会因为改了轮数把老配置搞出意外。
+        loop_cfg = self._tuning().get("loop") or {}
+        max_rounds = max(1, int(loop_cfg.get("max_rounds") or 1))
+        if bool(self.config.get("跑完一轮就停", True)) and max_rounds > 1:
+            self.log_warning(f"配置里循环 {max_rounds} 轮，但「跑完一轮就停」= true → 只跑 1 轮"
+                             f"（工作台保存时会把这两项对齐）")
+            max_rounds = 1
+        self.rounds_done = 0
+        self.max_rounds = max_rounds
 
-        self.log_info(f"开始自动训练：最多 {max_steps} 步")
+        self.log_info(f"开始自动训练：最多 {max_steps} 步，共 {max_rounds} 轮")
 
         # 角色分支：不同主训人员走不同支线（剧情选项、小游戏、事件都不一样）。
         # 结构先接好，规则后填 —— strategy.yaml 的 routes 现在还是空的。
@@ -3130,11 +3192,39 @@ class AutoTask(MyBaseTask):
             self.log_info(f"角色 {_char} 暂无分支规则，全部走默认")
         self._start_watchdog()
         try:
-            return self._run_loop(max_steps, wait, stop_after_run)
+            return self._run_loop(max_steps, wait, max_rounds)
         finally:
             self._watchdog_stop = True
 
-    def _run_loop(self, max_steps, wait, stop_after_run):
+    def _begin_round(self):
+        """开始新的一轮之前，把「按天/按局」的状态清掉。
+
+        不清会怎样：第 2 轮的第一天，`trip_probe_done` 还停在第 1 轮最后那天，
+        商店 `shop_day` 也可能撞上，于是「探出行」「看货架」这些一天一次的动作
+        整轮都被跳过。全局累计（买了几件、喝了几瓶）**故意不清** —— 那些是
+        「每轮最多几次」的口径，跨轮累计才拦得住。
+        """
+        self.saw_training = False
+        self.in_training = False
+        self.weekday = None
+        self.core_checked = False
+        self.trip_picked = False
+        self.trip_probe = False
+        self.trip_probe_done = None
+        self.trip_back_tries = 0
+        self.unknown_count = 0
+        self.minigame_tries = 0
+        self.stock_idx = 0
+        self.stock_tries = 0
+        self.stock_picked = False
+        self.slots_autofill = 0
+        self.slots_empty = 0
+        self.slots_checked_page = None
+        self.confirm_gray = 0
+        self.main_char_round = None
+        self.log_info(f"—— 开始第 {self.rounds_done + 1}/{self.max_rounds} 轮 ——")
+
+    def _run_loop(self, max_steps, wait, max_rounds):
         last_key, repeat = None, 0
         last_page = None
         same_count = 0
@@ -3245,10 +3335,17 @@ class AutoTask(MyBaseTask):
             elif page == "每日页":
                 self._do_daily(items, frame)
             elif page == "大厅":
-                if self.saw_training and stop_after_run:
-                    self.log_info("★ 一轮训练已跑完，回到大厅 —— 收工", notify=True)
-                    self._shot(frame, "done_hall")
-                    break
+                if self.saw_training:
+                    self.rounds_done += 1
+                    if self.rounds_done >= max_rounds:
+                        self.log_info(f"★ 第 {self.rounds_done} 轮训练已跑完（共 {max_rounds} 轮），"
+                                      f"回到大厅 —— 收工", notify=True)
+                        self._shot(frame, "done_hall")
+                        break
+                    self.log_info(f"第 {self.rounds_done}/{max_rounds} 轮完成，"
+                                  f"游戏不关，接着开下一轮", notify=True)
+                    self._shot(frame, f"round{self.rounds_done}_done")
+                    self._begin_round()
                 # 大厅右下角按钮实际写的是「训练中」（不是「训练」），
                 # 且上次异常退出时点它会先弹「训练确认 → 继续训练」。
                 it = self._find(items, ["训练中", "训练"], exact=True) or self._find(items, ["训练中"])

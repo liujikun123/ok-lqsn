@@ -11,12 +11,13 @@ import time
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QFont, QTextCursor, QColor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
-    QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFrame, QGroupBox, QHBoxLayout,
+    QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from workbench import runner as R
+from workbench.settings_ui import SettingsPanel
 
 ROOT = R.project_root()
 
@@ -52,6 +53,16 @@ QTableWidget {{ gridline-color: #f0f1f3; }}
 QHeaderView::section {{ background: #fafbfc; border: none; border-bottom: 1px solid {BORDER};
                         padding: 5px; color: {MUTED}; font-weight: 600; }}
 QSplitter::handle {{ background: transparent; }}
+QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 8px; background: {CARD}; }}
+QTabBar::tab {{ background: transparent; color: {MUTED}; padding: 6px 14px; margin-right: 2px;
+                border: 1px solid transparent; border-top-left-radius: 8px;
+                border-top-right-radius: 8px; }}
+QTabBar::tab:selected {{ background: {CARD}; color: {TEXT}; border-color: {BORDER};
+                         border-bottom-color: {CARD}; font-weight: 600; }}
+QTabBar::tab:hover {{ color: {ACCENT}; }}
+QSpinBox {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px;
+            padding: 5px 8px; min-width: 72px; }}
+QCheckBox {{ spacing: 6px; }}
 """
 
 LOG_COLORS = {
@@ -115,7 +126,7 @@ class Workbench(QMainWindow):
         head = QHBoxLayout()
         title = QLabel("篮球少女 · 自动训练工作台")
         title.setStyleSheet("font-size:18px; font-weight:700;")
-        sub = QLabel("发布版 0.1 · 框架")
+        sub = QLabel("发布版 0.2 · 可改配置")
         sub.setStyleSheet(f"color:{MUTED}; font-size:12px; padding-top:4px;")
         head.addWidget(title)
         head.addWidget(sub)
@@ -165,12 +176,11 @@ class Workbench(QMainWindow):
         box = QWidget()
         lay = QVBoxLayout(box)
         lay.setContentsMargins(0, 0, 8, 0)
-        lay.setSpacing(10)
+        lay.setSpacing(8)
 
-        # 配置
-        g1 = QGroupBox("加载配置")
-        v = QVBoxLayout(g1)
-        row = QHBoxLayout()
+        # 规则文件：多份规则（strategy / 周末冲量 …）就在这里切
+        g1 = QGroupBox("规则文件")
+        row = QHBoxLayout(g1)
         self.cmb_rule = QComboBox()
         self.cmb_rule.currentTextChanged.connect(self.preview_rule)
         btn_reload = QPushButton("重新读取")
@@ -180,8 +190,21 @@ class Workbench(QMainWindow):
         row.addWidget(self.cmb_rule, 1)
         row.addWidget(btn_reload)
         row.addWidget(btn_open)
-        v.addLayout(row)
+        lay.addWidget(g1)
 
+        self.tabs = QTabWidget()
+        self.panel_settings = SettingsPanel(ROOT, self)
+        self.panel_settings.log.connect(self.append_log)
+        self.tabs.addTab(self.panel_settings, "运行设置")
+        self.tabs.addTab(self._summary_tab(), "规则摘要")
+        self.tabs.addTab(self._raw_tab(), "规则原文")
+        lay.addWidget(self.tabs, 1)
+        return box
+
+    def _summary_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
         self.tbl = QTableWidget(0, 2)
         self.tbl.setHorizontalHeaderLabels(["项目", "当前值"])
         self.tbl.verticalHeader().setVisible(False)
@@ -192,20 +215,24 @@ class Workbench(QMainWindow):
         self.tbl.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         v.addWidget(self.tbl)
-        lay.addWidget(g1)
+        v.addStretch(1)
+        note = QLabel("这一页只是速览，要改值请到「运行设置」。")
+        note.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        v.addWidget(note)
+        return w
 
-        # 原文预览
-        g2 = QGroupBox("规则原文（只读）")
-        v2 = QVBoxLayout(g2)
+    def _raw_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
         self.txt_rule = QPlainTextEdit()
         self.txt_rule.setReadOnly(True)
         f = QFont("Consolas")
         f.setStyleHint(QFont.Monospace)
         f.setPointSize(9)
         self.txt_rule.setFont(f)
-        v2.addWidget(self.txt_rule)
-        lay.addWidget(g2, 1)
-        return box
+        v.addWidget(self.txt_rule)
+        return w
 
     def _right_panel(self) -> QWidget:
         g = QGroupBox("运行日志")
@@ -258,6 +285,10 @@ class Workbench(QMainWindow):
 
     def preview_rule(self) -> None:
         p = self.current_rule_path()
+        name = self.cmb_rule.currentText()
+        if name and hasattr(self, "panel_settings"):
+            # 设置面板改的永远是「当前选中的这份规则文件」
+            self.panel_settings.bind_yaml(os.path.join("config", name))
         if not os.path.exists(p):
             self.txt_rule.setPlainText("（没有可读的规则文件）")
             self.tbl.setRowCount(0)
@@ -318,6 +349,8 @@ class Workbench(QMainWindow):
     def start_boot(self, auto: bool) -> None:
         if not self._guard():
             return
+        if not self._flush_settings():
+            return
         timeout = int(self.game.get("boot_timeout") or 150)
         args = ["tools/start_game.py", "--timeout", str(timeout)]
         if auto:
@@ -325,8 +358,26 @@ class Workbench(QMainWindow):
         label = "启动游戏并训练" if auto else "启动游戏"
         self.runner.run(args, label)
 
+    def _flush_settings(self) -> bool:
+        """开跑前处理「设置面板有改动但没保存」。返回 False 表示用户取消。"""
+        dirty = self.panel_settings.dirty_or_none()
+        if not dirty:
+            return True
+        r = QMessageBox.question(
+            self, "设置还没保存",
+            f"设置面板里有 {len(dirty)} 项改动没保存。\n\n"
+            "是：保存后运行　　否：按文件里现有的配置运行　　取消：回去改",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+        if r == QMessageBox.Cancel:
+            return False
+        if r == QMessageBox.Yes:
+            self.panel_settings.save()
+        return True
+
     def start_train(self) -> None:
         if not self._guard():
+            return
+        if not self._flush_settings():
             return
         run, _ = R.game_running(ROOT)
         if not run:
