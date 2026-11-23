@@ -157,6 +157,11 @@ check("纯属性面板→训练结果(非选人)", s._classify(items(pure_attr),
 # 真·训练核心：右侧六技能 + 决定 + 失败率，无属性面板标题词
 pure_core = "第7周 星期2 精力97/130 投射 弹跳 防守 体能 运控 意识 决定 失败率0%".split()
 check("纯训练核心→训练核心(非结果)", s._classify(items(pure_core), None), "训练核心")
+# 17:30 实跑：「附加赛目标」弹窗盖住每日页，顶栏被遮读不出，但底部训练/休息/商店还在
+extra_banner = "附加赛目标 商店 休息 训练".split()
+check("附加赛目标弹窗盖每日页→每日页", s._classify(items(extra_banner), None), "每日页")
+# 反向：只有「附加赛目标」一个词、没有行动按钮 → 不认每日页（避免别处误伤）
+check("附加赛目标无按钮→未知", s._classify(items(["附加赛目标"]), None), "未知")
 
 print(f"\n=== 通过 {PASS} / 失败 {FAIL} ===")
 sys.exit(1 if FAIL else 0)
