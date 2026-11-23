@@ -2782,6 +2782,39 @@ class AutoTask(MyBaseTask):
         self.click_relative(0.926, 0.831)
         return True
 
+    def _selected_skill(self, frame, rows):
+        """从当前帧认出「深蓝高亮」的技能胶囊 = 游戏默认选中的那一项。
+
+        实测两帧（2026-11-23 20:37）：
+          W1D4 点开弹跳后：选中态整条带 亮度≈124、B-R≈9（深藏青）；
+                            其余 亮度≈170~189、B-R≈95~117（浅蓝底）。
+          10:13 调试帧：    选中态 亮度≈102、B-R≈24；其余 亮度≈168~179、
+                            B-R≈-76~-116（橙底）。
+        所以判据用「明显更暗 + B 不远高于 R」，两种皮肤都成立，也不会把黄色
+        角标 / 「决定」按钮误当选中态。认不出返回 None，调用方走保守路径。
+        """
+        try:
+            h, w = frame.shape[:2]
+            sx, sy = w / 1920.0, h / 1080.0
+            best, best_dark = None, None
+            for r in rows:
+                cx, cy = r["cx"], r["cy"]
+                x0, x1 = max(0, int((cx - 180) * sx)), min(w, int((cx + 180) * sx))
+                y0, y1 = max(0, int((cy - 30) * sy)), min(h, int((cy + 30) * sy))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                roi = frame[y0:y1, x0:x1]
+                b = float(roi[:, :, 0].mean())
+                g = float(roi[:, :, 1].mean())
+                rr = float(roi[:, :, 2].mean())
+                bright = (b + g + rr) / 3.0
+                if bright < 155 and (b - rr) < 60:
+                    if best_dark is None or bright < best_dark:
+                        best, best_dark = r["t"], bright
+            return best
+        except Exception:
+            return None
+
     def _do_training_core(self, items, frame):
         """训练核心页：只点右上角带角标的技能 → 读队友 / 器材 / 失败率 → 打分 → 决定。
 
@@ -2797,6 +2830,15 @@ class AutoTask(MyBaseTask):
         if self.core_checked:
             return self._decide(items, frame)
         self.core_checked = True
+
+        # 2026-11-23 玩家指出（14 次实跑全部验证）：训练核心页默认选中的是「投射」，
+        # 再点它一次游戏就当作确认开训，3~4 秒后直接跳「训练结果」，整次编队比较作废。
+        # 所以当前高亮的那一项只读不点；实测深蓝胶囊就是选中态，用画面认，不写死。
+        selected = self._selected_skill(frame, rows)
+        if selected:
+            self.log_info(f"当前默认选中「{selected}」→ 这一项不点击，直接采默认帧")
+        else:
+            self.log_warning("没认出默认选中态 → 「投射」跳过点击且不参与排名（保守路径）")
 
         cfg = self._tuning().get("core_score", {}) or {}
         audit_week, audit_day = self._read_week(items)   # 证据目录按「第N周星期X」分组
@@ -2814,8 +2856,18 @@ class AutoTask(MyBaseTask):
 
         scored = []
         for idx, (r, _spot) in enumerate(targets, 1):
-            self.log_info(f"—— 点开「{r['t']}」（{idx}/{len(targets)}）看编队")
-            self._click_item(r, "[展开编队]")
+            name = r["t"]
+            # 「投射」是默认选中项时绝不能再点；若这局高亮的不是投射，说明默认项变了，
+            # 投射没有可靠数据来源，宁可不参与排名也不冒险点它（点了就会开训）。
+            if name == "投射" and selected != "投射":
+                self.log_warning(f"「投射」不是默认选中项（当前 {selected}）→ 跳过，不点击也不采样")
+                continue
+            no_click = (name == selected)
+            if no_click:
+                self.log_info(f"—— 默认选中「{name}」（{idx}/{len(targets)}）：不点击，直接采当前帧")
+            else:
+                self.log_info(f"—— 点开「{name}」（{idx}/{len(targets)}）看编队")
+                self._click_item(r, "[展开编队]")
             # 选中态会一直保留，起手等 0.4s 就够（由 _sample_core 的 warmup 控制）
             names, pct, level, equips = self._sample_core(r)
 
@@ -2830,12 +2882,16 @@ class AutoTask(MyBaseTask):
                     return True
 
             if not names and pct is None and level is None:
+                if no_click:
+                    self.log_warning(f"「{name}」默认帧没读到编队 → 不参与排名（不补点，避免误开训）")
+                    continue
                 # 2026-11-23 实测：「意识」这一档常点了没反应（选中的还是上一个技能），
                 # 因为它贴在最底下、离属性条太近。往上挪 26px 重点一次再读。
-                self.log_warning(f"「{r['t']}」没读到编队（可能点偏了），往上挪 26px 重点一次")
+                self.log_warning(f"「{name}」没读到编队（可能点偏了），往上挪 26px 重点一次")
                 self.click(r["cx"], r["cy"] - 26)
                 names, pct, level, equips = self._sample_core(r)
-            f2 = self._frame()
+            # 默认选中的那一项，证据就用刚进页面时的原始帧（数据也是从这一帧读的）
+            f2 = frame if no_click else self._frame()
             if f2 is not None and self.config.get("保存截图"):
                 self._shot(f2, f"core_{idx}")
             # 三项全空 = 这次采样整个失败了（取帧全 None / 画面还在渲染），
@@ -2849,7 +2905,8 @@ class AutoTask(MyBaseTask):
             f2_items = self._texts(f2) if f2 is not None else []
             audit_txt = (
                 f"第{audit_week}周 星期{audit_day}  采样时刻 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"技能：{r['t']}  有效采样：{valid}\n"
+                f"技能：{name}  有效采样：{valid}  "
+                f"采样方式：{'默认选中帧(未点击)' if no_click else '点开胶囊后采样'}\n"
                 f"队友({len(names)})：{names}\n"
                 f"器材({len(equips or [])})：{equips}\n"
                 f"失败率：{pct}%   等级：{level}\n"
@@ -2959,6 +3016,7 @@ class AutoTask(MyBaseTask):
             f"精力 {self.stamina}/{self.stamina_max}  金币 {getattr(self, 'gold', None)}\n\n"
             f"【每项原始读数与得分】\n" + "\n".join(detail_lines) + "\n\n"
             f"【编队排名】\n{rank_txt}\n\n"
+            f"【默认选中项】{selected or '未识别'}（该项未点击，直接采默认帧）\n"
             f"【规则覆盖】{'改练 ' + forced['row']['t'] + '（原第一 ' + scored[0]['row']['t'] + '）'
                          if forced and scored[0] is not forced else '无'}\n"
             f"【最终选择】{_sk}  得分 {best['score']:.2f}  失败率 {best.get('pct')}%\n"
@@ -2969,7 +3027,11 @@ class AutoTask(MyBaseTask):
         # 运行记录：记下这次选课的最终得分与当时的体力，工作台按轮次列出来
         self._runlog_train(_sk, best["score"], best["pct"], best["mates"],
                            best.get("equips"))
-        self._click_item(best["row"], f"[最优编队 {_sk} 得分{best['score']:.1f}]")
+        if _sk == selected:
+            # 本来就是默认选中项，再点一次会被游戏当成确认开训，跳过直接点「决定」
+            self.log_info(f"「{_sk}」本来就是默认选中项 → 不再点它，避免二次确认开训")
+        else:
+            self._click_item(best["row"], f"[最优编队 {_sk} 得分{best['score']:.1f}]")
         self.sleep(1.0)
         f3 = self._frame()
         if f3 is None:
