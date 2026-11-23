@@ -89,6 +89,12 @@ for text in ATTR_CASES:
     check(f"属性面板[{text[:12]}...] is_attr_panel", panel, True)
     check(f"属性面板[{text[:12]}...] →训练结果", got, "训练结果")
 
+# 14:59 实跑抓到的过渡帧：末字「体」被 OCR 吞，只剩「心·技」+ 六属性带数值。
+# 修复前：XIN_JI_TI 要求「体」→ 不命中 → 判未知 → fallback=pause 提前收工（0/1）。
+stub_case = "心·技 35 投射C367/1784 体能C284/1640 弹跳A679/+25 防守B+507/2040 运控B474/1745 意识C298/+12".split()
+check("残缺[心·技] is_attr_panel", is_attr_panel(" ".join(stub_case)), True)
+check("残缺[心·技] →训练结果(非未知)", s._classify(items(stub_case), None), "训练结果")
+
 # ---------------------------------------------------------------- 4. 其他真实未知页
 print("--- 4. 日志里其他真实未知页 ---")
 OTHER = [

@@ -237,7 +237,8 @@ tuning:
       - {name: 比赛结果横幅, keys: [NBA, 战胜, 赢得比赛], action: next}
       - {name: 合宿结算,     keys: [海边合宿结束, 心愿达成, 完美], action: next}
       - {name: 本周总结,     keys: [本周总结, 球队评分], action: next}
-      - {name: 属性加成,     keys: [初始加成, 属性加成, 心·技·体, 倍率加成], action: next}
+      # 心·技（缺末字）是 2026-11-23 14:59 实跑抓到的过渡帧残缺读数，曾导致 0/1 提前收工
+      - {name: 属性加成,     keys: [初始加成, 属性加成, 心·技·体, 心·技, 心枝, 倍率加成], action: next}
       - {name: 野餐中,       keys: [野餐中, 划船中, 散步中], action: next}
       - {name: 专业指导,     keys: [专业指导, 精力提升了], action: next}
 
