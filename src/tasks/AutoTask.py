@@ -747,6 +747,14 @@ class AutoTask(MyBaseTask):
         #     否则回大厅会被当成每日页，收工判定就永远等不到（saw_training 白攒）。
         if exact("训练") and has("协会", "好友", "图鉴", "成就", "招募"):
             return "大厅"
+        # 【2026-11-23 12:05 实跑兜底】OCR 偶尔读不到「训练」两个字，整个大厅就被判成
+        # 未知页，连点 11 次屏幕中间后停机（那一轮 0 步有效）。大厅有一批**独占词**，
+        # 凑够 3 个且没有「星期X」（每日页才有的）就认大厅。
+        hall_hits = sum(1 for w in ("助教", "商城", "飞跃计划", "协会赛", "表演赛",
+                                    "招募", "卡册", "图鉴", "成就", "协会")
+                        if has(w))
+        if hall_hits >= 3 and not re.search(r"星期[一二三四五六日天]", joined):
+            return "大厅"
         # 12. 每日行动页（枢纽）：带「第N周」+ 右下角真的有行动按钮。
         #     只认「第N周」不行 —— 行程结果、野餐中、粉丝对话这些页顶栏也带第N周，
         #     被当成每日页后找不到按钮，就会一直警告空转（2026-11-23 06:13 实测）。
@@ -1380,26 +1388,48 @@ class AutoTask(MyBaseTask):
         return "other"
 
     def _shop_price(self, items, item):
-        """商品卡附近的价格（元）。先认『N元』，再认卡片下方的纯数字。
+        """商品卡上的价格。
 
-        实机事实：游戏里卡片上的价格是**纯数字**（如 130 / 40 / 50），
-        不带「元」字，所以只按 `\\d+元` 匹配会全部读不到价，白名单的价格上限就失效。
+        【2026-11-23 12:12 实机 1920x1080 截图逐字量的坐标】
+            道具名 y=298 → 「剩余：1」y=474 → 价格 y=517（下一行分别是 584/763/805）
+        也就是说价格在「剩余」下面 **约 43px**，名字下面 219px（≈5.5 个字高）。
+        之前按「名字下方 3.2h」找，所以真价格一律超范围 → 全部 None，
+        价格上限形同虚设；偶尔还会把库存那个「1」当价格。
+        现在改成以「剩余」这一行作锚点，价格必须在它下面 5~95px；
+        没有锚点才退回按名字的高度比例找。
         """
         h = item["b"].height
+        stocks = [it["cy"] for it in items
+                  if ("剩余" in (it["t"] or "") or "剩余" in (it["t"] or "").replace("：", ":"))
+                  and abs(it["cx"] - item["cx"]) < 90]
+        # 必须取**名字下方**最近的那条「剩余」：第二行卡片的正上方 110px 也有第一行的
+        # 「剩余」，按绝对距离取会取到上一行，于是把上一行的价格算到这一行头上
+        # （实测「特调专属饮料+」100 被读成上面那件的 130）。
+        below = [sy for sy in stocks if sy > item["cy"] - 20]
+        anchor = min(below) if below else None
         best, best_d = None, 1e9
         for it in items:
             t = (it["t"] or "").replace(" ", "")
             m = re.search(r"(\d{1,4})\s*元", t)
             if m:
                 val = int(m.group(1))
-            elif re.fullmatch(r"\d{1,4}", t) and "剩余" not in t:
-                val = int(t)
             else:
+                # 价格前面常带一个硬币图标，OCR 会读成「?50」「¥50」这种前缀
+                m2 = re.fullmatch(r"\D{0,2}(\d{1,4})", t)
+                if not m2 or "剩余" in t:
+                    continue
+                val = int(m2.group(1))
+            if abs(it["cx"] - item["cx"]) > 90:
                 continue
-            dy = it["cy"] - item["cy"]
-            if dy < -0.8 * h or dy > 3.2 * h:      # 价格在名字下方 0~3 个字高内
-                continue
-            d = abs(dy) + abs(it["cx"] - item["cx"]) * 0.5
+            if anchor is not None:
+                dy_stock = it["cy"] - anchor
+                if not (5 < dy_stock < 95):
+                    continue
+            else:
+                dy = it["cy"] - item["cy"]
+                if dy < -0.8 * h or dy > 6.5 * h:
+                    continue
+            d = abs(it["cy"] - item["cy"]) + abs(it["cx"] - item["cx"]) * 0.5
             if d < best_d:
                 best, best_d = val, d
         return best
@@ -1514,25 +1544,78 @@ class AutoTask(MyBaseTask):
             self._shot(frame, "shop")
 
         if not self.config.get("商店自动购买", True):
-            return self._leave(items, frame)
+            return self._leave_shop(items, frame)
 
         max_buy = int(cfg.get("max_buy_per_run", 4))
         if self.shop_bought >= max_buy:
             self.log_info(f"本期商店已买 {self.shop_bought} 件（上限 {max_buy}），不再买")
-            return self._leave(items, frame)
+            return self._leave_shop(items, frame)
 
         o, why = self._shop_plan(offers, cfg)
         if o is None:
             self.log_info(f"商店：{why}")
-            return self._leave(items, frame)
+            return self._leave_shop(items, frame)
 
         self.shop_bought += 1
         self._click_item(o["item"], f"[商店-{why} 「{o['name']}」{o['price']}元]")
-        self.sleep(self.config.get("等待秒数"))
+        self.sleep(0.9)
         f2 = self._frame()
         if f2 is not None:
-            self._click_confirm(self._texts(f2), f2)
+            # 点开商品后右侧滑出详情面板，底部是**黄色大按钮**，上面写的是价格数字
+            # （不是「购买」两个字），OCR 拿不到关键词，只能按色块定位。
+            c = self._yellow_rect_center(f2, (0.55, 0.55, 0.98, 0.95))
+            if c:
+                self.log_info(f"点击购买按钮 @({int(c[0])},{int(c[1])})")
+                self.click(c[0], c[1])
+                self.sleep(0.6)
+            else:
+                self.log_warning("没找到右侧的黄色购买按钮，改按 OCR 确认词找")
+                self._click_confirm(self._texts(f2), f2)
         return True
+
+    def _yellow_rect_center(self, frame, roi=(0.55, 0.55, 0.98, 0.95)):
+        """在指定区域里找**面积最大的黄色实心矩形**并返回中心（商店的购买按钮）。"""
+        h, w = frame.shape[:2]
+        x1, y1 = int(w * roi[0]), int(h * roi[1])
+        x2, y2 = int(w * roi[2]), int(h * roi[3])
+        sub = frame[y1:y2, x1:x2]
+        if sub.size == 0:
+            return None
+        hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+        m = cv2.inRange(hsv, np.array([18, 110, 170]), np.array([38, 255, 255]))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for c in cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw < 100 or bh < 34:
+                continue
+            if not (2.0 < bw / max(bh, 1) < 8.0):
+                continue
+            if cv2.contourArea(c) < bw * bh * 0.55:
+                continue
+            if best is None or bw * bh > best[0]:
+                best = (bw * bh, (x1 + bx + bw / 2, y1 + by + bh / 2))
+        return best[1] if best else None
+
+
+    def _leave_shop(self, items, frame):
+        """退出商店。
+
+        实机截图确认：右上角那颗 X 是**图标**，OCR 读不到「关闭」两个字，
+        所以 `_leave` 会退化成按 ESC —— 而 ESC 在商店页没用，于是整轮卡在店里
+        连点「已买 4 件」（2026-11-23 12:06 实测卡了 10 步）。
+        这里改成：先按文字找，找不到就点右上角 X 的比例坐标 (0.843, 0.155)。
+        """
+        it = self._find(items, STOP_WORDS, exact=True)
+        if it:
+            self._click_item(it, "[关闭商店]")
+            return True
+        h, w = frame.shape[:2]
+        self.log_info("商店没有可识别的关闭按钮 → 点右上角 X")
+        self.click(int(w * 0.931), int(h * 0.161))
+        return True
+
 
     def _price_near(self, items, item, frame):
         """道具卡片上/下的「N 元」价格，读不到返回 None。"""
@@ -3048,8 +3131,13 @@ class AutoTask(MyBaseTask):
                     self.in_training = True
                     self._click_item(it, "[进入训练]")
                 else:
-                    self.log_info("大厅没有「训练」按钮，结束")
-                    break
+                    # OCR 漏读「训练」两个字也不能就这么收工：大厅入口固定在右下角
+                    # （1920x1080 实测 0.764, 0.883），按比例点一下。
+                    self.log_info("大厅没读到「训练」文字，按固定坐标点右下角入口")
+                    self.in_training = True
+                    hh, ww = frame.shape[:2]
+                    self.click(int(ww * 0.764), int(hh * 0.883))
+                    self.sleep(1.5)
             elif page == "赛前准备":
                 self._do_pretrain(items, frame)
             elif page == "行程结果":
