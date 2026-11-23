@@ -61,6 +61,22 @@ PAGE_PHASE = {
     "体力恢复": PHASE_TRAINING, "本周总结": PHASE_SETTLING,
 }
 
+# 页面级状态转移软约束（2026-11-23 玩家要求）——「上页→当前页」明显不可能时记警告+截图，
+# 但**不改判页、不拦动作**，只收集数据。跑几轮看误报率再决定要不要收紧成硬约束。
+# 只列「明确不可能」的转移，宁可漏报也别误报刷屏。设计依据玩家举的两个例子：
+#   ① 还在选人环节 → 不可能出现每日页的「训练」入口（那是选完回大厅才有的）
+#   ② 还没到周日 → 不可能出现「本周总结」这类周收尾页
+PAGE_FORBIDDEN = {
+    # 选人三连 + 编队确认：只能往训练深处走，不该退回每日页/大厅训练入口
+    "选择队友":   ("每日页", "大厅", "商店"),
+    "笔记选择":   ("每日页", "大厅", "商店"),
+    "器材选择":   ("每日页", "大厅", "商店"),
+    "确认编队":   ("每日页", "大厅", "商店"),
+    "开始训练确认": ("每日页", "大厅", "商店"),
+    "训练核心":   ("大厅", "商店"),   # 训练核心不该直接跳大厅/商店
+    "行为卡":     ("每日页", "大厅", "商店"),
+}
+
 # 「心·技·体」属性面板 —— OCR 极不稳定：实测读出过「心·支·体」「心·枝·体」，
 # 甚至整行只剩「属性加成」「颜外队友」。
 # 2026-11-23 14:59 实跑又抓到一种：过渡帧只读到「心·技」（末字「体」被吞），
@@ -968,6 +984,18 @@ class AutoTask(MyBaseTask):
         #     「弹跳+20，防守+20」+ 剧情立绘，底部▼/点继续推进，没有行动按钮。
         #     周切换瞬间「星期-」还没刷新，OCR 读残就落到未知页停了。用「属性+数字」
         #     这种通用模式匹配，不写死具体数值/地点名。要求无行动按钮，避免抢每日页。
+        # 7.6b 事件二选一（2026-11-23 16:06 实跑「记者突击采访：老实回答/黑红也是红」）：
+        #     每个选项下方各挂一条收益说明「体能+10」「50%概率体能+40」，位于画面下部
+        #     (cy>0.78h) 且横向分开。这两条也含「属性+数字」，会被 7.6 抢成行程结果
+        #     → 找不到继续按钮、点中间空转 15 步。所以先于 7.6 判成选项页。
+        #     出行结果页的涨幅在正文区(cy≈0.5h)，不会命中，区分可靠。
+        if frame is not None:
+            gain_items = [it for it in items
+                          if it["cy"] > 0.78 * frame.shape[0]
+                          and re.search(r"(?:%s)\s*[+＋]\s*\d+|\d+%%\s*概率.*(?:%s)\s*[+＋]\s*\d+"
+                                        % ("|".join(ATTR_WORDS), "|".join(ATTR_WORDS)), it["t"])]
+            if len(gain_items) >= 2:
+                return "选项"
         gain = re.search(r"(?:%s)\s*[+＋-]\s*\d+" % "|".join(ATTR_WORDS), joined)
         if (gain and re.search(r"第\s*\d+\s*周", joined)
                 and not self._action_btn(items, frame)):
@@ -1308,8 +1336,11 @@ class AutoTask(MyBaseTask):
 
         skip = ("OFF", "详细", "通用", "得分手", "防守者", "中锋", "大前", "小前", "控卫", "分卫",
                 "能力详情", "行为卡")
+        # 2026-11-23 16:00 实跑：顶部 y≈0.25h 有「已装备行为卡」展示（如「无惧重围★★」），
+        # 和候选卡同名。旧筛选 0.12~0.80 把它当候选，next() 取第一个 → 点卡面算到屏幕顶。
+        # 真正的候选卡名标签在 y≈0.44h（实测 cy≈496/1119），收紧到 0.38~0.62 排除顶部展示。
         cards = [it for it in items
-                 if 0.12 < it["cy"] / h < 0.80
+                 if 0.38 < it["cy"] / h < 0.62
                  and 2 <= len(it["t"]) <= 8
                  and it["t"] not in skip
                  and not re.match(r"^[\d/\.\+%★]+$", it["t"])]
@@ -1331,7 +1362,9 @@ class AutoTask(MyBaseTask):
         # 2026-11-23 15:41 实跑修正：旧代码往下偏移(y+0.2h≈0.66h)点到了卡片下方空白，
         # 连点 15 次没反应；真正的卡面图在标签**上方**（y≈0.25h），往上偏移才选中。
         x = best["cx"]
-        y = max(best["cy"] - h * 0.22, h * 0.12)
+        # 卡名标签 cy≈0.44h，卡面图中心约在其上方 0.16h（实测 496-180≈316）。
+        # 旧值 h*0.22 偏移过大再被下限压到 0.12h，点到屏幕顶。
+        y = max(best["cy"] - h * 0.16, h * 0.20)
         self.log_info(f"选行为卡「{best['t']}」→ 点卡面 @({int(x)},{int(y)})")
         self.click(x, y)
         self.card_pick_pending = True    # 下一轮直接点确定，别再重复选卡
@@ -2303,6 +2336,16 @@ class AutoTask(MyBaseTask):
         "体力恢复": "focus",
     }
 
+    # 资源槽位（相对坐标 x1,y1,x2,y2）—— 玩家 2026-11-23 明确要求「位置固定就按位置读」。
+    # 实测 1936x1119 截图：局内精力在每日页顶栏左 x389-597,y47-101；
+    # 局外专注在顶栏右 x1369-1527,y62-97。用比例适配不同窗口尺寸。
+    # 之前整屏扫描所有 a/b，底部属性条「1216/2533」被当精力读出 291/253，这是根因。
+    RESOURCE_ROI = {
+        "stamina": (0.18, 0.02, 0.33, 0.12),
+        "focus":   (0.66, 0.02, 0.84, 0.12),
+    }
+    RESOURCE_B_MAX = 320   # 道具提升+溢出后的硬上限；属性条 b 都是 1600+，一律挡在外面
+
     def _ab_kind(self, a, b, hint=None):
         """判断 a/b 是哪种资源。
 
@@ -2347,7 +2390,8 @@ class AutoTask(MyBaseTask):
         s = (text or "").replace(" ", "").replace("＋", "+")
         # 斜杠还在：用 search 不用 ^$，因为实测 OCR 会在后面粘噪音
         # 「221/150+ü三」（2026-11-23 06:50 探针原样输出），锚定结尾必然匹配失败
-        m = re.search(r"(\d{1,3})/(\d{2,3})", s)
+        # (?!\d) 防止把 284/1784 截断成 284/178 —— 属性条大数被当成资源上限
+        m = re.search(r"(\d{1,3})/(\d{2,3})(?!\d)", s)
         if m:
             a, b = int(m.group(1)), int(m.group(2))
             if 0 <= a <= b * 2:
@@ -2382,7 +2426,8 @@ class AutoTask(MyBaseTask):
         上限优先用本次 OCR 读到的 b（道具提升后能跟上），只有明显是 OCR 抖动
         （比已知上限差 1~6，如 134/136）时才保留旧上限，避免卡住不更新。
         """
-        h = frame.shape[0]
+        h = frame.shape[0] if frame is not None else 1080
+        w = frame.shape[1] if frame is not None else 1920
         hint = self.PAGE_RESOURCE.get(page) if page else None
         for it in items:
             ab = self._parse_ab(it["t"])
@@ -2392,7 +2437,28 @@ class AutoTask(MyBaseTask):
             # 体力可以溢出（202/150 是实测见到的真实状态），所以不能要求 a <= b
             if not (0 <= a <= b * 2):
                 continue
-            kind = self._ab_kind(a, b, hint=hint)
+            # 硬上限：资源上限最高也就 150+道具，b>320 必是属性条/金币（如 1216/2533）
+            if b > self.RESOURCE_B_MAX:
+                continue
+            # 位置决定类型（比 hint 更硬）：顶栏左槽=精力、右槽=专注。
+            # 专注恢复弹窗没有顶栏、文字在画面中央，这种页退回数字指纹判断。
+            kind = None
+            if page not in ("专注恢复", "体力恢复"):
+                cx, cy = it.get("cx", 0) / w, it.get("cy", 0) / h
+                for k, (x1, y1, x2, y2) in self.RESOURCE_ROI.items():
+                    if x1 <= cx <= x2 and y1 <= cy <= y2:
+                        kind = k
+                        break
+                if kind is None:
+                    continue                      # 不在任何资源槽位 → 别处的数字，丢掉
+                # 类型与上限对不上（如左槽读到 b=150）说明 OCR 串行了，也丢掉
+                lo, hi = ((110, 220) if kind == "stamina" else (140, 320))
+                if not (lo <= b <= hi):
+                    continue
+            else:
+                kind = self._ab_kind(a, b, hint=hint)
+            if kind not in ("focus", "stamina"):
+                continue
             if kind == "focus":
                 self.out_focus = a
                 self.out_focus_max = self._settle_cap(b, self.out_focus_max,
@@ -3789,6 +3855,13 @@ class AutoTask(MyBaseTask):
             lines.append("已知浮层：" + "、".join(
                 f"{k}×{v}" for k, v in self.known_overlay_hits.items()))
         lines.append(f"未知页 {len(self.unknown_texts)} 次")
+        trans = getattr(self, "transition_warns", []) or []
+        if trans:
+            pairs = {}
+            for a, b, _ in trans:
+                pairs[f"{a}→{b}"] = pairs.get(f"{a}→{b}", 0) + 1
+            lines.append("页面跳转存疑（软约束，未拦截）：" + "、".join(
+                f"{k}×{v}" for k, v in pairs.items()))
         for ln in lines:
             self.log_info(ln)
         # 顺手写一份到 logs/，方便事后翻（不刷屏控制台）
@@ -3800,6 +3873,26 @@ class AutoTask(MyBaseTask):
             self.log_info(f"摘要已存：{p}")
         except Exception:
             pass
+
+    def _check_transition(self, prev, page, frame=None, step=0):
+        """页面级转移软约束：不可能的「上页→当前页」记警告+截图，但照常处理。
+
+        只警告不拦，是为了先收集真实误报样本——玩家要的马尔可夫链式限制，
+        得先证明转移表在真实运行里不误伤，才能收紧成硬约束。
+        过场帧被判成「未知」很常见，出现「未知→任何页」「任何页→未知」都跳过。
+        """
+        if not prev or page in ("未知",) or prev == "未知" or prev == page:
+            return False
+        bad = PAGE_FORBIDDEN.get(prev) or ()
+        if page not in bad:
+            return False
+        if not hasattr(self, "transition_warns"):
+            self.transition_warns = []
+        self.transition_warns.append((prev, page, step))
+        shot = self._shot(frame, f"transition_{step}") if frame is not None else ""
+        self.log_warning(f"页面跳转存疑：{prev} → {page}（第{step}步，只记录不拦截"
+                         + (f"，截图 {shot}" if shot else "") + "）")
+        return True
 
     def _set_phase(self, to, page="", reason=""):
         """显式阶段转换：HALL → TRAINING → SETTLING → (回大厅计一轮) → HALL。
@@ -3858,6 +3951,7 @@ class AutoTask(MyBaseTask):
         self.confirm_gray = 0
         self.main_char_round = None
         self.unknown_texts = []          # 未知页文字按轮清；已知浮层命中数全局累计到收工摘要
+        self.transition_warns = []       # 页面转移存疑按轮清，收工摘要里汇总
         self.log_info(f"—— 开始第 {self.rounds_done + 1}/{self.max_rounds} 轮 ——")
 
     def _run_loop(self, max_steps, wait, max_rounds):
@@ -3903,6 +3997,8 @@ class AutoTask(MyBaseTask):
             page = self._classify(items, frame)
             self._read_stamina(items, frame, page=page)
             self.weekday = self._read_week(items)[1]
+            # 页面级转移软约束：明显不可能的跳转记警告+截图，照常处理不拦截
+            self._check_transition(last_page, page, frame=frame, step=step)
             # 事件页没有标题字，顶栏又带着「第N周」，很容易被认成每日页。
             # 成排黄卡片是它最硬的图像特征，所以在这里纠正一次。
             if page in ("未知", "每日页", "训练结束", "剧情事件", "选项") \

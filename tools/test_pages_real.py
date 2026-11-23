@@ -78,6 +78,22 @@ stuck = ("训练核心 训练流 筛选 OFF 额外队友 分卫 100 大前 110 �
          "SSR希雅 编队 历史玩家阵容 投射E+146 体能D 169 弹跳C+334 下一步 防守 C+ 312 运控D 153 意识D 183")
 check("卡死页(额外队友)→选择队友", s._classify(items(stuck.split()), None), "选择队友")
 
+# 16:06 实跑：记者采访二选一，「体能+10 / 50%概率体能+40」挂在画面下部两个选项上。
+# 这两条含「属性+数字」，会被 7.6 通用涨幅规则抢成行程结果 → 点中间空转 15 步。
+# 用带坐标的 frame 区分：收益说明在 cy>0.78h 且横向分开 → 选项页。
+import numpy as _np
+_fake_frame = _np.zeros((1119, 1936, 3), dtype="uint8")
+def _items_at(texts, coords):
+    return [{"t": t, "cx": coords.get(t, (100, 100))[0],
+             "cy": coords.get(t, (100, 100))[1], "b": Box()} for t in texts]
+choice_words = "第3周 星期四 体能+10 老实回答 黑红也是红 50%概率体能+40".split()
+choice_coords = {"体能+10": (676, 1005), "50%概率体能+40": (1261, 1006),
+                 "老实回答": (676, 939), "黑红也是红": (1263, 940)}
+check("记者采访二选一→选项", s._classify(_items_at(choice_words, choice_coords), _fake_frame), "选项")
+trip_words = "第3周 星期- 空之丘女高 弹跳+20, 防守+20".split()
+trip_coords = {"弹跳+20,": (400, 500), "防守+20": (600, 500)}
+check("出行结果涨幅在正文→行程结果(不被抢)", s._classify(_items_at(trip_words, trip_coords), _fake_frame), "行程结果")
+
 # ---------------------------------------------------------------- 2. 训练核心（技能名干净，右侧≥4）
 # 真实运行时 OCR 把技能胶囊读成干净的「投射」「弹跳」（日志 27855 行实证）
 print("--- 2. 训练核心（右侧技能胶囊）---")

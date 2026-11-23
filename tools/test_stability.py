@@ -35,6 +35,7 @@ class Stub:
         self.stat = {"train": {}, "gamble": [], "buy": [], "note": 0,
                      "sample_fail": 0, "stamina_drink": 0}
         self.config = {}
+        self.transition_warns = []
 
     def _tuning(self):
         import yaml
@@ -54,7 +55,8 @@ class Stub:
     def sleep(self, sec): self.logs.append(("sleep", sec))
 
 
-for m in ("_match_overlay", "_do_unknown", "_print_summary", "_is_loading_frame"):
+for m in ("_match_overlay", "_do_unknown", "_print_summary", "_is_loading_frame",
+          "_check_transition"):
     setattr(Stub, m, getattr(AutoTask, m))
 
 
@@ -139,6 +141,26 @@ s = Stub()
 r = s._do_unknown(items("9"), fade)
 check("紫过场帧 → 继续等待", r, True)
 check("紫过场帧无 unknown_texts", len(s.unknown_texts), 0)
+
+print("--- 3.5 页面转移软约束（只警告不拦截）---")
+s = Stub()
+# 明确不可能：选人环节退回每日页
+r = s._check_transition("选择队友", "每日页", frame=None, step=10)
+check("选人→每日页 记为存疑", r, True)
+check("记入 transition_warns", s.transition_warns, [("选择队友", "每日页", 10)])
+check("有警告日志", any(k == "warn" and "存疑" in m for k, m in s.logs), True)
+check("没有点击动作(不拦截)", [x for x in s.logs if x[0] == "click"], [])
+# 合法跳转不报
+s2 = Stub()
+check("每日页→训练核心 正常", s2._check_transition("每日页", "训练核心"), False)
+check("选择队友→确认编队 正常", s2._check_transition("选择队友", "确认编队"), False)
+check("无 prev 不报", s2._check_transition(None, "每日页"), False)
+# 过场帧（未知）不报
+check("未知→任何页 不报", s2._check_transition("未知", "每日页"), False)
+check("任何页→未知 不报", s2._check_transition("选择队友", "未知"), False)
+# 训练核心→大厅 也存疑（不该跳过结算）；但训练核心→训练结果正常
+check("训练核心→大厅 存疑", s2._check_transition("训练核心", "大厅"), True)
+check("训练核心→训练结果 正常", s2._check_transition("训练核心", "训练结果"), False)
 
 print("--- 4. 收工摘要 ---")
 s = Stub()
