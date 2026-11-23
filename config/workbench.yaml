@@ -1,0 +1,18 @@
+# 工作台配置（跟训练规则 strategy.yaml 分开：
+#   这一份管「怎么启动」，strategy.yaml 管「怎么打」）
+
+game:
+  launcher: 'D:\LQSN\launcher.exe'                 # Ejoy 启动器，必须它先点「启动游戏」
+  exe: 'D:\LQSN\games\LQSN\k3_windows_ob.exe'      # 游戏本体
+  process: k3_windows_ob.exe                        # 任务管理器里的进程名（判「游戏在不在跑」）
+  window_keyword: k3_windows                        # 窗口所属进程名关键字
+  boot_timeout: 150                                 # 进大厅超时（秒）
+
+task:
+  config: 'src.config:config'                       # ok 框架的配置导入路径
+  name: AutoTask                                    # 要跑的任务类
+  default_rule: config/strategy.yaml                # 默认加载的规则文件
+
+run:
+  log_dir: logs                                     # 工作台自己的日志写这里
+  keep_console: true                                # 把子进程输出实时刷到界面

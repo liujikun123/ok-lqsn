@@ -90,6 +90,8 @@ class AutoTask(MyBaseTask):
         self.stock_idx = 0
         self.stock_tries = 0
         self.stock_picked = False
+        self.slots_autofill = 0
+        self.slots_empty = 0
         self.route = {}
         self.in_training = False
         self.saw_training = False
@@ -294,6 +296,111 @@ class AutoTask(MyBaseTask):
                 return True
             self.log_info(f"「{w}」不是黄色 BGR={bgr}，跳过")
         return False
+
+    # ---------- 空槽位（未选满）检查 ----------
+
+    def _find_empty_slots(self, frame, cfg=None):
+        """找「还没选东西」的槽位，返回相对坐标列表。
+
+        长这样：**金色粗边框 + 近白底色 + 中间一个黄色十字**（器材页第 5 格实测），
+        跟已选中的卡片（整块金黄、饱和度很高）区分明显。
+
+        只统计有金色描边的方形、内部足够白、且内部还留着黄色十字的框，
+        三个条件同时成立才认，避免把金色徽章/图标误判成空槽。
+        """
+        cfg = cfg or (self._tuning().get("pick_slots") or {})
+        h, w = frame.shape[:2]
+        box = cfg.get("region") or [0.02, 0.42, 0.68, 0.78]
+        x0, y0, x1, y1 = (int(box[0] * w), int(box[1] * h), int(box[2] * w), int(box[3] * h))
+        x0, y0 = max(x0, 0), max(y0, 0)
+        x1, y1 = min(x1, w), min(y1, h)
+        if x1 - x0 < 40 or y1 - y0 < 40:
+            return []
+        roi = frame[y0:y1, x0:x1]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        gold = cv2.inRange(hsv, (15, 80, 120), (40, 255, 255))
+        gold = cv2.morphologyEx(gold, cv2.MORPH_CLOSE,
+                                cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)))
+        cnts, _ = cv2.findContours(gold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_h = float(cfg.get("min_height") or 0.09) * h
+        max_h = float(cfg.get("max_height") or 0.24) * h
+        min_white = float(cfg.get("min_white") or 0.55)
+
+        out = []
+        for c in cnts:
+            x, y, bw, bh = cv2.boundingRect(c)
+            if not (min_h <= bh <= max_h):
+                continue
+            if not (0.72 < bw / bh < 1.35):
+                continue
+            if cv2.contourArea(c) / float(bw * bh) < 0.35:
+                continue
+            # 内部中间 46%：必须是近白
+            ix, iy = x + int(bw * 0.27), y + int(bh * 0.27)
+            ip = hsv[iy:iy + int(bh * 0.46), ix:ix + int(bw * 0.46)]
+            if ip.size == 0:
+                continue
+            white = float(((ip[:, :, 1] < 45) & (ip[:, :, 2] > 215)).mean())
+            if white < min_white:
+                continue
+            # 内部还得留着黄色十字
+            cx, cy = x + int(bw * 0.35), y + int(bh * 0.35)
+            cp = hsv[cy:cy + int(bh * 0.30), cx:cx + int(bw * 0.30)]
+            if cp.size == 0:
+                continue
+            cross = float((cv2.inRange(cp, (15, 80, 120), (40, 255, 255)) > 0).mean())
+            if cross < 0.08:
+                continue
+            out.append(dict(cx=(x + x0 + bw / 2.0) / w, cy=(y + y0 + bh / 2.0) / h,
+                            w=bw / float(w), h=bh / float(h),
+                            white=round(white, 2), cross=round(cross, 2)))
+        out.sort(key=lambda d: d["cx"])
+        return out
+
+    def _slots_ready(self, page, items, frame):
+        """开训前选人页的「选满了没」闸门。
+
+        有空槽（金色框 + 白底 + 黄加号）= 还有东西没选：
+          1) 先点一次「自动选择」（多数情况游戏会替你配满）
+          2) 再查一遍，还是空 → 截图 + 通知 + 暂停，**绝不点下一步**
+             （玩家明确要求：没选满就不要自己开始训练）
+        返回 "ok" / "wait"（刚点完自动选择，下一帧再看）/ "pause"（要停下等人工）。
+        """
+        cfg = self._tuning().get("pick_slots") or {}
+        if cfg.get("check") is False:
+            return "ok"
+        pages = cfg.get("pages") or ["选择队友", "笔记选择", "器材选择"]
+        if page not in pages:
+            return "ok"
+
+        slots = self._find_empty_slots(frame, cfg)
+        self.slots_empty = len(slots)
+        if not slots:
+            return "ok"
+
+        pos = ", ".join(f"({s['cx']:.2f},{s['cy']:.2f})" for s in slots)
+        self.log_warning(f"{page}：发现 {len(slots)} 个空槽（还没选）@ {pos}")
+        self._shot(frame, f"empty_slots_{page}")
+
+        if cfg.get("auto_fill_first", True) and self.slots_autofill < int(cfg.get("max_auto_fill") or 1):
+            auto = self._find(items, ["自动选择", "自动填充"], exact=True)
+            if auto:
+                self.slots_autofill += 1
+                self.log_info(f"{page}：还有空槽，先点「自动选择」补满（第 {self.slots_autofill} 次）")
+                self._click_item(auto, "[自动选择-补空槽]")
+                self.sleep(1.6)
+                return "wait"  # 下一帧重新判断
+
+        # 自动选择也补不上（比如「剩余0次」）→ 停在这里等人工
+        if cfg.get("on_empty", "暂停提示") == "暂停提示":
+            self._shot(frame, f"pause_empty_{page}")
+            self.log_error(f"{page} 还有 {len(slots)} 个空槽没选（自动选择也补不上），"
+                           f"已暂停，请手动选完或改配置后再继续", notify=True)
+            return "pause"
+        self.log_warning(f"{page} 有空槽，但配置是继续，按原规则点下一步")
+        return "ok"
 
     # ---------- 页面识别 ----------
 
@@ -1979,6 +2086,8 @@ class AutoTask(MyBaseTask):
         self.stock_idx = 0
         self.stock_tries = 0
         self.stock_picked = False
+        self.slots_autofill = 0
+        self.slots_empty = 0
         self.route = {}
         self.in_training = False
         self.saw_training = False
@@ -2062,6 +2171,10 @@ class AutoTask(MyBaseTask):
                 self.stock_picked = False
             if page != "选项":
                 self.choice_idx = 0
+            # 离开选人三连就把「自动选择补空槽」的计数清掉，下一个页面还能再补一次
+            if page not in ("选择队友", "笔记选择", "器材选择"):
+                self.slots_autofill = 0
+                self.slots_empty = 0
 
             key = (page, len(items))
             repeat = repeat + 1 if key == last_key else 0
@@ -2185,6 +2298,14 @@ class AutoTask(MyBaseTask):
                 else:
                     self.click_relative(0.5, 0.5)
             elif page in ("选择队友", "笔记选择", "器材选择"):
+                # 先过「选满了没」这道闸门：有空白加号槽就补/停，绝不自己开训
+                gate = self._slots_ready(page, items, frame)
+                if gate == "pause":
+                    break
+                if gate == "wait":
+                    result = True          # 已经点了自动选择，等下一帧再看
+                    self.sleep(wait)
+                    continue
                 if not self._click_confirm(items, frame):
                     # 2026-11-23 实测（冷启动进训练第一次遇到）：刚进选人页时队伍没配满，
                     # 「下一步」是灰色的 BGR≈(195,198,200)，等多久都不会变黄 —— 之前这里

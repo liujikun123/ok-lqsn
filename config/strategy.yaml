@@ -150,6 +150,20 @@ tuning:
     only_egg_or_rest: true
     exclusive_skill: true
 
+  # 开训前的选人三连（选择队友 / 选择笔记 / 选择器材）
+  #   空槽长什么样：**金色粗边框 + 近白底 + 中间一个黄色加号**（器材页实测）
+  #   含义：还有东西没选。玩家要求 —— 有空槽就停下来提示，不许自己开训。
+  pick_slots:
+    check: true                      # false = 完全不检查
+    pages: [选择队友, 笔记选择, 器材选择]
+    auto_fill_first: true            # 先点一次「自动选择」试着补满
+    max_auto_fill: 1                 # 每个页面最多自动补几次
+    on_empty: 暂停提示               # 暂停提示 / 继续（继续=照旧点下一步）
+    region: [0.02, 0.42, 0.68, 0.78] # 槽位可能在的相对区域，别放太大以免误判
+    min_height: 0.09                 # 槽位高度下限（相对画面高）
+    max_height: 0.24                 # 上限
+    min_white: 0.55                  # 框内近白占比下限
+
   # 循环
   loop:
     max_rounds: 1                    # 先跑通一次
