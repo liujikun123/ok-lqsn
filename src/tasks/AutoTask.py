@@ -122,7 +122,7 @@ class AutoTask(MyBaseTask):
         self.default_config.update({
             "最大步数": 1500,
             "等待秒数": 1.3,
-            "扭蛋目标关键词": "笔记",
+            "扭蛋目标关键词": "笔记,继承",   # 步行街扭蛋三选一里「笔记 / 继承」都算
             "扭蛋最高价": 120,
             "加强训练策略": "最高加成",
             "商店自动购买": True,
@@ -161,8 +161,10 @@ class AutoTask(MyBaseTask):
         #   用「第N周-星期X」记今天已经探过，避免同一天反复进出。
         self.trip_probe = False          # 本次进出行页是「探笔记」，不是真要出行
         self.trip_probe_done = None      # 已经探过的那天，例如 "6-7"
-        self.trip_probe_disabled = False # 出行页退不出去 → 以后不再探，直接按原顺序
+        self.trip_probe_disabled = False # 兼容旧状态；现在不再置 True（退回失败只放弃当天）
         self.trip_back_tries = 0         # 本次退出出行页试了几次
+        # 探笔记的「两级右上角返回」还剩几层：2=扭蛋三选一页, 1=出行页, 0=无
+        self.trip_probe_back = 0
         # 商店：以前 _do_shop 写好了却**从来没被调用过**（每日页没接入口），
         # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
         # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
@@ -1258,6 +1260,9 @@ class AutoTask(MyBaseTask):
           「休息」只推进一天、**不补精力**，所以精力不够且当天能出行时，
           应该先出行去公园，而不是直接休息。
         """
+        # 已经回到每日页 → 探笔记流程结束，清掉「还剩几层要退」的状态
+        self.trip_probe_back = 0
+
         # 二次确认弹窗（休息/训练前会弹「…是否要休息？」+ 取消/确认）
         ok = self._find(items, ["确认"], exact=True)
         cancel = self._find(items, ["取消"], exact=True)
@@ -1304,7 +1309,11 @@ class AutoTask(MyBaseTask):
                 self.trip_back_tries = 0
                 self._click_btn(go, f"[探出行-看有没有笔记 精力{self.stamina}/{self.stamina_max}]", frame)
                 return True
-            self._click_btn(train, f"[训练 精力{self.stamina}/{self.stamina_max}]", frame)
+            probed = (self.trip_probe_done == day_key)
+            if probed:
+                self.log_info(f"[探笔记] 已回到每日页 → 当天照常训练（精力 {self.stamina}/{self.stamina_max}）")
+            tag = "[探笔记后-训练" if probed else "[训练"
+            self._click_btn(train, f"{tag} 精力{self.stamina}/{self.stamina_max}]", frame)
             return True
 
         # 精力不足：先看能不能去公园（唯一能明显回精力的地方）
@@ -1465,19 +1474,41 @@ class AutoTask(MyBaseTask):
 
     def _do_egg_select(self, items, frame):
         """扭蛋三选一：只买目标关键词（笔记继承），且价格不超上限。"""
-        kw = str(self.config.get("扭蛋目标关键词") or "笔记").split(",")
+        kw = str(self.config.get("扭蛋目标关键词") or "笔记,继承").split(",")
         kw = [k.strip() for k in kw if k.strip()]
         cap = int(self.config.get("扭蛋最高价") or 120)
 
+        # ===== 探笔记（玩家 2026-11-23 21:01 确认）=====
+        # 步行街扭蛋三选一里出现【笔记 / 继承】才算有笔记：
+        #   有 → 选它（笔记 > 训练）；
+        #   没有 → 两级右上角返回回每日页，当天照常训练（探笔记不消耗行动）。
+        if self.trip_probe_back >= 2:
+            joined = " ".join(i["t"] for i in items)
+            hits = [k for k in ("笔记", "继承") if k in joined]
+            week, day = self._read_week(items)
+            self._audit_save(week, day, "NOTE_EGG", frame,
+                             f"[探笔记] 步行街扭蛋三选一\n"
+                             f"OCR：{[i['t'] for i in items]}\n"
+                             f"命中【笔记/继承】：{hits or '无'}\n")
+            if not hits or self.notes_done:
+                opts = [i["t"] for i in items if 0.2 < i["cy"] / frame.shape[0] < 0.55][:6]
+                self.log_info(f"[探笔记] 扭蛋三选一没有「笔记/继承」→ 两级右上角退回，回每日页走训练"
+                              f"｜选项 {opts}")
+                self.trip_probe_back = 1
+                return self._leave_top_right(items, frame, "[退第1层 扭蛋页→出行页]")
+            self.stat["note"] += 1
+            self.log_info(f"[探笔记] 命中 {hits} → 选笔记扭蛋（本轮笔记次数 {self.stat['note']}）")
+            self.trip_probe_back = 0   # 走正常购买流程，不用退回
+
         if self.notes_done:
             self.log_info("本轮已经拿过笔记继承，这次不买")
-            return self._leave(items, frame)
+            return self._leave_top_right(items, frame, "[已拿过笔记]")
 
         cands = [it for it in items if any(k in it["t"] for k in kw)]
         cands = [c for c in cands if 0.2 < c["cy"] / frame.shape[0] < 0.55]
         if not cands:
             self.log_info(f"三个扭蛋里没有「{kw}」，跳过不买")
-            return self._leave(items, frame)
+            return self._leave_top_right(items, frame, "[无目标扭蛋]")
 
         best = cands[0]
         price = None
@@ -1490,7 +1521,7 @@ class AutoTask(MyBaseTask):
         self.log_info(f"选中扭蛋「{best['t']}」，价格 {price}，上限 {cap}")
         if price is not None and price > cap:
             self.log_warning(f"价格 {price} 超过上限 {cap}，放弃")
-            return self._leave(items, frame)
+            return self._leave_top_right(items, frame, "[超上限]")
 
         self._click_item(best, "[扭蛋目标]")
         self.sleep(self.config.get("等待秒数"))
@@ -1507,7 +1538,7 @@ class AutoTask(MyBaseTask):
         if it:
             self._click_item(it, "[进入扭蛋选择]")
             return True
-        return self._leave(items, frame)
+        return self._leave_top_right(items, frame, "[扭蛋机无可抓]")
 
     def _do_enhance(self, items, frame):
         """加强训练三选一：优先最高加成。"""
@@ -1755,6 +1786,11 @@ class AutoTask(MyBaseTask):
         而同时存在「精力+30 且属性+」的选项 —— 那 49 点溢出是白扔的。
         现在统一走 `_reward_key`：先把精力按缺口截断，打平再看属性。
         """
+        # 探笔记的退回流程：从扭蛋三选一退回出行页后，还要再点一次右上角才回每日页。
+        if self.trip_probe_back > 0:
+            self.trip_probe_back -= 1
+            return self._leave_top_right(items, frame, "[退第2层 出行页→每日页]")
+
         go = self._find(items, ["前往"])
         if go and self._yellow_ratio(frame, go["b"]) > 0.35:
             self._click_item(go, "[出发确认]")
@@ -1782,20 +1818,32 @@ class AutoTask(MyBaseTask):
         #   没笔记 → 立刻退出回每日页，改走训练。
         if self.trip_probe:
             self.trip_probe = False
-            notes = [n for n in names if "笔记" in self._place_tag(n, items, frame)]
-            if notes:
-                self.stat["note"] += 1
-                self.log_info(f"出行有笔记 {[n['t'] for n in notes]} → 笔记优先，本次出行而不是训练")
-            else:
-                self.log_info("出行页没有笔记 → 退回每日页走训练")
-                self.trip_back_tries += 1
-                return self._leave(items, frame)
+            walk = next((n for n in names if n["t"] == "步行街"), None)
+            if walk:
+                # 玩家 2026-11-23 21:01 确认：笔记不在出行页的地点标签上，而在
+                # 「步行街 → 扭蛋三选一」里出现【笔记 / 继承】。步行街标签原文是
+                # 「随机增益+」，_place_tag 的 GAIN_KEYS 没收录 → 一直读成空、误判
+                # 「没有笔记」，所以旧逻辑从没真的点进过步行街。
+                week, day = self._read_week(items)
+                self.log_info(f"[探笔记] 出行页 → 点进「步行街」看扭蛋三选一（第{week}周 星期{day}）")
+                near = [i["t"] for i in items
+                        if abs(i["cx"] - walk["cx"]) < 270 and 0 < i["cy"] - walk["cy"] < 240]
+                self._audit_save(week, day, "NOTE_WALK", frame,
+                                 f"[探笔记] 出行页 → 点进步行街\n"
+                                 f"OCR：{[i['t'] for i in items]}\n"
+                                 f"步行街附近文字：{near}\n")
+                self.trip_probe_back = 2
+                self._click_item(walk, "[探笔记-进步行街]")
+                return True
+            self.log_warning("[探笔记] 出行页没找到「步行街」→ 右上角退回每日页走训练")
+            self.trip_probe_back = 1
+            return self._leave_top_right(items, frame, "[无步行街-退回]")
         elif self.trip_back_tries > 0 and self._day_key(items) == self.trip_probe_done:
-            # 上一帧刚点过「退出」，这一帧还在出行页 → 这页根本退不出去。
-            # 不再折腾：永久关掉探路，按原规则直接出行（否则会卡在这一页空转）。
+            # 退回失败只放弃今天，不再永久禁用：以前 trip_probe_disabled=True
+            # 会让之后所有天（甚至断点恢复后的整局）都不再探笔记。
             self.trip_back_tries = 0
-            self.trip_probe_disabled = True
-            self.log_warning("出行页退不出去（点过退出仍在原页）→ 以后不再探笔记，直接按原规则出行")
+            self.trip_probe_back = 0
+            self.log_warning("[探笔记] 退回没成功 → 今天放弃探笔记，按原规则出行")
 
         best, best_val, best_key = None, -1, None
         for n in names:
@@ -2147,6 +2195,20 @@ class AutoTask(MyBaseTask):
             if d < best_d:
                 best, best_d = int(m.group(1)), d
         return best if best_d < 400 else None
+
+    def _leave_top_right(self, items, frame, why=""):
+        """点顶栏最右侧的「返回」箭头（图形按钮，OCR 读不到文字）。
+
+        2026-11-23 21:04 实机验证：出行页、步行街「请选择1个扭蛋」三选一页，
+        右上角都有同一个浅蓝底 ↩ 按钮，客户区比例 ≈ (0.95, 0.046)。
+        连点两次：扭蛋三选一 → 出行页 → 每日页，且**不消耗当天行动**
+        （第3周星期六精力始终 80/130，回来「训练」「出行」按钮都还在）。
+        ESC / STOP_WORDS 在这两页都没用，所以不能走 _leave() 的 ESC 分支。
+        """
+        h, w = (frame.shape[:2] if frame is not None else (1080, 1920))
+        self.log_info(f"[探笔记] 点右上角返回箭头 (0.95,0.046) {why}")
+        self.click(int(w * 0.95), int(h * 0.046))
+        return True
 
     def _leave(self, items, frame):
         """退出当前页面：先找关闭/取消，再点右上角 X。"""
@@ -3855,8 +3917,10 @@ class AutoTask(MyBaseTask):
         #   用「第N周-星期X」记今天已经探过，避免同一天反复进出。
         self.trip_probe = False          # 本次进出行页是「探笔记」，不是真要出行
         self.trip_probe_done = None      # 已经探过的那天，例如 "6-7"
-        self.trip_probe_disabled = False # 出行页退不出去 → 以后不再探，直接按原顺序
+        self.trip_probe_disabled = False # 兼容旧状态；现在不再置 True（退回失败只放弃当天）
         self.trip_back_tries = 0         # 本次退出出行页试了几次
+        # 探笔记的「两级右上角返回」还剩几层：2=扭蛋三选一页, 1=出行页, 0=无
+        self.trip_probe_back = 0
         # 商店：以前 _do_shop 写好了却**从来没被调用过**（每日页没接入口），
         # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
         # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
@@ -4033,7 +4097,7 @@ class AutoTask(MyBaseTask):
     # 「今天探没探笔记 / 进没进过店 / 这是第几轮」这类**记账**，不用记完整画面。
     RESUME_FIELDS = (
         "saw_training", "in_training", "phase", "weekday", "core_checked",
-        "trip_picked", "trip_probe", "trip_probe_done", "trip_probe_disabled",
+        "trip_picked", "trip_probe", "trip_probe_done",
         "trip_back_tries", "shop_day", "shop_week", "shop_bought",
         "shop_has_stamina", "notes_done", "minigame_tries", "stock_idx",
         "stock_tries", "stock_picked", "stamina_refills", "stamina_misses",
