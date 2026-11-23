@@ -180,6 +180,21 @@ r = s._do_unknown(many_items, veil)
 check("紫蒙版 → 继续等待", r, True)
 check("紫蒙版无 unknown_texts", len(s.unknown_texts), 0)
 
+# E. 训练结果动画（2026-11-23 21:12 实跑）：体育馆 + 亮白卡片 + 光柱，
+#    OCR 只读出 1 段「病性加成」（「属性加成」被读花）。此前判未知页暂停。
+anim = _np.random.randint(90, 210, (1080, 1920, 3), dtype="uint8")  # 体育馆有纹理，避开旧 B 规则
+_cv2.rectangle(anim, (600, 160), (1300, 340), (245, 245, 245), -1)  # 亮白卡片
+anim_items = items("病性加成")
+bright = float((_cv2.cvtColor(anim, _cv2.COLOR_BGR2GRAY) > 225).mean())
+check("训练结果动画亮白占比", bright > 0.04, True)
+check("训练结果动画帧被识别", s._is_loading_frame(anim, anim_items), True)
+check("正常页不误判动画帧", s._is_loading_frame(normal_frame, anim_items), False)
+check("有顶栏HUD不误判动画帧", s._is_loading_frame(anim, items("第3周", "星期6")), False)
+s = Stub()
+r = s._do_unknown(anim_items, anim)
+check("训练结果动画 → 继续等待", r, True)
+check("训练结果动画无 unknown_texts", len(s.unknown_texts), 0)
+
 print("--- 3.5 页面转移软约束（只警告不拦截）---")
 s = Stub()
 # 明确不可能：选人环节退回每日页

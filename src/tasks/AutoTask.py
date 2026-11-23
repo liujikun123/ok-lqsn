@@ -1825,6 +1825,7 @@ class AutoTask(MyBaseTask):
                 # 「随机增益+」，_place_tag 的 GAIN_KEYS 没收录 → 一直读成空、误判
                 # 「没有笔记」，所以旧逻辑从没真的点进过步行街。
                 week, day = self._read_week(items)
+                self.stat["note_probe"] = self.stat.get("note_probe", 0) + 1
                 self.log_info(f"[探笔记] 出行页 → 点进「步行街」看扭蛋三选一（第{week}周 星期{day}）")
                 near = [i["t"] for i in items
                         if abs(i["cx"] - walk["cx"]) < 270 and 0 < i["cy"] - walk["cy"] < 240]
@@ -3734,7 +3735,12 @@ class AutoTask(MyBaseTask):
            蒙版（左紫三角+篮球水印+右斜杠），底下真实页面还在、OCR 能读出十几段
            文字（含训练/商店按钮），所以 B 的「文字≤2段」不满足。但这帧整屏偏紫
            (紫色像素占比≈68%)、整屏低对比(std≈18)。等蒙版消失即可，别当未知页。
-        正常游戏页 full std 通常 >80、紫色占比极低，四种条件都碰不到，不会误伤。
+        E. 训练结果动画（2026-11-23 21:12 实跑）：体育馆场景 + 左上「属性加成」
+           横幅 + 四张未翻开的亮白卡片 + 光柱，OCR 只读 1 段，还常把「属性加成」
+           读成「病性加成 / 肩性加成」。这帧 full std≈53、hud std≈54，A/B/C/D
+           全不符合；但亮白(>225)占比≈8.7%、文字≤2段、顶栏周/天/精力全读不到。
+           离线扫 204 张截图只命中 5 张同类动画帧，零误伤正常页。
+        正常游戏页 full std 通常 >80、紫色占比极低，五种条件都碰不到，不会误伤。
         """
         if frame is None:
             return False
@@ -3766,6 +3772,15 @@ class AutoTask(MyBaseTask):
                 purple_ratio = float(((bl > 140) & (rr > 110)
                                       & (bl - rr > 15) & (bl - gc > 10)).mean())
                 if purple_ratio > 0.5:
+                    return True
+            # E. 训练结果动画帧：亮白卡片+光柱，OCR 只剩一句被读花的「…加成」
+            if items is not None and len(items) <= 2:
+                joined = " ".join(str(i.get("t", "")) for i in items)
+                has_hud = any(k in joined for k in ("第", "星期", "/130", "/150"))
+                over_words = ("加成", "属性", "提升", "成功", "获得", "等级", "结果")
+                bright_ratio = float((gray > 225).mean())
+                if (not has_hud) and bright_ratio > 0.04 \
+                        and any(k in joined for k in over_words):
                     return True
             return False
         except Exception:
@@ -4182,7 +4197,8 @@ class AutoTask(MyBaseTask):
             f"完成轮数：{self.rounds_done}/{self.max_rounds}",
             f"本轮训练 {sum(train.values())} 次：" + ("、".join(f"{k}×{v}" for k, v in train.items()) or "无"),
             f"累计训练 {sum(tt.values())} 次：" + ("、".join(f"{k}×{v}" for k, v in tt.items()) or "无"),
-            f"笔记 {st.get('note', 0)} 次　采样失败 {st.get('sample_fail', 0)} 项",
+            f"探步行街笔记 {st.get('note_probe', 0)} 次（拿到笔记 {st.get('note', 0)} 次）"
+            f"　采样失败 {st.get('sample_fail', 0)} 项",
             f"商店买 {len(buys)} 件：" + ("、".join(f"{n}({p})" for _, n, p in buys[:8]) or "无"),
             f"赌一把 {len(gamble)} 次：" + ("、".join(f"{k}@{p}%" for k, p in gamble[:8]) or "无"),
         ]
@@ -4265,6 +4281,7 @@ class AutoTask(MyBaseTask):
             "gamble": [],       # 每次下注 (技能, 失败率)
             "buy": [],          # 每次购买 (类别, 名称, 价格)
             "note": 0,          # 出行拿到笔记的次数
+            "note_probe": 0,    # 真点进步行街探笔记的次数（含没命中的）
             "sample_fail": 0,   # 训练技能采样失败数
             "stamina_drink": 0, # 喝精力药次数
         }
@@ -4276,7 +4293,7 @@ class AutoTask(MyBaseTask):
             dst["train"][k] = dst["train"].get(k, 0) + v
         for k in ("gamble", "buy"):
             dst[k].extend(src.get(k) or [])
-        for k in ("note", "sample_fail", "stamina_drink"):
+        for k in ("note", "note_probe", "sample_fail", "stamina_drink"):
             dst[k] = dst.get(k, 0) + (src.get(k) or 0)
 
     def _rollover_stat(self):
