@@ -69,6 +69,47 @@ bsg-auto/
 
 运行环境沿用上一版目录里的虚拟环境（`../ok-bsg/.venv`，已装好 PyTorch/onnxocr 等依赖）。
 
+### 从零开始（游戏没开、甚至启动器没开）
+
+```bash
+# 一条命令：起启动器 → 点「启动游戏」→ 关公告弹窗 → 过标题页 → 进大厅
+../ok-bsg/.venv/Scripts/python.exe tools/start_game.py
+
+# 进大厅后直接接着跑主流程（等价于 run_auto.bat）
+../ok-bsg/.venv/Scripts/python.exe tools/start_game.py --auto
+```
+
+实测冷启动到大厅约 30 秒：启动器 4s → 点「启动游戏」1s 拉起 `k3_windows_ob.exe`
+→ 健康游戏忠告（等它自己过）→ 版本检查 → **公告弹窗（模板匹配右上角 ×）**
+→ 标题页点「点击进入」→ 大厅（命中 5 个锚点后停止点击）。
+
+| 参数 | 作用 |
+|---|---|
+| `--auto` | 进大厅后自动跑 AutoTask，一路训练到收工 |
+| `--dry-run` | 只观察不点击，用来对账识别结果 |
+| `--timeout N` | 进大厅阶段的超时（默认 240s） |
+| `--no-shot` | 不保存过程截图（默认存 `logs/start_game/<时间戳>/`） |
+
+两条补充工具：
+
+```bash
+../ok-bsg/.venv/Scripts/python.exe tools/ocr_now.py --save   # 当前画面 OCR 全量文字 + 相对坐标
+```
+
+### 游戏还开着、但停在中途（上次非正常退出）
+
+不用重启游戏，直接跑主流程：
+
+```bash
+../ok-bsg/.venv/Scripts/python.exe -m ok run_task -c src.config:config AutoTask
+```
+
+它会自己接上：大厅点右下角**「训练中」** → 弹出**训练确认** → 点**「继续训练」**
+恢复中断的那一轮（周次、局内精力都沿用上次，不是新开一轮）→ 训练核心 → …
+
+顺带能清掉的遮挡页：**游戏内公告浮层**（模板匹配右上角 × 关掉）、
+**炒股小游戏**（选股 → 确定；走势屏 → 卖出）。
+
 ### 推荐：走 MCP（可复现，能看每一步）
 
 ```bash

@@ -87,6 +87,10 @@ class AutoTask(MyBaseTask):
         self.trip_picked = False
         self.unknown_count = 0
         self.minigame_tries = 0
+        self.stock_idx = 0
+        self.stock_tries = 0
+        self.stock_picked = False
+        self.route = {}
         self.in_training = False
         self.saw_training = False
         self.choice_idx = 0
@@ -317,11 +321,19 @@ class AutoTask(MyBaseTask):
                 continue
             if re.match(r"^[\d/\.\+%★]+$", it["t"]):
                 continue
+            # 2026-11-23 08:18：背景装饰字（画面上的「See you」水印）也居中，
+            # 混进来当第 4 个选项，宽度比 372/108=3.44 直接把整组选项判废，
+            # 于是三选一页永远点「跳过」、连续 15 步不动 —— 只留含中文的。
+            if re.match(r"^[\x00-\x7F]+$", it["t"].strip()):
+                continue
             out.append(it)
         if not (2 <= len(out) <= 4):
             return []
         widths = [x["b"].width for x in out]
-        if max(widths) > min(widths) * 2.0:
+        # 2026-11-23：宽度差原来卡在 2.0，把「模拟软件而已…(764px) / 不许她们乱来(320px)」
+        # 这种一长一短的剧情二选一全排除了 —— 连续 15 步点「跳过」无效，整轮退出。
+        # 剧情选项本来就是长短句，胶囊选项（集训事件）才宽度接近，所以放宽到 3.0。
+        if max(widths) > min(widths) * 3.0:
             return []
         out.sort(key=lambda x: x["cy"])
         return out
@@ -339,9 +351,26 @@ class AutoTask(MyBaseTask):
         #    注意：这里的「专注」是**局外体力**（上限 150），跟局内精力(130) 不是一回事。
         if has("专注恢复", "当前专注", "下次恢复"):
             return "专注恢复"
-        # 1. 小游戏：没有主按钮，必须最先拦下来
+        # 1. 游戏内公告页（点错活动图标/进大厅自动弹）：必须先退出去，
+        #    否则会一直被当成「未知页」，点中间推进 11 次后停机（08:12 实测）。
+        if has("停服更新公告", "防沉迷系统公告", "公平运营公告", "内测返利说明") \
+                or ("公告" in joined and "置顶" in joined):
+            return "公告页"
+        # 1.05 训练确认弹窗：上一次训练非正常退出，这里会出现「继续训练」，
+        #      点它就能恢复中断，而不是重新开一轮。
+        if "训练确认" in joined or "继续训练" in joined:
+            return "训练确认"
+        # 1.1 小游戏：没有主按钮，必须最先拦下来
         if has("拼图碎片", "收回碎片", "点击旋转拼图碎片"):
             return "小游戏"
+        # 1.1 炒股小游戏（剧情支线，主线跑流程时就会撞上）
+        #     它跟拼图不同 —— 没有「放弃」，必须玩到结束才放人，
+        #     所以不能落到上面的「小游戏」分支（那个分支专门找放弃/ESC 退出）。
+        #     关键词取「炒股」「买入+卖出+持仓」这种只有这一页才同时出现的组合。
+        if "炒股" in joined or "请选择你要投资的股票" in joined \
+                or "股票走势" in joined or has("涨跌幅", "最新价") \
+                or (has("稳健型", "激进型", "平衡型") and has("确定", "放弃")):
+            return "炒股小游戏"
         # 1.5 公园子页：底部也挂着六项技能面板（投射/弹跳/…），
         #     不先拦就会在下面被「右侧竖排技能 ≥4」认成训练核心 →
         #     于是对着公园页猛点「决定」坐标，卡死 15 步（2026-11-23 06:11 实测）。
@@ -407,6 +436,10 @@ class AutoTask(MyBaseTask):
         # 7.5 出行/工资之类的结果屏：成功！+ 获得 + 下一步（顶栏也有第N周，会误判成每日页）
         if has("成功！", "成功!") and has("获得", "工资") and exact("下一步"):
             return "行程结果"
+        # 7.9 居中竖排胶囊选项（集训事件三选一这类）：先认出来再选，
+        #     不必先白白点 3 次「跳过」等 same_count 攒够（每次约 5 秒）。
+        if frame is not None and "跳过" in joined and len(self._pills(items, frame)) >= 2:
+            return "选项"
         # 8. 剧情 / 事件（有「跳过」的大多是对话页；事件页另有黄卡片兜底）
         if exact("跳过") or "跳过" in joined:
             return "剧情事件"
@@ -987,6 +1020,183 @@ class AutoTask(MyBaseTask):
             if not any(k in joined for k in ("拼图碎片", "收回碎片", "拼图")):
                 self.log_info("已退出小游戏")
                 self.minigame_tries = 0
+        self.stock_idx = 0
+        self.stock_tries = 0
+        self.stock_picked = False
+        self.route = {}
+        return True
+
+    def _match_template(self, frame, name, threshold=0.85):
+        """在 frame 里找 assets/templates/<name>（多尺度），返回相对坐标 (rx, ry)。"""
+        try:
+            root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            tpl = cv2.imread(os.path.join(root, "assets", "templates", name))
+            if tpl is None or frame is None:
+                return None
+            h, w = frame.shape[:2]
+            th, tw = tpl.shape[:2]
+            best = None
+            for s in (0.85, 1.0, 1.15):
+                t = cv2.resize(tpl, (max(8, int(tw * s)), max(8, int(th * s))))
+                if t.shape[0] >= h or t.shape[1] >= w:
+                    continue
+                res = cv2.matchTemplate(frame, t, cv2.TM_CCOEFF_NORMED)
+                _, mx, _, loc = cv2.minMaxLoc(res)
+                if best is None or mx > best[0]:
+                    best = (mx, loc[0] + t.shape[1] / 2.0, loc[1] + t.shape[0] / 2.0)
+            if not best or best[0] < threshold:
+                return None
+            self.log_info(f"模板 {name} 命中 score={best[0]:.2f}")
+            return (best[1] / w, best[2] / h)
+        except Exception as e:
+            self.log_warning(f"模板匹配失败 {name}: {e}")
+            return None
+
+    def _do_notice(self, items, frame):
+        """游戏内公告页：点右上角 X 退出（模板优先，认不到才用固定右上角）。"""
+        it = self._find(items, ["关闭", "返回", "退出"], exact=True)
+        if it:
+            self.log_info(f"公告页：点「{it['t']}」")
+            self._click_item(it, "[公告 关闭]")
+            self.sleep(1.0)
+            return True
+        pos = self._match_template(frame, "x_close.png")
+        if pos:
+            self.log_info(f"公告页：模板 × @({pos[0]:.3f},{pos[1]:.3f})")
+            self.click_relative(pos[0], pos[1])
+        else:
+            self.log_warning("公告页：没匹配到 ×，点右上角固定位置")
+            self.click_relative(0.939, 0.115)
+        self.sleep(1.2)
+        return True
+
+    def _do_train_confirm(self, items, frame):
+        """训练确认弹窗：优先「继续训练」恢复上一次中断的进度。
+
+        「继续训练」= 接着上次没打完的那一轮（周次、局内精力都在）；
+        旁边那个才是新开一轮。玩家 2026-11-23 明确：非正常退出后就点这里恢复。
+        """
+        it = self._find(items, ["继续训练"], exact=True) or self._find(items, ["继续训练"])
+        if not it:
+            it = self._find(items, ["开始训练", "确认"], exact=True)
+        if not it:
+            self.log_warning(f"训练确认页没有「继续训练」，按 ESC。文字：{[i['t'] for i in items][:10]}")
+            self.send_key("esc")
+            self.sleep(0.8)
+            return True
+        self.in_training = True
+        self.log_info(f"训练确认：点「{it['t']}」（恢复中断）")
+        self._click_item(it, "[继续训练]")
+        self.sleep(1.5)
+        return True
+
+    def _do_stock(self, items, frame):
+        """炒股小游戏（剧情支线）：三张股票卡 → 选一张 → 点「确定」。
+
+        实测（2026-11-23 08:15）：这一页右上角有「跳过」但点了没反应，
+        必须先选卡（选中后出现黄色角标、底部「确定」由灰变黄）才能推进，
+        所以不能落到「小游戏」的放弃分支。
+
+        卡片布局：横排三张，上部是类型标签（稳健型 / 平衡型 / 激进型），
+        下面是公司名、说明、价格。点标签下方约 12% 屏高处即卡片中心。
+
+        TODO 角色分支 —— 不同主训人员走不同支线，这张表的偏好以后按
+        strategy.yaml -> routes.<角色>.stock 覆盖，字段留好：
+            mode         随便选 / 按类型
+            prefer_type  稳健型 / 平衡型 / 激进型
+            max_steps    硬上限
+        现在「随便选」= 轮换着点，不看盈亏。
+        """
+        cfg = self.route.get("stock") if isinstance(self.route.get("stock"), dict) else None
+        cfg = cfg or (self._tuning().get("stock") or {})
+        mode = str(cfg.get("mode") or "随便选")
+
+        self.stock_tries += 1
+        limit = int(cfg.get("max_steps") or 30)
+        if self.stock_tries > limit:
+            self.log_error(f"炒股小游戏连续 {limit} 步没走完，暂停等人工处理", notify=True)
+            self._shot(frame, "stock_stuck")
+            return None
+
+        h, w = frame.shape[:2]
+        texts = [i["t"] for i in items]
+        joined = " ".join(texts)
+        self._shot(frame, f"stock_{self.stock_tries:02d}")
+
+        # 1) 走势 / 结算屏（标题「第N周股票走势」，有涨跌幅和最新价）：
+        #    主按钮是「卖出」（黄色），点掉就进入下一段或退出小游戏。
+        if "股票走势" in joined or any(k in joined for k in ("涨跌幅", "最新价")):
+            self.stock_picked = False
+            for w_ in ("卖出", "继续", "下一步", "确定", "确认"):
+                it = self._find(items, [w_], exact=True)
+                if it:
+                    self.log_info(f"炒股：走势结算屏，点「{it['t']}」")
+                    self._click_item(it, "[炒股 卖出]")
+                    self.sleep(1.2)
+                    return True
+            self.log_warning(f"炒股走势屏没找到主按钮，点底部中间。文字：{texts[:12]}")
+            self.click_relative(0.5, 0.86)
+            self.sleep(1.2)
+            return True
+
+        # 1.5) 排名 / 总结屏（「炒股队收益排名」，只有底部一个「下一步」）：
+        #      这页 OCR 只读出 11 段，选股锚点会误抓左边的名次数字「3」，
+        #      连点 15 步不动（08:29 实测）。有「下一步」就直接走。
+        nx = self._find(items, ["下一步"], exact=True)
+        if nx:
+            self.stock_picked = False
+            self.log_info("炒股：收益排名/总结屏，点「下一步」")
+            self._click_item(nx, "[炒股 下一步]")
+            self.sleep(1.2)
+            return True
+
+        # 2) 已经选过卡：点「确定」交单
+        if self.stock_picked:
+            ok = self._find(items, ["确定", "确认"], exact=True)
+            if ok:
+                self.log_info("炒股：点「确定」交单")
+                self._click_item(ok, "[炒股 确定]")
+                self.stock_picked = False
+                self.sleep(1.2)
+                return True
+            self.stock_picked = False
+
+        # 2) 选卡：优先用类型标签当锚点，退而求其次用价格数字
+        anchors = [i for i in items if i["t"].strip() in ("稳健型", "平衡型", "激进型", "保守型")]
+        if not anchors:
+            # 价格锚点必须成组（≥2 个不同 x 位置）才认 —— 排名页左边的名次
+            # 「1/2/3/4」也是一个数字，单个数字会被误当成卡片连点 15 步（08:29）。
+            prices = [i for i in items
+                      if re.match(r"^\d{1,4}$", i["t"].strip())
+                      and 0.55 < i["cy"] / h < 0.85]
+            if len(prices) >= 2 and len({round(p["cx"] / w, 2) for p in prices}) >= 2:
+                anchors = prices
+        if anchors:
+            anchors.sort(key=lambda i: i["cx"])
+            want = str(cfg.get("prefer_type") or "").strip()
+            pool = [a for a in anchors if a["t"].strip() == want] or anchors
+            idx = self.stock_idx % len(pool)
+            it = pool[idx]
+            self.stock_idx += 1
+            rx = it["cx"] / w
+            ry = it["cy"] / h + (0.12 if it["t"].strip().endswith("型") else 0.04)
+            self.log_info(f"炒股：选第 {idx + 1}/{len(pool)} 张「{it['t']}」（{mode}）")
+            self.click_relative(rx, ry)
+            self.stock_picked = True
+            self.sleep(0.9)
+            return True
+
+        # 3) 认不出卡片：先点「确定」，再退到放弃，最后 ESC
+        for w_ in ("确定", "放弃", "退出"):
+            it = self._find(items, [w_], exact=True)
+            if it:
+                self.log_warning(f"炒股页没认出卡片，点「{it['t']}」脱身")
+                self._click_item(it, "[炒股 脱身]")
+                self.sleep(1.0)
+                return True
+        self.log_warning(f"炒股页完全认不出，按 ESC。文字：{texts[:12]}")
+        self.send_key("esc")
+        self.sleep(0.8)
         return True
 
     def _do_story(self, items, frame):
@@ -1766,6 +1976,10 @@ class AutoTask(MyBaseTask):
         self.trip_picked = False
         self.unknown_count = 0
         self.minigame_tries = 0
+        self.stock_idx = 0
+        self.stock_tries = 0
+        self.stock_picked = False
+        self.route = {}
         self.in_training = False
         self.saw_training = False
         self.choice_idx = 0
@@ -1777,6 +1991,17 @@ class AutoTask(MyBaseTask):
         stop_after_run = bool(self.config.get("跑完一轮就停", True))
 
         self.log_info(f"开始自动训练：最多 {max_steps} 步")
+
+        # 角色分支：不同主训人员走不同支线（剧情选项、小游戏、事件都不一样）。
+        # 结构先接好，规则后填 —— strategy.yaml 的 routes 现在还是空的。
+        #   用法：routes.<角色名>.<页面或模块>.<字段>，例如 routes.希雅.stock.mode
+        _routes = self._tuning().get("routes") or {}
+        _char = (self._tuning().get("core_score") or {}).get("main_char")
+        self.route = _routes.get(_char) or {}
+        if self.route:
+            self.log_info(f"已载入角色分支规则：{_char}（{len(self.route)} 项）")
+        else:
+            self.log_info(f"角色 {_char} 暂无分支规则，全部走默认")
         self._start_watchdog()
         try:
             return self._run_loop(max_steps, wait, stop_after_run)
@@ -1830,6 +2055,11 @@ class AutoTask(MyBaseTask):
                 self.unknown_count = 0
             if page != "训练核心":
                 self.core_checked = False
+            # 离开炒股页就把计数和「已选卡」清掉，否则下一轮进选股页会残留 True，
+            # 直点「确定」白费一步（08:26 实测）。
+            if page != "炒股小游戏":
+                self.stock_tries = 0
+                self.stock_picked = False
             if page != "选项":
                 self.choice_idx = 0
 
@@ -1873,6 +2103,12 @@ class AutoTask(MyBaseTask):
                     self._shot(frame, f"minigame_{step}")
                     break
                 result = self._do_minigame(items, frame)
+            elif page == "公告页":
+                result = self._do_notice(items, frame)
+            elif page == "训练确认":
+                result = self._do_train_confirm(items, frame)
+            elif page == "炒股小游戏":
+                result = self._do_stock(items, frame)
             elif page == "每日页":
                 self._do_daily(items, frame)
             elif page == "大厅":
@@ -1880,7 +2116,9 @@ class AutoTask(MyBaseTask):
                     self.log_info("★ 一轮训练已跑完，回到大厅 —— 收工", notify=True)
                     self._shot(frame, "done_hall")
                     break
-                it = self._find(items, ["训练"], exact=True)
+                # 大厅右下角按钮实际写的是「训练中」（不是「训练」），
+                # 且上次异常退出时点它会先弹「训练确认 → 继续训练」。
+                it = self._find(items, ["训练中", "训练"], exact=True) or self._find(items, ["训练中"])
                 if it:
                     self.in_training = True
                     self._click_item(it, "[进入训练]")
@@ -1948,7 +2186,16 @@ class AutoTask(MyBaseTask):
                     self.click_relative(0.5, 0.5)
             elif page in ("选择队友", "笔记选择", "器材选择"):
                 if not self._click_confirm(items, frame):
-                    self.log_warning(f"{page} 主按钮不是黄色，等 2 秒再试")
+                    # 2026-11-23 实测（冷启动进训练第一次遇到）：刚进选人页时队伍没配满，
+                    # 「下一步」是灰色的 BGR≈(195,198,200)，等多久都不会变黄 —— 之前这里
+                    # 就是「等 2 秒再试」死循环，连续 15 步没变化就整轮退出。
+                    # 正解：页面上有「自动选择」，点一下游戏会把队伍配满，「下一步」随即变黄。
+                    auto = self._find(items, ["自动选择", "自动填充"], exact=True)
+                    if auto:
+                        self.log_info("主按钮是灰的（队伍没配满），先点「自动选择」再确认")
+                        self._click_item(auto, "[自动选择]")
+                    else:
+                        self.log_warning(f"{page} 主按钮不是黄色，等 2 秒再试")
             elif page == "训练剧本":
                 if not self._click_confirm(items, frame):
                     it = self._find(items, ["启程", "托管"])
