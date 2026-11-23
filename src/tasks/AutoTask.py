@@ -3773,8 +3773,11 @@ class AutoTask(MyBaseTask):
                                       & (bl - rr > 15) & (bl - gc > 10)).mean())
                 if purple_ratio > 0.5:
                     return True
-            # E. 训练结果动画帧：亮白卡片+光柱，OCR 只剩一句被读花的「…加成」
-            if items is not None and len(items) <= 2:
+            # E. 训练结果动画帧：亮白卡片+光柱，OCR 只剩几句被读花的碎片。
+            #    实测同一帧读成「病性加成」(1段)、「-」(1段)、
+            #    「肩性加成/つ/·体」(3段)，所以上限放宽到 4 段。
+            #    离线扫 215 张截图：放宽后命中 7 张，全是这类动画帧，零误伤。
+            if items is not None and len(items) <= 4:
                 joined = " ".join(str(i.get("t", "")) for i in items)
                 has_hud = any(k in joined for k in ("第", "星期", "/130", "/150"))
                 over_words = ("加成", "属性", "提升", "成功", "获得", "等级", "结果")
@@ -3796,7 +3799,7 @@ class AutoTask(MyBaseTask):
         不如这里做通用兜底：给几步宽限等动画自己过去，超时恢复原未知页处理，
         所以真实页面最多多等几秒，不会被永久跳过。
         """
-        if frame is None or items is None or len(items) > 2:
+        if frame is None or items is None or len(items) > 4:
             return False
         joined = " ".join(str(i.get("t", "")) for i in items)
         if any(k in joined for k in ("第", "星期", "/130", "/150")):
@@ -3807,7 +3810,12 @@ class AutoTask(MyBaseTask):
             return False
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            return 8.0 < float(gray.std()) and 25.0 < float(gray.mean()) < 245.0
+            if not (8.0 < float(gray.std()) and 25.0 < float(gray.mean()) < 245.0):
+                return False
+            # 选人页 / LOGO 转场也有「≤4段文字、无HUD」，但它们整屏亮白
+            # (>225 占比 0.6~0.9)，训练结果动画帧只有 0.06~0.09。上限 0.25
+            # 排除前者，避免把真实选人页当过场等过去。
+            return float((gray > 225).mean()) < 0.25
         except Exception:
             return False
 
