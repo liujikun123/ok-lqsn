@@ -193,5 +193,19 @@ check("附加赛目标弹窗盖每日页→每日页", s._classify(items(extra_b
 # 反向：只有「附加赛目标」一个词、没有行动按钮 → 不认每日页（避免别处误伤）
 check("附加赛目标无按钮→未知", s._classify(items(["附加赛目标"]), None), "未知")
 
+# 22:08 实跑：步行街扭蛋三选一里有一张卡叫「精力补充」，正文全是「精力」，
+# 旧兜底 `(购买|补充)+(体力|精力)` 把整个扭蛋选择页误判成体力不足弹窗 →
+# 找不到「取消」就点左上角，连点 600+ 步空转（第7周星期六卡死）。
+check("扭蛋选择页不算购买弹窗",
+      s._is_buy_popup("扭蛋选择", items("请选择1个扭蛋 精力恢复++ 精力补充 意识增加+ 确定".split())), False)
+check("商店页不算购买弹窗",
+      s._is_buy_popup("商店", items("精力饮料 购买 30".split())), False)
+check("未知页购买浮层→弹窗",
+      s._is_buy_popup("未知", items("第5周 星期7 24/130 购买并 精力".split())), True)
+check("每日页购买浮层→弹窗",
+      s._is_buy_popup("每日页", items("第4周 星期5 5/253 购买 体力".split())), True)
+check("只有补充没有购买→不算弹窗",
+      s._is_buy_popup("未知", items("精力补充 体力".split())), False)
+
 print(f"\n=== 通过 {PASS} / 失败 {FAIL} ===")
 sys.exit(1 if FAIL else 0)

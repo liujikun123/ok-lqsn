@@ -904,6 +904,21 @@ class AutoTask(MyBaseTask):
         except Exception:
             return False
 
+    def _is_buy_popup(self, page, items):
+        """局外体力不足 / 购买提示浮层（绝不点「购买」，直接取消）。
+
+        2026-11-23 22:08 实跑踩坑：步行街扭蛋三选一里有张卡就叫「精力补充」，
+        正文又全是「精力」，旧条件 `(购买|补充)+(体力|精力)` 把整个扭蛋选择页
+        误判成弹窗 → 找不到「取消」就点左上角，连点 600+ 步空转。
+        历史上这兜底只在「未知 / 每日页」的购买浮层上生效（12:08、15:29
+        实跑，文字 6~9 段），所以：排除有独立处理分支的功能页，且必须真的
+        出现「购买」二字，「补充」不再单独触发。
+        """
+        if page in ("专注恢复", "体力恢复", "扭蛋选择", "扭蛋机", "商店"):
+            return False
+        joined = " ".join(it["t"] for it in items)
+        return "购买" in joined and ("体力" in joined or "精力" in joined)
+
     def _is_event_reply(self, items, frame):
         """8.2 事件二选一之后的「回应对话」页（2026-11-23 21:59 实跑）。
 
@@ -4522,8 +4537,7 @@ class AutoTask(MyBaseTask):
 
             # 局外体力不足弹窗：绝不点「购买」，直接取消
             joined = " ".join(i["t"] for i in items)
-            if page not in ("专注恢复", "体力恢复") and ("购买" in joined or "补充" in joined) \
-                    and ("体力" in joined or "精力" in joined):
+            if self._is_buy_popup(page, items):
                 it = self._find(items, ["取消", "关闭", "稍后"])
                 if it:
                     self.log_warning(f"体力不足弹窗，点「{it['t']}」不买")
