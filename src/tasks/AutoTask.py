@@ -107,6 +107,8 @@ class AutoTask(MyBaseTask):
         self.stock_picked = False
         self.slots_autofill = 0
         self.slots_empty = 0
+        self.slots_checked_page = None   # 已经确认过「没有空槽」的那一页（只用来打一次日志）
+        self.confirm_gray = 0            # 选人页「下一步」连续灰着几次了（配队没满就暂停）
         # 上一场训练在场上看到的器材数（商店买「器材暴击」要先确认器材上有人）
         self.last_equip_count = 0
         # 商店有没有精力道具卖：None=本期还没进过店 / True=有 / False=没有。
@@ -452,7 +454,7 @@ class AutoTask(MyBaseTask):
 
     # ---------- 空槽位（未选满）检查 ----------
 
-    def _find_empty_slots(self, frame, cfg=None):
+    def _find_empty_slots(self, frame, cfg=None, debug=False):
         """找「还没选东西」的槽位，返回相对坐标列表。
 
         长这样：**金色粗边框 + 近白底色 + 中间一个黄色十字**（器材页第 5 格实测），
@@ -482,13 +484,17 @@ class AutoTask(MyBaseTask):
         min_white = float(cfg.get("min_white") or 0.55)
 
         out = []
+        rejects = []
         for c in cnts:
             x, y, bw, bh = cv2.boundingRect(c)
             if not (min_h <= bh <= max_h):
+                rejects.append(f"{bw}x{bh} 高度不在 {min_h:.0f}~{max_h:.0f}")
                 continue
             if not (0.72 < bw / bh < 1.35):
+                rejects.append(f"{bw}x{bh} 不是方的({bw / max(bh, 1):.2f})")
                 continue
             if cv2.contourArea(c) / float(bw * bh) < 0.35:
+                rejects.append(f"{bw}x{bh} 空心(填充率低)")
                 continue
             # 内部中间 46%：必须是近白
             ix, iy = x + int(bw * 0.27), y + int(bh * 0.27)
@@ -497,6 +503,7 @@ class AutoTask(MyBaseTask):
                 continue
             white = float(((ip[:, :, 1] < 45) & (ip[:, :, 2] > 215)).mean())
             if white < min_white:
+                rejects.append(f"{bw}x{bh} 不够白 {white:.2f}<{min_white}")
                 continue
             # 内部还得留着黄色十字
             cx, cy = x + int(bw * 0.35), y + int(bh * 0.35)
@@ -505,21 +512,29 @@ class AutoTask(MyBaseTask):
                 continue
             cross = float((cv2.inRange(cp, (15, 80, 120), (40, 255, 255)) > 0).mean())
             if cross < 0.08:
+                rejects.append(f"{bw}x{bh} 白但没黄十字 {cross:.2f}")
                 continue
             out.append(dict(cx=(x + x0 + bw / 2.0) / w, cy=(y + y0 + bh / 2.0) / h,
                             w=bw / float(w), h=bh / float(h),
                             white=round(white, 2), cross=round(cross, 2)))
+        if debug:
+            self.log_info(f"加号检测：金框候选 {len(cnts)} 个 → 命中 {len(out)} 个"
+                          f"｜ROI({x0},{y0})-({x1},{y1}) 高度门槛 {min_h:.0f}~{max_h:.0f}px"
+                          f"｜被拒：{rejects[:8]}")
         out.sort(key=lambda d: d["cx"])
         return out
 
     def _slots_ready(self, page, items, frame):
         """开训前选人页的「选满了没」闸门。
 
-        有空槽（金色框 + 白底 + 黄加号）= 还有东西没选：
-          1) 先点一次「自动选择」（多数情况游戏会替你配满）
-          2) 再查一遍，还是空 → 截图 + 通知 + 暂停，**绝不点下一步**
-             （玩家明确要求：没选满就不要自己开始训练）
-        返回 "ok" / "wait"（刚点完自动选择，下一帧再看）/ "pause"（要停下等人工）。
+        有空槽（金色框 + 白底 + 黄加号）= 还有东西没选。
+
+        玩家 2026-11-23 12:47 明确：
+          「如果有空的，你不要自己点自动选择，而且停止并且弹出提示」
+        所以现在**绝不代为选择**：发现空槽 → 截图 → 桌面置顶弹窗 → 暂停，
+        等玩家自己把编队配好再继续。想恢复「先点一次自动选择」，
+        把 config/strategy.yaml 里 pick_slots.auto_fill_first 改成 true。
+        返回 "ok" / "wait"（刚点完自动选择，下一帧再看）/ "pause"（停下等人工）。
         """
         cfg = self._tuning().get("pick_slots") or {}
         if cfg.get("check") is False:
@@ -528,16 +543,26 @@ class AutoTask(MyBaseTask):
         if page not in pages:
             return "ok"
 
-        slots = self._find_empty_slots(frame, cfg)
+        first_time = self.slots_checked_page != page
+        slots = self._find_empty_slots(frame, cfg, debug=first_time)
+        if first_time and cfg.get("snapshot", True):
+            # 每页第一次进来留一张原图，方便事后离线校准「加号检测」
+            # （以前只有检测到空槽才存图，结果没报空槽时根本分不清是没空槽还是没检出）
+            self._shot(frame, f"slots_{page}")
         self.slots_empty = len(slots)
         if not slots:
+            # 每一页第一次通过时打一条，用来确认「加号检测」真的跑了
+            # （以前只有空槽才打日志，没日志时根本分不清是「没空槽」还是「检测没跑」）
+            if self.slots_checked_page != page:
+                self.slots_checked_page = page
+                self.log_info(f"{page}：已检查加号槽位，没有空位")
             return "ok"
 
         pos = ", ".join(f"({s['cx']:.2f},{s['cy']:.2f})" for s in slots)
         self.log_warning(f"{page}：发现 {len(slots)} 个空槽（还没选）@ {pos}")
         self._shot(frame, f"empty_slots_{page}")
 
-        if cfg.get("auto_fill_first", True) and self.slots_autofill < int(cfg.get("max_auto_fill") or 1):
+        if cfg.get("auto_fill_first", False) and self.slots_autofill < int(cfg.get("max_auto_fill") or 1):
             auto = self._find(items, ["自动选择", "自动填充"], exact=True)
             if auto:
                 self.slots_autofill += 1
@@ -546,14 +571,52 @@ class AutoTask(MyBaseTask):
                 self.sleep(1.6)
                 return "wait"  # 下一帧重新判断
 
-        # 自动选择也补不上（比如「剩余0次」）→ 停在这里等人工
         if cfg.get("on_empty", "暂停提示") == "暂停提示":
             self._shot(frame, f"pause_empty_{page}")
-            self.log_error(f"{page} 还有 {len(slots)} 个空槽没选（自动选择也补不上），"
-                           f"已暂停，请手动选完或改配置后再继续", notify=True)
+            self._alert_popup(
+                "篮球少女：编队有空位，已暂停",
+                f"「{page}」还有 {len(slots)} 个空位（带黄色「+」的格子）没选。\n\n"
+                f"脚本不会替你自动选择，已停在这里等你配好编队。\n"
+                f"配好后重新运行即可继续。\n\n"
+                f"截图：screenshots/auto/pause_empty_{page}_*.png")
+            self.log_error(f"{page} 还有 {len(slots)} 个空槽没选 —— 按你的要求不自动补，"
+                           f"已暂停并在桌面弹出提示", notify=True)
             return "pause"
         self.log_warning(f"{page} 有空槽，但配置是继续，按原规则点下一步")
         return "ok"
+
+    def _alert_popup(self, title, msg):
+        """弹一个置顶的 Windows 提示框（后台线程，不阻塞脚本）。
+
+        玩家要求「停止并且弹出提示」—— 光写日志看不见，脚本停了他也不知道为什么。
+        用 daemon 线程弹 MessageBox：主线程照常走暂停逻辑，弹窗一直挂在那儿等人点。
+        想关掉桌面弹窗，配置 alerts.popup: false。
+        """
+        cfg = self._tuning().get("alerts") or {}
+        if cfg.get("popup", True) is False:
+            return
+        msg = str(msg)
+        title = str(title)
+        try:
+            import ctypes
+            import threading
+
+            def _run():
+                try:
+                    MB_OK = 0x0
+                    MB_ICONWARNING = 0x30
+                    MB_SETFOREGROUND = 0x10000
+                    MB_TOPMOST = 0x40000
+                    ctypes.windll.user32.MessageBoxW(
+                        0, msg, title,
+                        MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_run, daemon=True).start()
+            self.log_info(f"已弹出桌面提示窗：{title}")
+        except Exception as e:
+            self.log_warning(f"桌面弹窗失败（{e}），请看日志")
 
     # ---------- 页面识别 ----------
 
@@ -1248,6 +1311,9 @@ class AutoTask(MyBaseTask):
           1) 精力 < 50：缺精力，得看有没有 50 元以下的饮料；
           2) 换周了：商店「上新时间 7天后」，一周才刷一次货，例行进去把该买的买齐。
         按天记账，一天最多进一次，避免每日页 ↔ 商店来回打转。
+
+        **周日一律不进**（玩家 2026-11-23）：周日去公园就能把精力回满，
+        这时候再买精力药纯属溢出浪费钱。配置 shop.skip_weekdays: [7] 可改。
         """
         shop_cfg = self._tuning().get("shop") or {}
         if not self.config.get("商店自动购买", True):
@@ -1257,6 +1323,16 @@ class AutoTask(MyBaseTask):
             return False
         if self.shop_bought >= int(shop_cfg.get("max_buy_per_run", 4)):
             return False
+
+        # 玩家 2026-11-23 12:47：「周日就不要去商店了，周日能逛公园回复，
+        # 再去商店买精力药不就溢出了」→ 周日（7）默认不进店。
+        week, wd = self._read_week(items)
+        skip_days = shop_cfg.get("skip_weekdays", [7])
+        if wd is not None and wd in [int(x) for x in skip_days]:
+            self.shop_day = day            # 记成今天已看过，免得每帧重复打日志
+            self.log_info(f"星期{wd} 不进商店：这天靠公园回精力，再买精力药会溢出")
+            return False
+
         st = self.stamina if self.stamina is not None else 999
         below = int(((shop_cfg.get("rules") or {}).get("stamina") or {}).get("when_below", 50))
         if st < below:
@@ -3016,6 +3092,8 @@ class AutoTask(MyBaseTask):
         self.stock_picked = False
         self.slots_autofill = 0
         self.slots_empty = 0
+        self.slots_checked_page = None   # 已经确认过「没有空槽」的那一页（只用来打一次日志）
+        self.confirm_gray = 0            # 选人页「下一步」连续灰着几次了（配队没满就暂停）
         # 上一场训练在场上看到的器材数（商店买「器材暴击」要先确认器材上有人）
         self.last_equip_count = 0
         # 商店有没有精力道具卖：None=本期还没进过店 / True=有 / False=没有。
@@ -3115,6 +3193,8 @@ class AutoTask(MyBaseTask):
             if page not in ("选择队友", "笔记选择", "器材选择"):
                 self.slots_autofill = 0
                 self.slots_empty = 0
+                self.slots_checked_page = None
+                self.confirm_gray = 0
 
             key = (page, len(items))
             repeat = repeat + 1 if key == last_key else 0
@@ -3262,16 +3342,31 @@ class AutoTask(MyBaseTask):
                     self.sleep(wait)
                     continue
                 if not self._click_confirm(items, frame):
-                    # 2026-11-23 实测（冷启动进训练第一次遇到）：刚进选人页时队伍没配满，
-                    # 「下一步」是灰色的 BGR≈(195,198,200)，等多久都不会变黄 —— 之前这里
-                    # 就是「等 2 秒再试」死循环，连续 15 步没变化就整轮退出。
-                    # 正解：页面上有「自动选择」，点一下游戏会把队伍配满，「下一步」随即变黄。
-                    auto = self._find(items, ["自动选择", "自动填充"], exact=True)
-                    if auto:
-                        self.log_info("主按钮是灰的（队伍没配满），先点「自动选择」再确认")
-                        self._click_item(auto, "[自动选择]")
-                    else:
-                        self.log_warning(f"{page} 主按钮不是黄色，等 2 秒再试")
+                    # 主按钮是灰的（BGR≈195,198,200）= 队伍 / 笔记 / 器材没配满。
+                    # 玩家 2026-11-23 12:47：「如果有空的，你不要自己点自动选择，
+                    # 而且停止并且弹出提示」→ 默认不再代为选择，直接停下弹窗。
+                    # 只有配置 pick_slots.auto_fill_first: true 才保留旧行为。
+                    slot_cfg = self._tuning().get("pick_slots") or {}
+                    if slot_cfg.get("auto_fill_first", False):
+                        auto = self._find(items, ["自动选择", "自动填充"], exact=True)
+                        if auto:
+                            self.log_info("主按钮是灰的（队伍没配满），先点「自动选择」再确认")
+                            self._click_item(auto, "[自动选择]")
+                            continue
+                    self.confirm_gray += 1
+                    if self.confirm_gray >= 3:
+                        self.confirm_gray = 0
+                        self._shot(frame, f"confirm_gray_{page}_{step}")
+                        self._alert_popup(
+                            "篮球少女：配队没满，已暂停",
+                            f"「{page}」的「下一步」一直是灰色的，说明队伍 / 笔记 / 器材\n"
+                            f"还没配满。\n\n"
+                            f"脚本不会替你自动选择，已停下等你手动配好再运行。")
+                        self.log_error(f"{page} 主按钮连续 3 次不是黄色（配队没满）→ "
+                                       f"暂停等你手动配置", notify=True)
+                        break
+                    self.log_warning(f"{page} 主按钮不是黄色（配队没满），等一会儿再看 "
+                                     f"（{self.confirm_gray}/3，我不会替你选）")
             elif page == "训练剧本":
                 if not self._click_confirm(items, frame):
                     it = self._find(items, ["启程", "托管"])
