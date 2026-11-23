@@ -365,6 +365,44 @@ class AutoTask(MyBaseTask):
         except Exception:
             return None
 
+    def _audit_path(self, week, day, tag):
+        """采样证据目录：logs/audit/<run_id>/W<周>D<星期>/<时刻>_<tag>.png。
+
+        玩家 2026-11-23 16:47 要求「重跑一周，把每天采样的截图和判定结果都保留，
+        人工检查」。所以每次训练核心页逐项采样都落一份：截图 + 那帧的 OCR 原文 +
+        识别出的队友/器材/失败率/等级 + 打分，按「周 / 星期」分目录，绝不覆盖。
+        """
+        try:
+            import cv2
+            run = getattr(self, "run_id", None) or "norun"
+            w = week if week is not None else 0
+            d = day if day is not None else 0
+            d = os.path.join("logs", "audit", str(run), f"W{w}D{d}")
+            os.makedirs(d, exist_ok=True)
+            tag = "".join(c if (c.isascii() and (c.isalnum() or c in "-_")) else "_"
+                          for c in str(tag))
+            return os.path.join(d, f"{time.strftime('%H%M%S')}_{tag}")
+        except Exception:
+            return None
+
+    def _audit_save(self, week, day, tag, frame, text):
+        """存一帧采样证据：同名 .png + .txt（OCR 原文 + 判定）。失败不影响主流程。"""
+        audit_cfg = self._tuning().get("audit") or {}
+        if audit_cfg.get("enabled") is False:
+            return None
+        base = self._audit_path(week, day, tag)
+        if not base:
+            return None
+        try:
+            import cv2
+            if frame is not None:
+                cv2.imwrite(base + ".png", frame)
+            with open(base + ".txt", "w", encoding="utf-8") as f:
+                f.write(text if isinstance(text, str) else str(text))
+            return base
+        except Exception:
+            return None
+
     def _frame_retry(self, tries=3, wait=0.6):
         """取帧并重试。切场景/白闪的那一两帧会取不到，连拍时不能因为一次失败就少一帧。"""
         for _ in range(tries):
@@ -2714,6 +2752,7 @@ class AutoTask(MyBaseTask):
         self.core_checked = True
 
         cfg = self._tuning().get("core_score", {}) or {}
+        audit_week, audit_day = self._read_week(items)   # 证据目录按「第N周星期X」分组
         targets = []
         for r in rows:
             spot = self._badge_near(frame, r)
@@ -2758,6 +2797,20 @@ class AutoTask(MyBaseTask):
             scored.append({"row": r, "pct": pct, "mates": 0, "level": level,
                            "valid": valid, "names": set(names), "score": 0.0,
                            "equips": equips})
+            # 采样证据（玩家 16:47 要人工检查）：每个角标技能一帧图 + OCR 原文 +
+            # 这次读到的队友/器材/失败率/等级；打分在下面算完后会再补写一份汇总。
+            f2_items = self._texts(f2) if f2 is not None else []
+            audit_txt = (
+                f"第{audit_week}周 星期{audit_day}  采样时刻 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"技能：{r['t']}  有效采样：{valid}\n"
+                f"队友({len(names)})：{names}\n"
+                f"器材({len(equips or [])})：{equips}\n"
+                f"失败率：{pct}%   等级：{level}\n"
+                f"—— 本帧 OCR 原文 ——\n"
+                + "\n".join(f"{it.get('cx'):.0f},{it.get('cy'):.0f}  {it['t']}"
+                            for it in (f2_items or []))
+            )
+            self._audit_save(audit_week, audit_day, f"core{idx}_{r['t']}", f2, audit_txt)
 
         if not scored:
             self.log_warning("带角标的技能都没读到编队，按当前默认项决定")
@@ -2841,6 +2894,31 @@ class AutoTask(MyBaseTask):
 
         _sk = best["row"]["t"]
         self.stat["train"][_sk] = self.stat["train"].get(_sk, 0) + 1
+
+        # 判定汇总证据（玩家 16:47）：这一天六项各自的原始读数 + 打分 + 排名 + 最终选择，
+        # 单独落一份 DECIDE.txt，人工一眼能核对「为什么选了它」。
+        rank_txt = " | ".join(
+            f"{d['row']['t']} {d['score']:.2f}分(队友{d['mates']} 器材{len(d.get('equips') or [])}"
+            f"/{d['level'] or '?'}) 失败率{d['pct']}%"
+            for d in scored)
+        detail_lines = []
+        for d in scored:
+            real = sorted(set(d["names"]))
+            detail_lines.append(
+                f"  {d['row']['t']}: 队友={real} 器材={d.get('equips')} "
+                f"失败率={d['pct']}% 等级={d['level']} → 得分={d['score']:.2f}")
+        decide_txt = (
+            f"第{audit_week}周 星期{audit_day}  判定时刻 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"精力 {self.stamina}/{self.stamina_max}  金币 {getattr(self, 'gold', None)}\n\n"
+            f"【每项原始读数与得分】\n" + "\n".join(detail_lines) + "\n\n"
+            f"【编队排名】\n{rank_txt}\n\n"
+            f"【规则覆盖】{'改练 ' + forced['row']['t'] + '（原第一 ' + scored[0]['row']['t'] + '）'
+                         if forced and scored[0] is not forced else '无'}\n"
+            f"【最终选择】{_sk}  得分 {best['score']:.2f}  失败率 {best.get('pct')}%\n"
+            f"【采样是否有效】{'有效' if best.get('score', 0) > 0 else '全员0分/采样可能不全'}\n"
+        )
+        self._audit_save(audit_week, audit_day, "DECIDE", None, decide_txt)
+
         # 运行记录：记下这次选课的最终得分与当时的体力，工作台按轮次列出来
         self._runlog_train(_sk, best["score"], best["pct"], best["mates"],
                            best.get("equips"))
@@ -3681,15 +3759,13 @@ class AutoTask(MyBaseTask):
         self.stamina_refills = 0
         self.stamina_misses = 0
 
-        # ---- 收工摘要统计（全局累计，跨轮不清）----
-        self.stat = {
-            "train": {},        # 技能 -> 次数
-            "gamble": [],       # 每次下注 (技能, 失败率)
-            "buy": [],          # 每次购买 (类别, 名称, 价格)
-            "note": 0,          # 出行拿到笔记的次数
-            "sample_fail": 0,   # 训练技能采样失败数
-            "stamina_drink": 0, # 喝精力药次数
-        }
+        # ---- 收工摘要统计 ----
+        #   2026-11-23 16:4x：原来 stat 全局累计、跨轮不清，摘要却叫「本轮运行摘要」，
+        #   早期采样失败留下的「投射×5」被每次 stop 反复打印几十次（假数据）。
+        #   现在拆两份：stat=本轮，stat_total=本次运行累计；每轮开始把上一轮并入累计
+        #   再清零本轮，摘要的「本轮」名副其实，累计另起一行。
+        self.stat = self._new_stat()
+        self.stat_total = self._new_stat()
 
         max_steps = int(self.config.get("最大步数") or 1500)
         wait = float(self.config.get("等待秒数") or 1.3)
@@ -3904,16 +3980,19 @@ class AutoTask(MyBaseTask):
         train = st.get("train") or {}
         gamble = st.get("gamble") or []
         buys = st.get("buy") or []
+        total = getattr(self, "stat_total", None) or self._new_stat()
+        tt = total.get("train") or {}
         lines = [
             "━━━━━━━━ 本轮运行摘要 ━━━━━━━━",
             f"完成轮数：{self.rounds_done}/{self.max_rounds}",
-            f"训练 {sum(train.values())} 次：" + ("、".join(f"{k}×{v}" for k, v in train.items()) or "无"),
+            f"本轮训练 {sum(train.values())} 次：" + ("、".join(f"{k}×{v}" for k, v in train.items()) or "无"),
+            f"累计训练 {sum(tt.values())} 次：" + ("、".join(f"{k}×{v}" for k, v in tt.items()) or "无"),
             f"笔记 {st.get('note', 0)} 次　采样失败 {st.get('sample_fail', 0)} 项",
             f"商店买 {len(buys)} 件：" + ("、".join(f"{n}({p})" for _, n, p in buys[:8]) or "无"),
             f"赌一把 {len(gamble)} 次：" + ("、".join(f"{k}@{p}%" for k, p in gamble[:8]) or "无"),
         ]
         if self.known_overlay_hits:
-            lines.append("已知浮层：" + "、".join(
+            lines.append("已知浮层（累计）：" + "、".join(
                 f"{k}×{v}" for k, v in self.known_overlay_hits.items()))
         lines.append(f"未知页 {len(self.unknown_texts)} 次")
         trans = getattr(self, "transition_warns", []) or []
@@ -3983,6 +4062,36 @@ class AutoTask(MyBaseTask):
         self.log_info(f"阶段 {old}→{to}" + (f"（{page}）" if page else "")
                       + (f" {reason}" if reason else ""))
         return True
+
+    @staticmethod
+    def _new_stat():
+        return {
+            "train": {},        # 技能 -> 次数
+            "gamble": [],       # 每次下注 (技能, 失败率)
+            "buy": [],          # 每次购买 (类别, 名称, 价格)
+            "note": 0,          # 出行拿到笔记的次数
+            "sample_fail": 0,   # 训练技能采样失败数
+            "stamina_drink": 0, # 喝精力药次数
+        }
+
+    @staticmethod
+    def _merge_stat(dst, src):
+        """把 src 累加进 dst（原地改 dst），用于「本轮 → 累计」。"""
+        for k, v in (src.get("train") or {}).items():
+            dst["train"][k] = dst["train"].get(k, 0) + v
+        for k in ("gamble", "buy"):
+            dst[k].extend(src.get(k) or [])
+        for k in ("note", "sample_fail", "stamina_drink"):
+            dst[k] = dst.get(k, 0) + (src.get(k) or 0)
+
+    def _rollover_stat(self):
+        """一轮结束：本轮 stat 并入累计，再把本轮清零。
+
+        摘要只在此后打印，所以「本轮运行摘要」只含这一轮真实发生的事；
+        累计值单列一行，想看全局还有得看。
+        """
+        self._merge_stat(self.stat_total, self.stat)
+        self.stat = self._new_stat()
 
     def _begin_round(self):
         """开始新的一轮之前，把「按天/按局」的状态清掉。
@@ -4148,6 +4257,7 @@ class AutoTask(MyBaseTask):
                     self.log_info(f"第 {self.rounds_done}/{max_rounds} 轮完成，"
                                   f"游戏不关，接着开下一轮", notify=True)
                     self._shot(frame, f"round{self.rounds_done}_done")
+                    self._rollover_stat()   # 本轮并入累计、清零，下一轮从干净 stat 开始
                     self._begin_round()
                 # 大厅右下角按钮实际写的是「训练中」（不是「训练」），
                 # 且上次异常退出时点它会先弹「训练确认 → 继续训练」。

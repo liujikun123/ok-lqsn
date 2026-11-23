@@ -276,6 +276,13 @@ tuning:
     enabled: true
     path: logs/runs.jsonl
 
+  # 采样证据（玩家 2026-11-23 16:47 要求人工检查每一天的判定）：
+  #   每个带角标技能点开后存一帧截图 + 那帧 OCR 原文 + 队友/器材/失败率/等级，
+  #   再存一份 DECIDE.txt（六项打分、排名、规则覆盖、最终选择）。
+  #   按 logs/audit/<run_id>/W<周>D<星期>/ 分目录，绝不覆盖。关掉就不写。
+  audit:
+    enabled: true
+
   # 断点续跑：每步把当前页面和关键计数写到 .state/，中途停掉再启动能直接接上
   resume:
     enabled: true

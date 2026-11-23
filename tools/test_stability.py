@@ -34,8 +34,14 @@ class Stub:
         self.max_rounds = 1
         self.stat = {"train": {}, "gamble": [], "buy": [], "note": 0,
                      "sample_fail": 0, "stamina_drink": 0}
+        self.stat_total = {"train": {}, "gamble": [], "buy": [], "note": 0,
+                           "sample_fail": 0, "stamina_drink": 0}
         self.config = {}
         self.transition_warns = []
+
+    _new_stat = staticmethod(AutoTask.__dict__["_new_stat"].__func__)
+    _merge_stat = staticmethod(AutoTask.__dict__["_merge_stat"].__func__)
+    _rollover_stat = AutoTask._rollover_stat
 
     def _tuning(self):
         import yaml
@@ -172,12 +178,29 @@ s.known_overlay_hits = {"比赛结果横幅": 7}
 s._print_summary()
 joined = " ".join(m for _, m in s.logs)
 check("摘要标题", "本轮运行摘要" in joined, True)
-check("训练次数", "训练 8 次" in joined, True)
+check("训练次数(标明本轮)", "本轮训练 8 次" in joined, True)
+check("累计行", "累计训练" in joined, True)
 check("技能分布", "投射×5" in joined and "意识×3" in joined, True)
 check("购买", "精力饮料(30)" in joined, True)
 check("赌", "防守@25%" in joined, True)
 check("浮层", "比赛结果横幅×7" in joined, True)
 check("只打一次", joined.count("本轮运行摘要"), 1)
+
+print("--- 5. 每轮 stat 清零（修摘要假数据）---")
+s = Stub()
+s.stat["train"] = {"投射": 5, "意识": 3}
+s.stat["note"] = 2
+s._rollover_stat()
+check("本轮已清零", s.stat["train"], {})
+check("本轮note清零", s.stat["note"], 0)
+check("累计并入投射", s.stat_total["train"].get("投射"), 5)
+check("累计并入意识", s.stat_total["train"].get("意识"), 3)
+check("累计并入note", s.stat_total["note"], 2)
+s.stat["train"] = {"弹跳": 1}
+s._print_summary()
+joined = " ".join(m for _, m in s.logs)
+check("摘要本轮只含弹跳", "本轮训练 1 次" in joined and "弹跳×1" in joined, True)
+check("摘要累计含投射", "累计训练 8 次" in joined and "投射×5" in joined, True)
 
 print(f"\n结果: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
