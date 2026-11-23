@@ -904,6 +904,32 @@ class AutoTask(MyBaseTask):
         except Exception:
             return False
 
+    def _is_event_reply(self, items, frame):
+        """8.2 事件二选一之后的「回应对话」页（2026-11-23 21:59 实跑）。
+
+        点完黄卡片后画面只剩顶栏 + 对话框里一句台词，右下角是角色头像而不是
+        白色▼，8.1 的箭头规则接不住 → 判未知页、按兜底 pause 直接收工。
+        特征：第N周 + 中部一句 ≥10 字中文长句 + 无行动按钮/跳过/继续。
+        要求长句，避免把「商店购买浮层」那种顶栏 + 几个短词的页面抢走。
+        """
+        if frame is None:
+            return False
+        joined = " ".join(it["t"] for it in items)
+        if not re.search(r"第\s*\d+\s*周", joined):
+            return False
+        if self._action_btn(items, frame):
+            return False
+        if any(w in joined for w in ("跳过", "点击屏幕继续", "下一步", "确定")):
+            return False
+        h = frame.shape[0]
+        body = [it for it in items if 0.20 < it["cy"] / h < 0.80]
+        # 剧情对话页正文只有一两句台词；真每日页/训练核心页中部还有一堆按钮、
+        # 属性条、技能标签，段数远多于此。离线扫 222 张验证过这个区分。
+        if not (1 <= len(body) <= 2):
+            return False
+        return any(len(re.sub(r"[^\u4e00-\u9fff]", "", it["t"])) >= 10
+                   for it in body)
+
     def _classify(self, items, frame=None):
         """判定当前页面。顺序 = 优先级，别随意调换。"""
         texts = [it["t"] for it in items]
@@ -1108,6 +1134,15 @@ class AutoTask(MyBaseTask):
         #     等标签，文字多达 11 段，所以**不按文字段数限制**，只靠▼视觉+无行动按钮。
         if (frame is not None and self._has_dialog_arrow(frame)
                 and not self._action_btn(items, frame)):
+            return "剧情事件"
+        # 8.2 事件选择后的「回应对话」页（2026-11-23 21:59 实跑）：
+        #     点完二选一黄卡片，画面只剩顶栏 + 对话框里一句台词，右下角是**角色头像**
+        #     而不是白色▼，8.1 的箭头规则接不住 → 判未知页、按兜底 pause 直接收工。
+        #     特征：有第N周、中部一句 ≥10 字的中文长句、没有行动按钮/跳过/继续。
+        #     判剧情事件后 _do_story 会点对话框推进。要长句是为了不误伤
+        #     「商店购买浮层」那种顶栏 + 几个短词的页面。
+        #     抽成方法，离线扫描时可 monkeypatch 关掉来对比新旧分类、验证零误伤。
+        if self._is_event_reply(items, frame):
             return "剧情事件"
         # 8.5 训练事件 / 球星卡事件：正文常提到「公园」这类词，会被下面的出行规则抢走
         if "训练事件" in joined and not exact("跳过"):

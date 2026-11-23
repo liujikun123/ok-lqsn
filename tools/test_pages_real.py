@@ -126,6 +126,19 @@ check("资源收益在正文→不抢成选项", s._classify(_items_at(res_trip_
 # 视觉兜底：结果类误判也能被成排黄卡片纠正回事件页
 check("行程结果在黄卡片纠正白名单内", "行程结果" in s.EVENT_CORRECT_PAGES, True)
 
+# 21:59 实跑（screenshots/auto/215917_unknown_1.png）：点完二选一黄卡片后的
+# 「回应对话」页，只剩顶栏 + 对话框里一句台词，右下角是角色头像而不是白色▼，
+# 8.1 箭头规则接不住 → 判未知页按兜底 pause 收工。8.2 应判剧情事件点对话框推进。
+reply_words = "第7周 星期四 3921130 120 6 昆三 还是别让她勉强了，受伤的话可得不偿失啊。".split()
+reply_coords = {"还是别让她勉强了，受伤的话可得不偿失啊。": (950, 548)}
+_reply_items = _items_at(reply_words, reply_coords)
+check("事件回应对话→剧情事件", s._classify(_reply_items, _fake_frame), "剧情事件")
+check("事件回应特征命中", s._is_event_reply(_reply_items, _fake_frame), True)
+# 反向：中部有多段文字的功能页（每日页/训练核心）不算回应对话
+busy_words = "第7周 星期四 92/130 120 训练 休息 商店 投射 弹跳 体能 防守 运控 意识".split()
+busy_coords = {t: (200 + i * 60, 500 + (i % 3) * 40) for i, t in enumerate(busy_words)}
+check("多段正文不算事件回应", s._is_event_reply(_items_at(busy_words, busy_coords), _fake_frame), False)
+
 # ---------------------------------------------------------------- 2. 训练核心（技能名干净，右侧≥4）
 # 真实运行时 OCR 把技能胶囊读成干净的「投射」「弹跳」（日志 27855 行实证）
 print("--- 2. 训练核心（右侧技能胶囊）---")
