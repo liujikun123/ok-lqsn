@@ -783,6 +783,26 @@ class AutoTask(MyBaseTask):
             return it
         return self._btn_in_area(items, self.ACTION_BTNS, frame, exact=False)
 
+    def _shop_button(self, items, frame):
+        """每日页的「商店」入口。
+
+        2026-11-23 12:10 实跑：整轮一次都没进店。原因是这里原来用 `_btn_in_area`，
+        而它只在**右下角**（x>0.6w, y>0.45h）找按钮 —— 每日页的「商店」不在那个区域
+        （掉线弹窗的 OCR 里能看到「商店」二字，说明这页确实有）。
+        改成全屏找，右下角优先，并排除顶部状态栏里的同名小图标。
+        """
+        h, w = frame.shape[:2]
+        cands = [it for it in items if it["t"].strip() == "商店"
+                 and it["cy"] > h * 0.15 and it["cx"] > w * 0.05]
+        if not cands:
+            return None
+        cands.sort(key=lambda x: (x["cx"] > w * 0.60 and x["cy"] > h * 0.45,
+                                  x["cx"] + x["cy"]), reverse=True)
+        it = cands[0]
+        self.log_info(f"商店按钮 @({int(it['cx'])},{int(it['cy'])}) "
+                      f"相对({it['cx']/w:.2f},{it['cy']/h:.2f})")
+        return it
+
     def _btn_in_area(self, items, words, frame, exact=True):
         """只在「右下角按钮区」找按钮。
 
@@ -830,7 +850,7 @@ class AutoTask(MyBaseTask):
         train = self._btn_in_area(items, ["训练"], frame)
         rest = self._btn_in_area(items, ["休息"], frame)
         go = self._btn_in_area(items, ["出行"], frame)
-        shop = self._btn_in_area(items, ["商店"], frame)
+        shop = self._shop_button(items, frame)
 
         # 商店（玩家 2026-11-23：只买 0 元 + 精力 <50 买精力药）
         #   以前这里没接入口，整轮一次店都没进过 → 精力药从来没买过。
@@ -840,6 +860,11 @@ class AutoTask(MyBaseTask):
             self.shop_week = (self.shop_day or "").split("-")[0] or None
             self._click_btn(shop, f"[进商店 精力{self.stamina} 看货架]", frame)
             return True
+        if not shop:
+            day = self._day_key(items) or ""
+            if self.shop_week != day.split("-")[0]:
+                self.log_info(f"每日页没找到「商店」按钮（本周期还没看过货架）"
+                              f"｜文字 {[it['t'] for it in items][:12]}")
 
         if train and enough:
             # 玩家 2026-11-23：「出行看有没有笔记，大于训练」。
@@ -2164,8 +2189,12 @@ class AutoTask(MyBaseTask):
             self.log_info(f"按规则覆盖排名：改练「{forced['row']['t']}」"
                           f"（原第一「{scored[0]['row']['t']}」）")
 
+        # 全员 0 分 = 队友和器材都没读到，这时候的排名没有意义，别装作在"赌"
+        if best.get("score", 0) <= 0:
+            self.log_warning(f"所有候选得分都是 0（队友/器材没读到），按「{best['row']['t']}」"
+                             f"——采样可能不全，这一手不算决策")
         # 选中项带失败率 → 明确打一条「赌」的日志，事后复盘输赢用
-        if best.get("pct"):
+        elif best.get("pct"):
             alt = [d for d in scored if d is not best and not d.get("pct")]
             self.log_warning(f"赌一把：「{best['row']['t']}」失败率 {best['pct']}%，"
                              f"期望得分仍排第一（{best['score']:.2f}）"
@@ -2241,7 +2270,8 @@ class AutoTask(MyBaseTask):
         self.log_info(f"失败率全部 >{thr}% 且商店无精力道具 → 改练「{want}」（成功率最高）")
         return cand
 
-    def _sample_core(self, row, frames=5, gap=0.2, warmup=0.4, max_tries=8):
+    def _sample_core(self, row, frames=6, gap=0.18, warmup=0.35, max_tries=10,
+                     min_frames=4):
         """点开技能后等 0.4 秒（选中态出来），再连拍几帧投票成稳定值。
 
         2026-11-23 10:14 CoreSweepTask 逐帧扫查的结论（玩家提示「不用特定时间窗口」）：
@@ -2283,7 +2313,12 @@ class AutoTask(MyBaseTask):
             # 那一帧把阵容页的位置名（分卫/大前/控卫）当成队友、把球队大卡当成器材，
             # 结果唯一一项得分 8 分，直接定案选错技能。只要出现比赛/结算类的字眼就丢帧。
             off_core = any(w in " ".join(it["t"] for it in its)
-                           for w in ("赛前准备", "跳过比赛", "前往比赛", "MVP", "目标达成"))
+                           for w in ("赛前准备", "跳过比赛", "前往比赛", "MVP", "目标达成",
+                                     # 2026-11-23 12:10 实跑发现：点技能后有时先弹「心·技·体」
+                                     # 属性/加成大浮层，把编队面板整个盖住。这类帧以前会被
+                                     # 当成训练核心页的错误读数，现在明确丢掉（48% 的采样
+                                     # 0 帧有效就是栽在这上面）。
+                                     "心·技·体", "属性加成", "表情升级", "倍率加成"))
             looks_core = (not off_core) and (hits >= 1 or has_pct or has_lv or len(names) >= 2)
             if not looks_core:
                 self.sleep(gap)
@@ -2304,8 +2339,12 @@ class AutoTask(MyBaseTask):
                                   f"{[(int(c['x']), int(c['y']), card_glow(f, c)) for c in cs]}")
             except Exception as e:      # 器材读失败不能拖累编队采样
                 self.log_info(f"器材检测失败（忽略）：{e}")
-            if len(pcts) >= 2 and len(name_sets) >= 2:
-                break                            # 已经够投票了，别再多拍
+            # 【2026-11-23 12:05 实跑修正】原来 `>=2 帧就 break`，一局下来 78% 的训练
+            # 只采到 2 帧。配合下面「名字要出现 >=2 帧才算」，等于**两帧都得读到**——
+            # 漏读一帧就少一个队友，得分直接从 5.0 掉到 3.0，选出来的课自然比手打差。
+            # 现在至少 min_frames 帧才允许收工，多拍 2 帧成本 <0.4s，换来名字读全。
+            if used >= min_frames and len(pcts) >= 2 and len(name_sets) >= min_frames:
+                break
             self.sleep(gap)
 
         mates = []
@@ -2320,7 +2359,10 @@ class AutoTask(MyBaseTask):
             # 主训人员每局都可能换（这一局是「闪堂」，上一局是「希雅」），
             # 写死一个名字必然剔错。谁该忽略交给 _do_training_core 用「每个技能都有」
             # 的常驻名来判。
-            mates = [n for n, c in cnt.items() if c >= 2]
+            # 门槛随帧数走：6 帧要 4 帧命中，4 帧要 2 帧命中。
+            # （原来写死 >=2，帧少时等于"必须每帧都读到"，见上面 12:05 那条）
+            need = max(2, int(len(name_sets) * 0.6 + 0.5))
+            mates = [n for n, c in cnt.items() if c >= need]
 
         pct = None
         if pcts:
@@ -2337,11 +2379,22 @@ class AutoTask(MyBaseTask):
             level = max(cnt.items(), key=lambda kv: kv[1])[0]
         equip = ()
         if equips:
+            # 【2026-11-23 12:10】器材是**一直画在场上**的，读到 0 张是检测漏了，
+            # 不是"没有"。原来看票数取多数 → 3 帧 0 张 + 2 帧 1 张就判成"没器材"，
+            # 一场少 0.5~1.5 分。现在只要有非 0 帧就以非 0 帧为准。
+            nz = [e for e in equips if e]
             cnt = {}
-            for e in equips:
+            for e in (nz or equips):
                 cnt[e] = cnt.get(e, 0) + 1
-            # 票数最高者；同票取张数多的（宁可少算支援也不漏）
             equip = max(cnt.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
+        if used == 0:
+            # 一帧都没通过「像训练核心页」的判据 —— 把画面文字和截图留下来，
+            # 不然只能猜（实跑里 48% 的采样是这种情况）。
+            try:
+                self.log_warning(f"采样 0 帧有效，画面文字：{[it['t'] for it in its][:14]}")
+                self._shot(f, "core_fail")
+            except Exception:
+                pass
         if used < frames:
             self.log_info(f"编队采样 {used}/{frames} 帧有效（试了 {tries} 次，废帧已丢弃）")
         return mates, pct, level, list(equip)
