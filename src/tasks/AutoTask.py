@@ -2488,6 +2488,9 @@ class AutoTask(MyBaseTask):
 
         _sk = best["row"]["t"]
         self.stat["train"][_sk] = self.stat["train"].get(_sk, 0) + 1
+        # 运行记录：记下这次选课的最终得分与当时的体力，工作台按轮次列出来
+        self._runlog_train(_sk, best["score"], best["pct"], best["mates"],
+                           best.get("equips"))
         self._click_item(best["row"], f"[最优编队 {_sk} 得分{best['score']:.1f}]")
         self.sleep(1.0)
         f3 = self._frame()
@@ -3298,6 +3301,8 @@ class AutoTask(MyBaseTask):
 
         self.log_info(f"开始自动训练：最多 {max_steps} 步，共 {max_rounds} 轮")
         self._load_state()
+        # 运行记录：写一个 start 事件；断点续跑时会沿用同一个 run_id（见 _runlog_start）
+        self._runlog_start()
 
         # 角色分支：不同主训人员走不同支线（剧情选项、小游戏、事件都不一样）。
         # 结构先接好，规则后填 —— strategy.yaml 的 routes 现在还是空的。
@@ -3317,6 +3322,7 @@ class AutoTask(MyBaseTask):
             # 人不在屏幕前根本不知道脚本什么时候、为什么停了。
             import traceback
             tb = traceback.format_exc()
+            self._runlog_status = f"异常：{type(e).__name__}"
             self.log_error(f"脚本异常停机：{type(e).__name__}: {e}\n{tb[-800:]}", notify=True)
             raise
         finally:
@@ -3325,6 +3331,89 @@ class AutoTask(MyBaseTask):
             if not getattr(self, "_summary_printed", False):
                 self._summary_printed = True
                 self._print_summary()
+            # 运行记录收尾：无论正常/异常都写，工作台的「运行记录」页据此显示本次结果
+            self._runlog_end(getattr(self, "_runlog_status", "正常"))
+
+    # ---------- 运行记录（给工作台的「运行记录」页看）----------
+    # 设计：append-only 的 jsonl，一次运行一个 run_id，事件分 start / train / end。
+    #   为什么不在内存里攒一份给工作台：AutoTask 是工作台 spawn 的**独立进程**，
+    #   内存不共享；只能通过文件交接。jsonl 追加写的好处是崩了也不丢已写的记录，
+    #   工作台读的时候正好看到「有 start 没 end」= 还在跑 / 被强停。
+    #   任何一步写失败都吞掉 —— 记录是锦上添花，绝不能因为磁盘满就把训练搞崩。
+
+    def _runlog_path(self):
+        cfg = self._tuning().get("runlog") or {}
+        if cfg.get("enabled") is False:
+            return None
+        return str(cfg.get("path") or "logs/runs.jsonl")
+
+    def _runlog_event(self, ev):
+        p = self._runlog_path()
+        if not p:
+            return
+        try:
+            import json
+            if not os.path.isabs(p):
+                root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                p = os.path.join(root, p)
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            ev["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _runlog_start(self):
+        # 断点续跑：run_id 已从 .state 恢复，就接着记（写一条 resume 便于对账），
+        # 不新开一次运行，否则「本次运行几轮」会被拆成两次。
+        if getattr(self, "run_id", None):
+            self._runlog_event({"event": "resume", "run": self.run_id})
+            return
+        self.run_id = time.strftime("%Y%m%d_%H%M%S")
+        self._runlog_first_stamina = None
+        self._runlog_first_focus = None
+        self._runlog_status = "正常"
+        loop = self._tuning().get("loop") or {}
+        self._runlog_event({"event": "start", "run": self.run_id,
+                            "rounds": int(loop.get("max_rounds") or 1)})
+
+    def _runlog_train(self, skill, score, pct, mates, equips):
+        """一次选课 = 一条训练记录。得分是 _score_core 算出来的编队期望分。"""
+        if not getattr(self, "run_id", None):
+            return
+        st, fo = self.stamina, self.out_focus
+        if getattr(self, "_runlog_first_stamina", None) is None and st is not None:
+            self._runlog_first_stamina = [st, self.stamina_max]
+        if getattr(self, "_runlog_first_focus", None) is None and fo is not None:
+            self._runlog_first_focus = [fo, self.out_focus_max]
+        self._runlog_event({
+            "event": "train", "run": self.run_id,
+            "round": int(getattr(self, "rounds_done", 0)) + 1,
+            "skill": skill, "score": round(float(score or 0), 2),
+            "fail": pct, "mates": mates, "equips": len(equips or []),
+            "stamina": st, "stamina_max": self.stamina_max,
+            "focus": fo, "focus_max": self.out_focus_max,
+        })
+
+    def _runlog_end(self, status="正常"):
+        if not getattr(self, "run_id", None):
+            return
+        st = getattr(self, "stat", {}) or {}
+        first_st = getattr(self, "_runlog_first_stamina", None)
+        first_fo = getattr(self, "_runlog_first_focus", None)
+        self._runlog_event({
+            "event": "end", "run": self.run_id, "status": status,
+            "rounds_done": int(getattr(self, "rounds_done", 0)),
+            "rounds": int(getattr(self, "max_rounds", 0)),
+            "trains": int(sum((st.get("train") or {}).values())),
+            "stamina_start": first_st[0] if first_st else None,
+            "stamina_end": self.stamina,
+            "focus_start": first_fo[0] if first_fo else None,
+            "focus_end": self.out_focus,
+            "drinks": int(getattr(self, "stamina_refills", 0)),
+        })
+        # 写完就本次运行结束，下次启动要新开 run_id
+        self.run_id = None
 
     # ---------- 断点续跑 ----------
     # 状态机本来就是按页面流转的（任何一屏都能接着跑），所以断点只需记住
@@ -3336,6 +3425,7 @@ class AutoTask(MyBaseTask):
         "shop_has_stamina", "notes_done", "minigame_tries", "stock_idx",
         "stock_tries", "stock_picked", "stamina_refills", "stamina_misses",
         "last_equip_count", "rounds_done", "stat",
+        "run_id", "_runlog_first_stamina", "_runlog_first_focus",
     )
 
     def _state_path(self):

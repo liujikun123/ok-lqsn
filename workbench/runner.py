@@ -91,6 +91,75 @@ def summarize_rule(path: str) -> list[tuple[str, str]]:
     return rows
 
 
+# ---------------------------------------------------------------- 运行记录
+
+def read_run_log(root: str | None = None, path: str | None = None) -> list[dict]:
+    """读 logs/runs.jsonl，按 run_id 聚合成一条条运行记录（新的在前）。
+
+    每条返回：
+        id, start, end, status, rounds_done, rounds, trains,
+        stamina_start/end, focus_start/end, drinks,
+        items: [{round, skill, score, fail, mates, equips, stamina, focus, at}, ...]
+    坏行跳过（文件被强停写坏的半行不能让整个面板打不开）。
+    """
+    import json
+    root = root or project_root()
+    path = path or os.path.join(root, "logs", "runs.jsonl")
+    runs: dict[str, dict] = {}
+    order: list[str] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                    rid = ev.get("run")
+                    if not rid:
+                        continue
+                except Exception:
+                    continue
+                if rid not in runs:
+                    runs[rid] = {"id": rid, "start": "", "end": "", "status": "进行中/中断",
+                                 "rounds_done": 0, "rounds": 0, "trains": 0,
+                                 "stamina_start": None, "stamina_end": None,
+                                 "focus_start": None, "focus_end": None, "drinks": 0,
+                                 "items": []}
+                    order.append(rid)
+                r = runs[rid]
+                kind = ev.get("event")
+                if kind == "start":
+                    r["start"] = ev.get("at") or ""
+                    r["rounds"] = int(ev.get("rounds") or 0)
+                elif kind == "resume":
+                    r["resumed"] = True
+                elif kind == "train":
+                    r["items"].append({
+                        "round": ev.get("round"), "skill": ev.get("skill") or "-",
+                        "score": ev.get("score"), "fail": ev.get("fail"),
+                        "mates": ev.get("mates"), "equips": ev.get("equips"),
+                        "stamina": ev.get("stamina"), "focus": ev.get("focus"),
+                        "at": ev.get("at") or "",
+                    })
+                elif kind == "end":
+                    r["end"] = ev.get("at") or ""
+                    r["status"] = ev.get("status") or "正常"
+                    r["rounds_done"] = int(ev.get("rounds_done") or 0)
+                    r["rounds"] = int(ev.get("rounds") or r["rounds"])
+                    r["trains"] = int(ev.get("trains") or len(r["items"]))
+                    r["stamina_start"] = ev.get("stamina_start")
+                    r["stamina_end"] = ev.get("stamina_end")
+                    r["focus_start"] = ev.get("focus_start")
+                    r["focus_end"] = ev.get("focus_end")
+                    r["drinks"] = int(ev.get("drinks") or 0)
+    except FileNotFoundError:
+        return []
+    except Exception:
+        pass
+    return [runs[rid] for rid in reversed(order)]
+
+
 # ---------------------------------------------------------------- 环境自检
 
 @dataclass

@@ -73,6 +73,15 @@ LOG_COLORS = {
 }
 
 
+def _fmt(v) -> str:
+    """记录面板里的数值显示：None → -，整数不带小数点。"""
+    if v is None:
+        return "-"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 class Chip(QLabel):
     """顶部状态小胶囊。"""
 
@@ -110,6 +119,7 @@ class Workbench(QMainWindow):
         self._build()
 
         self.refresh_all()
+        self.refresh_records()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_game_state)
         self.timer.start(3000)
@@ -198,8 +208,91 @@ class Workbench(QMainWindow):
         self.tabs.addTab(self.panel_settings, "运行设置")
         self.tabs.addTab(self._summary_tab(), "规则摘要")
         self.tabs.addTab(self._raw_tab(), "规则原文")
+        self.tabs.addTab(self._records_tab(), "运行记录")
         lay.addWidget(self.tabs, 1)
         return box
+
+    def _records_tab(self) -> QWidget:
+        """运行记录：读 logs/runs.jsonl，顶部汇总当前运行，下面列出每次选课得分。"""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(8)
+
+        head = QHBoxLayout()
+        self.lab_record_title = QLabel("暂无运行记录，先点「启动训练」跑一轮。")
+        self.lab_record_title.setStyleSheet("font-weight:600;")
+        head.addWidget(self.lab_record_title, 1)
+        btn_refresh = QPushButton("刷新")
+        btn_refresh.clicked.connect(self.refresh_records)
+        head.addWidget(btn_refresh)
+        v.addLayout(head)
+
+        self.lab_record_sum = QLabel("")
+        self.lab_record_sum.setWordWrap(True)
+        self.lab_record_sum.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        v.addWidget(self.lab_record_sum)
+
+        self.tbl_records = QTableWidget(0, 4)
+        self.tbl_records.setHorizontalHeaderLabels(["轮", "技能", "最终得分", "失败率"])
+        self.tbl_records.verticalHeader().setVisible(False)
+        self.tbl_records.horizontalHeader().setStretchLastSection(True)
+        self.tbl_records.setColumnWidth(0, 40)
+        self.tbl_records.setColumnWidth(1, 90)
+        self.tbl_records.setColumnWidth(2, 80)
+        self.tbl_records.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tbl_records.setSelectionMode(QTableWidget.NoSelection)
+        v.addWidget(self.tbl_records, 1)
+
+        tip = QLabel("数据来自 logs/runs.jsonl · 每完成一次选课记一行 · 体力是选课那一刻的读数")
+        tip.setStyleSheet(f"color:{MUTED}; font-size:10px;")
+        v.addWidget(tip)
+        return w
+
+    def refresh_records(self) -> None:
+        """显示最近一次运行的汇总与明细；训练中反复调用，最后一条自然是本次。"""
+        if not hasattr(self, "tbl_records"):
+            return
+        runs = R.read_run_log(ROOT)
+        if not runs:
+            self.lab_record_title.setText("暂无运行记录，先点「启动训练」跑一轮。")
+            self.lab_record_sum.setText("")
+            self.tbl_records.setRowCount(0)
+            return
+        r = runs[0]
+        status = r.get("status") or "?"
+        self.lab_record_title.setText(
+            f"最近一次运行 · {r.get('start') or r.get('id', '')} · {status}")
+        sm = (f"完成 {r.get('rounds_done', 0)}/{r.get('rounds', 0)} 轮　"
+              f"训练 {r.get('trains', 0)} 次　"
+              f"精力 {_fmt(r.get('stamina_start'))}→{_fmt(r.get('stamina_end'))}　"
+              f"专注 {_fmt(r.get('focus_start'))}→{_fmt(r.get('focus_end'))}"
+              f"（喝药 {r.get('drinks', 0)} 瓶）")
+        if r.get("resumed"):
+            sm += "　· 中途断点续跑"
+        self.lab_record_sum.setText(sm)
+
+        items = r.get("items") or []
+        self.tbl_records.setRowCount(len(items))
+        for i, it in enumerate(items):
+            score = it.get("score")
+            fail = it.get("fail")
+            vals = [
+                str(it.get("round") or "-"),
+                str(it.get("skill") or "-"),
+                f"{score:.2f}" if isinstance(score, (int, float)) else "-",
+                f"{fail}%" if fail else "0%",
+            ]
+            for c, val in enumerate(vals):
+                cell = QTableWidgetItem(val)
+                if c == 2 and isinstance(score, (int, float)):
+                    # 得分高亮：>=6 绿、<=3 橙，一眼看出这轮选得好不好
+                    if score >= 6:
+                        cell.setForeground(QColor(OK_C))
+                    elif score <= 3:
+                        cell.setForeground(QColor(WARN_C))
+                self.tbl_records.setItem(i, c, cell)
+        self.tbl_records.resizeRowsToContents()
 
     def _summary_tab(self) -> QWidget:
         w = QWidget()
@@ -398,6 +491,7 @@ class Workbench(QMainWindow):
 
     def on_done(self, code: int, label: str) -> None:
         self.refresh_game_state()
+        self.refresh_records()
         if code != 0:
             self.append_log("error", f"「{label}」非正常结束（{code}），看日志最后几行")
 

@@ -245,6 +245,13 @@ tuning:
   summary:
     enabled: true
 
+  # 运行记录：给工作台「运行记录」页看。
+  #   每次选课写一条 {轮次,技能,最终得分,失败率,体力}，运行首尾各写一条汇总，
+  #   追加到 logs/runs.jsonl（一行一条，坏了不影响训练）。关掉就不写。
+  runlog:
+    enabled: true
+    path: logs/runs.jsonl
+
   # 断点续跑：每步把当前页面和关键计数写到 .state/，中途停掉再启动能直接接上
   resume:
     enabled: true
