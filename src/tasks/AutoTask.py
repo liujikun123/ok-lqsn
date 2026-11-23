@@ -309,6 +309,73 @@ class AutoTask(MyBaseTask):
         self.log_info(f"点击「{it['t']}」@({int(it['cx'])},{int(it['cy'])}) {why}")
         self.click(it["cx"], it["cy"])
 
+    def _btn_center(self, frame, it, reach=0.28):
+        """在文字附近找**按钮实体矩形**，返回它的中心；找不到返回 None。
+
+        为什么要这一步（2026-11-23 两次踩坑）：
+          · 行为卡「确定」OCR 框中心比按钮实体高 38px，连点 15 次全点在按钮上方空白；
+          · 赛前准备「前往比赛」OCR 给 (1706,929)，按钮实体中心 (1653,978)，
+            偏 53/49px，同样点空，15 步后停机。
+          OCR 框只框住**字**，字在按钮里通常偏上（有的还偏右），所以主按钮一律按
+          「色块矩形」定位，而不是按文字框中心。
+
+        认三类按钮底色：金黄 / 浅灰（不可点的主按钮）/ 蓝（次要按钮）。
+        """
+        if frame is None:
+            return None
+        h, w = frame.shape[:2]
+        x1 = max(int(it["cx"] - reach * w), 0)
+        x2 = min(int(it["cx"] + reach * w), w)
+        y1 = max(int(it["cy"] - 0.10 * h), 0)
+        y2 = min(int(it["cy"] + 0.10 * h), h)
+        patch = frame[y1:y2, x1:x2]
+        if patch.size == 0:
+            return None
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        # 按「可信度」分三档逐档尝试：金黄最可信（就是主按钮），其次蓝色，最后浅灰。
+        tiers = [
+            ((H >= 16) & (H <= 42) & (S >= 110) & (V >= 160)),      # 金黄主按钮
+            ((H >= 85) & (H <= 115) & (S >= 70) & (V >= 110)),      # 蓝
+            ((S <= 45) & (V >= 165)),                               # 浅灰按钮
+        ]
+        for mask in tiers:
+            m = mask.astype(np.uint8) * 255
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            best = None
+            for c in cnts:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                if bw < 0.05 * w or bh < 0.022 * h or bw > 0.40 * w:
+                    continue
+                if not (2.2 <= bw / float(bh) <= 16):
+                    continue
+                # 必须是「一整块」的实心矩形：按钮底色是纯色，背景/渐变会被这条挡掉
+                if cv2.contourArea(c) / float(bw * bh) < 0.60:
+                    continue
+                cx_, cy_ = bx + x1 + bw / 2.0, by + y1 + bh / 2.0
+                dist = abs(cx_ - it["cx"]) + abs(cy_ - it["cy"])
+                if dist > 0.14 * w:
+                    continue
+                key = (bw * bh) - dist * 2.0
+                if best is None or key > best[0]:
+                    best = (key, cx_, cy_)
+            if best:
+                return (best[1], best[2])
+        return None
+
+    def _click_btn(self, it, why="", frame=None):
+        """点主按钮：先按色块矩形定位，定位不到才退回文字框中心。"""
+        spot = self._btn_center(frame, it)
+        if spot:
+            off = abs(spot[0] - it["cx"]) + abs(spot[1] - it["cy"])
+            if off > 6:
+                self.log_info(f"点击「{it['t']}」@({int(spot[0])},{int(spot[1])}) {why} "
+                              f"[按按钮矩形定位，文字框偏了 {int(off)}px]")
+                self.click(spot[0], spot[1])
+                return
+        self._click_item(it, why)
+
     def _yellow_ratio(self, frame, box, pad=28):
         """框外扩一圈后统计黄色像素占比 —— 按钮是黄底，但文字框本身是黑的，
         直接取平均色会判成「不是黄按钮」，所以看占比更准。"""
@@ -620,19 +687,6 @@ class AutoTask(MyBaseTask):
         trip_hits = [it for it in items if it["t"] in self.TRIP_NAMES]
         if "在公园干点什么好呢" in joined:
             return "公园子页"
-        # 1.55 确认编队页（2026-11-23 10:37 实测）
-        #      打开训练后先弹这一页：左侧「训练队伍」五人、右侧「训练笔记 / 器材」，
-        #      底部「将消耗 89/30 开始训练，确定要继续吗？」+ 黄色大按钮「开始训练」。
-        #      之前没有这条规则，每次都卡在这儿得人工点（玩家：我配好了，你直接点开始训练）。
-        if "确认编队" in joined or ("开始训练" in joined and "将消耗" in joined)                 or ("训练队伍" in joined and "开始训练" in joined):
-            return "确认编队"
-        # 1.6 剧情提议「加练」对话（2026-11-23 10:28 实测）
-        #     画面是训练馆 + 一段正文 + 两个黄按钮「稍等一下 / 那就开始吧」，
-        #     底部还挂着队伍属性面板（投射/弹跳/… 六项），于是被下面
-        #     「右侧技能 ≥4」当成训练核心 → 对着不存在的技能胶囊猛点，
-        #     采样 0/5 帧、整轮作废。必须在训练核心之前拦下来。
-        if ("那就开始吧" in joined and "稍等一下" in joined) or "提议再" in joined                 or ("加练" in joined and ("那就开始吧" in joined or "稍等一下" in joined)):
-            return "训练提议"
         if exact("步行街") or len(trip_hits) >= 2:
             return "出行"
         if any(t.startswith("前往") for t in texts):
@@ -642,6 +696,13 @@ class AutoTask(MyBaseTask):
         # 10. 训练剧本（这页也有 图鉴/成就 图标，会被大厅抢走）
         if has("训练剧本") or (has("启程") and has("托管")) or has("大师模式"):
             return "训练剧本"
+        # 10.5 全屏遮罩弹窗（「新目标」「距离比赛还有N天」这类）
+        #      正文下方固定带「点击屏幕继续」，但**被遮住的每日页按钮仍会被 OCR 读到**，
+        #      于是判成每日页 → 在遮罩上猛点「训练」，15 步毫无变化后停机
+        #      （2026-11-23 10:52 实测：第 5 周星期 2，精力 130/130，连点 15 次）。
+        #      只要有这一行提示，就是「点一下继续」，不是功能页。
+        if "点击屏幕继续" in joined:
+            return "点击继续"
         # 11. 大厅：一定有一个「训练」按钮（exact），再配协会/好友/图鉴这些入口。
         #     必须排在「每日页」之前：大厅也可能带「第N周」，右下角也有「训练」按钮，
         #     否则回大厅会被当成每日页，收工判定就永远等不到（saw_training 白攒）。
@@ -721,7 +782,7 @@ class AutoTask(MyBaseTask):
 
         match = self._btn_in_area(items, ["比赛"], frame)
         if match:
-            self._click_item(match, "[比赛日-进赛前准备]")
+            self._click_btn(match, "[比赛日-进赛前准备]", frame)
             return True
 
         stamina_min = int(self.config.get("训练精力下限") or 40)
@@ -732,25 +793,25 @@ class AutoTask(MyBaseTask):
         go = self._btn_in_area(items, ["出行"], frame)
 
         if train and enough:
-            self._click_item(train, f"[训练 精力{self.stamina}/{self.stamina_max}]")
+            self._click_btn(train, f"[训练 精力{self.stamina}/{self.stamina_max}]", frame)
             return True
 
         # 精力不足：先看能不能去公园（唯一能明显回精力的地方）
         if go and not enough:
-            self._click_item(go, f"[精力{self.stamina}<{stamina_min}-出行去公园补精力]")
+            self._click_btn(go, f"[精力{self.stamina}<{stamina_min}-出行去公园补精力]", frame)
             return True
 
         if rest:
-            self._click_item(rest, f"[休息 精力{self.stamina}<{stamina_min}，休息不补精力只推一天]")
+            self._click_btn(rest, f"[休息 精力{self.stamina}<{stamina_min}，休息不补精力只推一天]", frame)
             return True
 
         if train:  # 没别的路，先点训练（不足会弹专注恢复，那边有兜底）
-            self._click_item(train, "[训练-精力可能不足]")
+            self._click_btn(train, "[训练-精力可能不足]", frame)
             return True
 
         # 周末（六/日）：每日页只有「出行」一个行动按钮，不走就走不动这一天
         if go:
-            self._click_item(go, "[周末-出行]")
+            self._click_btn(go, "[周末-出行]", frame)
             return True
 
         # 兜底 0：这屏其实是个结果展示页（成功！/工资），点「下一步」就走
@@ -803,11 +864,11 @@ class AutoTask(MyBaseTask):
         """赛前准备：一律跳过比赛（玩家规则里从没打过比赛）。"""
         it = self._find(items, ["跳过比赛"])
         if it:
-            self._click_item(it, "[跳过比赛]")
+            self._click_btn(it, "[跳过比赛]", frame)
             return True
         it = self._find(items, ["跳过"])
         if it:
-            self._click_item(it, "[跳过]")
+            self._click_btn(it, "[跳过]", frame)
             return True
         self.log_warning("赛前准备页没找到「跳过比赛」，点屏幕中间")
         self.click_relative(0.5, 0.5)
@@ -2647,6 +2708,12 @@ class AutoTask(MyBaseTask):
                 self._do_shop(items, frame)
             elif page == "训练核心":
                 self._do_training_core(items, frame)
+            elif page == "点击继续":
+                it = self._find(items, ["点击屏幕继续"]) or self._find(items, ["点击继续"])
+                if it:
+                    self._click_item(it, "[点击屏幕继续]")
+                else:
+                    self.click_relative(0.5, 0.86)
             elif page == "训练结果":
                 it = self._find(items, ["点击屏幕继续"])
                 if it:
