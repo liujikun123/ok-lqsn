@@ -104,12 +104,16 @@ tuning:
     exclude: [游戏厅]                # 游戏厅 = 拼图小游戏，规则里没要求去，直接排除
     park_first_fill_stamina: true    # 公园：中间(+30精力+属性) / 右边(+70精力)，先补满精力
     fallback_order: [公园, 散步, 野餐, 划船, 餐厅, 步行街]   # 分数并列/都读不到标签时的顺序
+    park_fallback: [野餐, 划船, 散步]    # 公园子页（休息日只求回满精力）：野餐 > 划船 > 散步
     probe_notes_first: true          # 玩家 2026-11-23：「出行看有没有笔记，笔记 > 训练」
                                      # true = 每天有训练时先探一眼出行页有没有笔记；false = 训练优先
 
   # 加强训练三选一
   enhance:
-    strategy: max_bonus              # 优先最高加成（+102 > +78 > +48）
+    strategy: max_bonus              # max_bonus=优先最高加成（+102 > +78 > +48）；first=第一个
+  # 得分行为卡三选一：按列表顺序挑，命中即停；都不命中取最右一张
+  behavior_card:
+    prefer: [无惧重围, 看破擅长, 看破, 得分手]
 
   # 训练核心页打分
   #   【已验证的事实】这页选之前能读到的只有三样：
@@ -168,12 +172,26 @@ tuning:
       skill: 意识
 
   # 随机事件倾向：技能 > 精力(未溢出) > 属性；无数值的三个竖排选项默认 属性 > 精力 > 金钱
+  # 事件/出行/加强/行为卡的优先级——全部**代码只读这里**，改这里就能换策略。
+  # tier 从高到低排，打分时按索引给大分（第 0 项最高）。
+  # 关键词是「奖励文字里出现这些词就算这档」。
   event:
-    priority: [技能, 精力, 属性]
+    # 5 档完整顺序：笔记 > 技能 > 未溢出精力 > 属性 > 零用钱
+    # （原来 yaml 只写了 3 档、代码写死 5 档 —— 两边对不上，P2 统一到这里）
+    priority: [笔记, 技能, 精力, 属性, 零用钱]
+    keywords:
+      笔记: [笔记]
+      技能: [技能, 专属, 绝技]
+      精力: [精力]
+      属性: [属性, 体能, 运控, 意识, 弹跳, 防守, 投射]
+      零用钱: [零用钱, 金钱, 金币]
+    # 精力/属性的「++」档位（OCR 吃掉数字时按加号个数还原）
+    symbol_gain: {精力: [30, 70], 属性: [20, 40]}
+    score_step: 10000                # 档位之间的分差，保证高 tier 永不被低 tier 的数值翻盘
     no_value_default_order: [属性, 精力, 金钱]
     skip_when_no_choice: true
-    unknown_fallback: first_option   # 判断不了就选第一个，影响不大
-    reject_probability: true         # 玩家 2026-11-23：概率型奖励（30%概率 属性+60）不要
+    unknown_fallback: first_option
+    reject_probability: true         # 概率型奖励（30%概率 属性+60）不要
 
   # 商店（玩家 2026-11-23：「商店具体的效果你去 wiki 看看，决定可以买哪些、长什么样」）
   #   查证来源：篮球少女：飞跃巅峰 · 训练流攻略（gamekee/多篇一致）
@@ -207,6 +225,30 @@ tuning:
   stamina:
     use_item: true                   # true = 允许喝药继续训练；false = 直接关掉弹窗
     max_per_round: 1                 # 每轮最多喝几瓶（只喝小瓶 +30，够一次训练就停）
+
+  # ===== P0 稳定性：未知页指纹表（2026-11-23）=====
+  # 这些是历史上被判成「未知」、但其实是**纯展示页**的画面：点一下/点继续就过。
+  # 命中任一关键词就按 `action` 处理，不再走「点屏幕中间」的盲点（历史上两次误点都来自那）。
+  # 没命中任何指纹 → 按 `fallback`：pause（默认，安全）/ center（老行为）。
+  unknown:
+    fallback: pause                # pause=没见过的页直接停下等人工；center=照旧点屏幕中间
+    max_center_clicks: 10          # fallback=center 时，连续多少次还没走出去就停
+    overlays:
+      - {name: 比赛结果横幅, keys: [NBA, 战胜, 赢得比赛], action: next}
+      - {name: 合宿结算,     keys: [海边合宿结束, 心愿达成, 完美], action: next}
+      - {name: 本周总结,     keys: [本周总结, 球队评分], action: next}
+      - {name: 属性加成,     keys: [初始加成, 属性加成, 心·技·体, 倍率加成], action: next}
+      - {name: 野餐中,       keys: [野餐中, 划船中, 散步中], action: next}
+      - {name: 专业指导,     keys: [专业指导, 精力提升了], action: next}
+
+  # 每轮收工打一份运行摘要（训练几次/技能分布/笔记/买药/赌输赢/未知页）
+  summary:
+    enabled: true
+
+  # 断点续跑：每步把当前页面和关键计数写到 .state/，中途停掉再启动能直接接上
+  resume:
+    enabled: true
+    path: .state/last_run.json
 
   # 周六（玩家 2026-11-23：不需要特殊规则，状态机自己就能处理）
   #   逻辑：有训练就打训练；出行时照样先看笔记。

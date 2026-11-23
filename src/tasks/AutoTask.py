@@ -115,6 +115,8 @@ class AutoTask(MyBaseTask):
         self.shop_day = None
         self.shop_week = None          # 已经例行看过货的那一周（商店 7 天刷新）
         self.unknown_count = 0
+        self.known_overlay_hits = {}     # 已知浮层命中计数 {名称: 次数}，收工摘要用
+        self.unknown_texts = []          # 真·未知页的文字（最多留 20 条），收工摘要/排复用
         self.minigame_tries = 0
         self.stock_idx = 0
         self.stock_tries = 0
@@ -1133,8 +1135,10 @@ class AutoTask(MyBaseTask):
             self.log_warning(f"行为卡页没找到可选项，文字: {[i['t'] for i in items][:14]}")
             self.click_relative(0.5, 0.5)
             return True
-        # 玩家偏好：行为卡（无惧重围）> 得分手 > 其它，没偏好就取最右一张
-        prefer = ["无惧重围", "看破擅长", "看破", "得分手"]
+        # 行为卡偏好读 strategy.yaml → behavior_card.prefer（P2 前写死在这里）
+        prefer = [str(x) for x in (
+            (self._tuning().get("behavior_card") or {}).get("prefer")
+            or ["无惧重围", "看破擅长", "看破", "得分手"])]
         best = None
         for p in prefer:
             best = next((c for c in cards if p in c["t"]), None)
@@ -1203,9 +1207,12 @@ class AutoTask(MyBaseTask):
         cands = self._all(items, r"\+\s*\d{2,}")
         cands = [c for c in cands if 0.2 < c["cy"] / frame.shape[0] < 0.8]
         best = None
+        strategy = (self._tuning().get("enhance") or {}).get("strategy", "max_bonus")
         if cands:
-            best = max(cands, key=lambda c: _num(c["t"]) or 0)
-            self.log_info(f"加强训练候选项: {[c['t'] for c in cands]}")
+            # max_bonus=取加成最大；first=取第一个（配置化，改 yaml 就能换）
+            best = (max(cands, key=lambda c: _num(c["t"]) or 0)
+                    if strategy == "max_bonus" else cands[0])
+            self.log_info(f"加强训练（{strategy}）候选项: {[c['t'] for c in cands]}")
         if best is None:
             self.log_warning("没识别到加成数值，兜底点第一个选项")
             card = self._all(items, r"训练|强化")
@@ -1229,7 +1236,30 @@ class AutoTask(MyBaseTask):
 
     # OCR 吞掉数字时（只留「精力++」/「精力+」），按加号个数还原档位。
     # 单加＝小档，双加＝大档。数值是实测出来的常见档位，不是拍脑袋的权重。
+    # 内置兜底值；正常从 strategy.yaml → event.keywords / symbol_gain 读。
     SYMBOL_GAIN = {"精力": (30, 70), "属性": (20, 40)}
+
+    def _event_cfg(self):
+        """event 段配置（代码只读这里，改 yaml 就能换优先级）。"""
+        return (self._tuning().get("event") or {}) if hasattr(self, "_tuning") else {}
+
+    def _keywords(self, tier_name):
+        """某一档的关键词；没配就用内置兜底（保证老配置不会因为缺键而崩）。"""
+        cfg = self._event_cfg()
+        kw = (cfg.get("keywords") or {}).get(tier_name)
+        if kw:
+            return [str(k) for k in kw]
+        fallback = {"笔记": ("笔记",), "技能": ("技能", "专属", "绝技"),
+                    "精力": ("精力",),
+                    "属性": ("属性", "体能", "运控", "意识", "弹跳", "防守", "投射"),
+                    "零用钱": ("零用钱", "金钱", "金币")}
+        return list(fallback.get(tier_name, ()))
+
+    def _tier_index(self, name):
+        """档位名在 event.priority 里的序号（越靠前越高）。没配的档排最后。"""
+        priority = [str(x) for x in (self._event_cfg().get("priority") or
+                                     ["笔记", "技能", "精力", "属性", "零用钱"])]
+        return priority.index(name) if name in priority else len(priority)
 
     def _gain(self, text, key):
         """从「精力+70」「精力++」「属性+30」里取增益数值。
@@ -1247,7 +1277,9 @@ class AutoTask(MyBaseTask):
             return int(m.group(1))
         m2 = re.search(rf"{key}(\++)", t)
         if m2:
-            small, big = self.SYMBOL_GAIN.get(key, (1, 2))
+            pair = (self._event_cfg().get("symbol_gain") or {}).get(key)
+            small, big = (int(pair[0]), int(pair[1])) if pair and len(pair) >= 2 \
+                else self.SYMBOL_GAIN.get(key, (1, 2))
             return big if len(m2.group(1)) >= 2 else small
         return 0
 
@@ -1261,47 +1293,62 @@ class AutoTask(MyBaseTask):
     ATTR_WORDS = ("体能", "运控", "意识", "弹跳", "防守", "投射", "属性")
 
     def _reward_key(self, text):
-        """统一的奖励优先级：笔记 > 技能 > 未溢出的精力 > 属性 > 零用钱。
+        """统一的奖励优先级，顺序读 strategy.yaml → event.priority。
 
-        返回可直接比较的元组 (tier, eff, at, money)：
-          tier 4 笔记 / 3 技能 / 2 能补进精力条 / 1 属性 / 0 其他
-          eff  实际能吃进精力条的点数（**超出上限的部分不算**）
-          at   属性点数
+        返回 (tier, eff, at, money)：
+          tier = N - priority.index(档位名)  （排在 priority 第一项的最高）
+          eff  = 实际能吃进精力条的点数（**超出上限的部分不算**）
+          at   = 属性点数
 
-        「未溢出」是玩家 2026-11-23 06:43 专门点出来的：
-          精力只差 21 时，+70 和 +30 都只能吃进 21，多出来的 49 是白扔的，
-          两档精力打平，就该选那个还能顺带加属性的 +30 档。
-        以前直接拿标签上的原始数值当收益（+70 永远赢），所以才会挑错。
+        「未溢出」是玩家 2026-11-23 06:43 专门点出来的：精力只差 21 时，
+        +70 和 +30 都只能吃进 21，多出来的 49 白扔 —— 这时该选顺带加属性的 +30。
+        以前直接拿标签原始数值当收益（+70 永远赢），所以才会挑错。
+
+        P2 前这里写死 5 档、yaml 只写 3 档，两边对不上；现在代码只读配置。
         """
         t = (text or "").replace("＋", "+").replace(" ", "")
-        money = 1 if any(k in t for k in ("零用钱", "金钱", "金币")) else 0
+        cfg = self._event_cfg()
+        priority = [str(x) for x in (cfg.get("priority") or
+                                     ["笔记", "技能", "精力", "属性", "零用钱"])]
+        # tier = 排在它后面的档数：默认 5 档时 笔记4/技能3/精力2/属性1/零钱0，
+        # 与 P2 之前的编号完全一致（出行页有 key[0] < 3 这类判断依赖它）。
+        highest = len(priority)
 
-        # 概率型奖励一律不要（玩家 2026-11-23 明确）
-        if re.search(r"\d+\s*%", t) and bool(
-                (self._tuning().get("event") or {}).get("reject_probability", True)):
-            return (0, 0, 0, money)
+        if re.search(r"\d+\s*%", t) and bool(cfg.get("reject_probability", True)):
+            return (0, 0, 0, 0)      # 概率型奖励一律不要
 
-        if "笔记" in t:
-            return (4, 0, 0, 0)
-        if any(k in t for k in self.SKILL_WORDS):
-            return (3, 0, 0, 0)
+        # 按配置顺序逐档匹配：越靠前 tier 越高
+        for name in priority:
+            if any(k in t for k in self._keywords(name)):
+                tier = highest - 1 - priority.index(name)
+                if name == "精力":
+                    gap = self._gap()
+                    st = self._gain(t, "精力")
+                    at = self._gain(t, "属性")
+                    if not at and any(k in t for k in self._keywords("属性")):
+                        at = 1
+                    eff = min(st, gap) if gap > 0 else 0
+                    if eff <= 0:     # 精力已满 → 这档没意义，继续看后面的档
+                        continue
+                    return (tier, eff, at, 0)
+                if name == "属性":
+                    at = self._gain(t, "属性")
+                    return (tier, 0, max(1, at), 0)
+                return (tier, 0, 0, 0)
 
-        gap = self._gap()
-        st = self._gain(t, "精力")
-        at = self._gain(t, "属性")
-        if not at and any(k in t for k in self.ATTR_WORDS):
-            at = 1                    # 有属性加成但读不到数值，至少别当 0
-        eff = min(st, gap) if gap > 0 else 0
-        if eff > 0:
-            return (2, eff, at, 0)
-        if at > 0:
-            return (1, 0, at, 0)
-        return (0, 0, 0, money)
+        # 没匹配到任何档：至少把「零用钱」认出来（它可能不在 priority 里）
+        if any(k in t for k in self._keywords("零用钱")):
+            return (0, 0, 0, 1)
+        return (0, 0, 0, 0)
 
     def _key_value(self, key):
-        """把 _reward_key 的元组压成一个数值，方便沿用旧的「取最大值」写法。"""
+        """把 _reward_key 的元组压成一个数值，方便沿用旧的「取最大值」写法。
+
+        档间分差读 event.score_step（默认 10000），保证高 tier 永不被低 tier 的数值翻盘。
+        """
         tier, eff, at, money = key
-        return tier * 10000 + eff * 10 + at + money * 0.1
+        step = int(self._event_cfg().get("score_step") or 10000)
+        return tier * step + eff * 10 + at + money * 0.1
 
     def _near_text(self, items, anchor, frame, keys=GAIN_KEYS):
         """取某个按钮/卡片附近的收益文字（同一张卡里，上下 10% 屏高、左右 20% 屏宽）。"""
@@ -1428,6 +1475,7 @@ class AutoTask(MyBaseTask):
             self.trip_probe = False
             notes = [n for n in names if "笔记" in self._place_tag(n, items, frame)]
             if notes:
+                self.stat["note"] += 1
                 self.log_info(f"出行有笔记 {[n['t'] for n in notes]} → 笔记优先，本次出行而不是训练")
             else:
                 self.log_info("出行页没有笔记 → 退回每日页走训练")
@@ -1458,7 +1506,10 @@ class AutoTask(MyBaseTask):
         if best is None or best_key is None or best_key[0] == 0:
             # 公园子页（散步/划船/野餐）用单独的顺序：休息日只求把精力补回来
             in_park = all(n["t"] in ("散步", "划船", "野餐", "发呆") for n in names)
-            order = self.PARK_FALLBACK if in_park else self.TRIP_FALLBACK
+            tcfg = self._tuning().get("trip") or {}
+            order = ([str(x) for x in (tcfg.get("park_fallback") or self.PARK_FALLBACK)]
+                     if in_park else
+                     [str(x) for x in (tcfg.get("fallback_order") or self.TRIP_FALLBACK)])
             cand = sorted(names, key=lambda x: order.index(x["t"]) if x["t"] in order else 99)
             best = cand[0]
             self.log_info(f"地点都没读到收益标签，按兜底顺序选「{best['t']}」")
@@ -1694,6 +1745,7 @@ class AutoTask(MyBaseTask):
             return self._leave_shop(items, frame)
 
         self.shop_bought += 1
+        self.stat["buy"].append((why, o["name"], o["price"]))
         self._click_item(o["item"], f"[商店-{why} 「{o['name']}」{o['price']}元]")
         self.sleep(0.9)
         f2 = self._frame()
@@ -2367,6 +2419,7 @@ class AutoTask(MyBaseTask):
         usable = [d for d in scored if d["valid"]]
         if usable:
             if len(usable) < len(scored):
+                self.stat["sample_fail"] += len(scored) - len(usable)
                 self.log_warning(f"{len(scored) - len(usable)} 个技能采样失败，已排除在排名外")
             scored = usable
         else:
@@ -2427,12 +2480,15 @@ class AutoTask(MyBaseTask):
         # 选中项带失败率 → 明确打一条「赌」的日志，事后复盘输赢用
         elif best.get("pct"):
             alt = [d for d in scored if d is not best and not d.get("pct")]
-            self.log_warning(f"赌一把：「{best['row']['t']}」失败率 {best['pct']}%，"
+            self.stat["gamble"].append((best["row"]["t"], best["pct"]))
+            self.log_warning(f"赌一把：「{best['row']['t']}」失败率 {best['pct']}%,"
                              f"期望得分仍排第一（{best['score']:.2f}）"
                              + (f"；稳的备选 {[(d['row']['t'], round(d['score'], 2)) for d in alt]}"
                                 if alt else "；今天没有 0% 的稳选项"))
 
-        self._click_item(best["row"], f"[最优编队 {best['row']['t']} 得分{best['score']:.1f}]")
+        _sk = best["row"]["t"]
+        self.stat["train"][_sk] = self.stat["train"].get(_sk, 0) + 1
+        self._click_item(best["row"], f"[最优编队 {_sk} 得分{best['score']:.1f}]")
         self.sleep(1.0)
         f3 = self._frame()
         if f3 is None:
@@ -3033,35 +3089,87 @@ class AutoTask(MyBaseTask):
         self._click_item(best, "[事件优选]")
         return True
 
+    def _match_overlay(self, items):
+        """未知页指纹匹配：命中返回 (名称, action)，否则 None。
+
+        指纹表在 strategy.yaml → tuning.unknown.overlays。每项是
+        `{name, keys: [...], action: next}`；keys 里任一关键词出现在画面文字里就算命中。
+        纯展示页（比赛横幅、周总结、属性加成…）命中后走 `next`（点继续/中间推进），
+        不再算「未知」——这样摘要里的未知次数才是真的「没见过」。
+        """
+        joined = " ".join(i["t"] for i in items)
+        cfg = self._tuning().get("unknown") or {}
+        for ov in cfg.get("overlays") or []:
+            if not isinstance(ov, dict):
+                continue
+            keys = ov.get("keys") or []
+            if any(str(k) in joined for k in keys):
+                return (str(ov.get("name") or "已知浮层"), str(ov.get("action") or "next"))
+        return None
+
     def _do_unknown(self, items, frame):
         joined = " ".join(i["t"] for i in items)
+        texts = [i["t"] for i in items][:16]
+
         if any(k in joined for k in ("拼图", "碎片", "小游戏")):
             self.log_warning("未知页面但看着像小游戏，按放弃处理")
             return self._do_minigame(items, frame)
         if self._event_cards(frame, items):
             self.log_info("未知页面但是事件卡片样式，按事件处理")
             return self._do_event(items, frame)
-        if "初始加成" in joined:
-            self.log_info("加成展示页，点屏幕中间推进")
+
+        # 1) 先查已知浮层指纹表（命中就不算未知，走 next）
+        hit = self._match_overlay(items)
+        if hit:
+            name, action = hit
+            self.known_overlay_hits[name] = self.known_overlay_hits.get(name, 0) + 1
+            if action == "pause":
+                self.log_warning(f"已知浮层「{name}」按配置暂停，等你处理")
+                return None
+            # next：优先点页面上的「继续/下一步/确定」，实在没有再点中间
+            if self._click_confirm(items, frame) or self._click_next_word(items, frame):
+                self.log_info(f"已知浮层「{name}」→ 点继续推进")
+                return True
             self.click_relative(0.5, 0.5)
+            self.log_info(f"已知浮层「{name}」→ 点屏幕中间推进")
             return True
 
-        mode = str(self.config.get("未知页面兜底") or "点屏幕中间")
-
+        # 2) 真·未知页：先试通用确认按钮
         if self._click_confirm(items, frame):
             return True
-        if mode == "暂停":
-            self.log_error(f"未知页面，按配置暂停。文字: {[i['t'] for i in items][:16]}", notify=True)
-            return None
+
+        cfg = self._tuning().get("unknown") or {}
+        # 老配置「未知页面兜底」= 暂停 仍优先（兼容）；否则用新配置 fallback
+        old = str(self.config.get("未知页面兜底") or "")
+        fallback = ("pause" if old == "暂停"
+                    else str(cfg.get("fallback") or "pause"))
         self.unknown_count += 1
-        if self.unknown_count <= 10:
+        self.unknown_texts.append(texts)
+
+        if fallback == "pause":
+            p = self._shot(frame, f"unknown_{self.unknown_count}")
+            self.log_error(f"没见过的页面（第 {self.unknown_count} 次）按配置暂停。"
+                           f"文字: {texts}｜截图: {p}", notify=True)
+            return None
+
+        limit = int(cfg.get("max_center_clicks") or 10)
+        if self.unknown_count <= limit:
             self.log_warning(f"未知页面（第 {self.unknown_count} 次），点屏幕中间推进。"
-                             f"文字: {[i['t'] for i in items][:14]}")
+                             f"文字: {texts[:8]}")
             self.click_relative(0.5, 0.5)
             return True
+        p = self._shot(frame, f"unknown_{self.unknown_count}")
         self.log_error(f"未知页面连续 {self.unknown_count} 次没有可点主按钮，暂停。"
-                       f"文字: {[i['t'] for i in items][:16]}", notify=True)
+                       f"文字: {texts}｜截图: {p}", notify=True)
         return None
+
+    def _click_next_word(self, items, frame):
+        """页面上有「继续/点击屏幕继续/下一步」这类文字就点它，没有返回 False。"""
+        it = self._find(items, ["点击屏幕继续", "继续", "下一步", "确定"], exact=False)
+        if it:
+            self._click_item(it, "[浮层-继续]")
+            return True
+        return False
 
     # ---------- MCP 基线契约 ----------
     # ok-script 的 MCP 在每次尝试前调用 reset_to_start() + verify_start_state()，
@@ -3164,6 +3272,16 @@ class AutoTask(MyBaseTask):
         self.stamina_refills = 0
         self.stamina_misses = 0
 
+        # ---- 收工摘要统计（全局累计，跨轮不清）----
+        self.stat = {
+            "train": {},        # 技能 -> 次数
+            "gamble": [],       # 每次下注 (技能, 失败率)
+            "buy": [],          # 每次购买 (类别, 名称, 价格)
+            "note": 0,          # 出行拿到笔记的次数
+            "sample_fail": 0,   # 训练技能采样失败数
+            "stamina_drink": 0, # 喝精力药次数
+        }
+
         max_steps = int(self.config.get("最大步数") or 1500)
         wait = float(self.config.get("等待秒数") or 1.3)
         # 循环轮数：`tuning.loop.max_rounds`（工作台上的那颗「循环轮数」）
@@ -3179,6 +3297,7 @@ class AutoTask(MyBaseTask):
         self.max_rounds = max_rounds
 
         self.log_info(f"开始自动训练：最多 {max_steps} 步，共 {max_rounds} 轮")
+        self._load_state()
 
         # 角色分支：不同主训人员走不同支线（剧情选项、小游戏、事件都不一样）。
         # 结构先接好，规则后填 —— strategy.yaml 的 routes 现在还是空的。
@@ -3193,8 +3312,118 @@ class AutoTask(MyBaseTask):
         self._start_watchdog()
         try:
             return self._run_loop(max_steps, wait, max_rounds)
+        except Exception as e:
+            # 异常停机也必须留痕 + 通知：以前只有日志里一行 traceback，
+            # 人不在屏幕前根本不知道脚本什么时候、为什么停了。
+            import traceback
+            tb = traceback.format_exc()
+            self.log_error(f"脚本异常停机：{type(e).__name__}: {e}\n{tb[-800:]}", notify=True)
+            raise
         finally:
             self._watchdog_stop = True
+            # 正常收工和异常停机都打一份摘要（_run_loop 正常结束已打过，用标志去重）
+            if not getattr(self, "_summary_printed", False):
+                self._summary_printed = True
+                self._print_summary()
+
+    # ---------- 断点续跑 ----------
+    # 状态机本来就是按页面流转的（任何一屏都能接着跑），所以断点只需记住
+    # 「今天探没探笔记 / 进没进过店 / 这是第几轮」这类**记账**，不用记完整画面。
+    RESUME_FIELDS = (
+        "saw_training", "in_training", "weekday", "core_checked",
+        "trip_picked", "trip_probe", "trip_probe_done", "trip_probe_disabled",
+        "trip_back_tries", "shop_day", "shop_week", "shop_bought",
+        "shop_has_stamina", "notes_done", "minigame_tries", "stock_idx",
+        "stock_tries", "stock_picked", "stamina_refills", "stamina_misses",
+        "last_equip_count", "rounds_done", "stat",
+    )
+
+    def _state_path(self):
+        cfg = self._tuning().get("resume") or {}
+        if cfg.get("enabled") is False:
+            return None
+        return str(cfg.get("path") or ".state/last_run.json")
+
+    def _save_state(self, step, page):
+        """每步写盘（原子替换）。失败不影响主流程。"""
+        p = self._state_path()
+        if not p:
+            return
+        try:
+            import json
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            data = {k: getattr(self, k, None) for k in self.RESUME_FIELDS}
+            data.update({"step": step, "page": page, "at": time.time()})
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, default=str)
+            os.replace(tmp, p)
+            self._resume_saved_at = time.time()
+        except Exception:
+            pass
+
+    def _load_state(self):
+        """启动时读盘恢复；没有/损坏/太旧就当新跑。"""
+        p = self._state_path()
+        if not p or not os.path.exists(p):
+            return
+        try:
+            import json
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            age = time.time() - float(data.get("at") or 0)
+            if age > 6 * 3600:      # 超过 6 小时的旧档不算（游戏早关了）
+                self.log_info(f"断点文件太旧（{age / 3600:.1f}h），按新跑")
+                return
+            for k in self.RESUME_FIELDS:
+                if k in data and data[k] is not None:
+                    setattr(self, k, data[k])
+            self.log_info(f"★ 断点恢复：从「{data.get('page')}」第 {data.get('step')} 步接上"
+                          f"（{age / 60:.0f} 分钟前存的）", notify=True)
+        except Exception as e:
+            self.log_warning(f"断点文件读取失败（{e}），按新跑")
+
+    def _clear_state(self):
+        p = self._state_path()
+        if p:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _print_summary(self):
+        """收工摘要：一轮下来到底干了啥，一张表看清（配置 summary.enabled）。"""
+        cfg = self._tuning().get("summary") or {}
+        if cfg.get("enabled") is False:
+            return
+        self._summary_printed = True
+        st = getattr(self, "stat", {}) or {}
+        train = st.get("train") or {}
+        gamble = st.get("gamble") or []
+        buys = st.get("buy") or []
+        lines = [
+            "━━━━━━━━ 本轮运行摘要 ━━━━━━━━",
+            f"完成轮数：{self.rounds_done}/{self.max_rounds}",
+            f"训练 {sum(train.values())} 次：" + ("、".join(f"{k}×{v}" for k, v in train.items()) or "无"),
+            f"笔记 {st.get('note', 0)} 次　采样失败 {st.get('sample_fail', 0)} 项",
+            f"商店买 {len(buys)} 件：" + ("、".join(f"{n}({p})" for _, n, p in buys[:8]) or "无"),
+            f"赌一把 {len(gamble)} 次：" + ("、".join(f"{k}@{p}%" for k, p in gamble[:8]) or "无"),
+        ]
+        if self.known_overlay_hits:
+            lines.append("已知浮层：" + "、".join(
+                f"{k}×{v}" for k, v in self.known_overlay_hits.items()))
+        lines.append(f"未知页 {len(self.unknown_texts)} 次")
+        for ln in lines:
+            self.log_info(ln)
+        # 顺手写一份到 logs/，方便事后翻（不刷屏控制台）
+        try:
+            os.makedirs("logs", exist_ok=True)
+            p = f"logs/summary_{time.strftime('%m%d_%H%M%S')}.txt"
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self.log_info(f"摘要已存：{p}")
+        except Exception:
+            pass
 
     def _begin_round(self):
         """开始新的一轮之前，把「按天/按局」的状态清掉。
@@ -3222,6 +3451,7 @@ class AutoTask(MyBaseTask):
         self.slots_checked_page = None
         self.confirm_gray = 0
         self.main_char_round = None
+        self.unknown_texts = []          # 未知页文字按轮清；已知浮层命中数全局累计到收工摘要
         self.log_info(f"—— 开始第 {self.rounds_done + 1}/{self.max_rounds} 轮 ——")
 
     def _run_loop(self, max_steps, wait, max_rounds):
@@ -3234,6 +3464,9 @@ class AutoTask(MyBaseTask):
         for step in range(1, max_steps + 1):
             self._last_step_at = time.time()
             self._ensure_foreground()
+            # 断点：每 3 秒写一次（不是每步，省 IO）；异常停机时也只丢 3 秒内的进度
+            if time.time() - getattr(self, "_resume_saved_at", 0) >= 3.0:
+                self._save_state(step, last_page or "起点")
             frame = self._frame()
             if frame is None:
                 blind += 1
@@ -3506,5 +3739,7 @@ class AutoTask(MyBaseTask):
             last_page = page
             self.sleep(wait)
 
+        self._print_summary()
+        self._clear_state()          # 正常跑完才清断点；异常停机会留着下次接上
         self.log_info("本轮结束")
         return True
