@@ -379,8 +379,15 @@ class AutoTask(MyBaseTask):
             d = day if day is not None else 0
             d = os.path.join("logs", "audit", str(run), f"W{w}D{d}")
             os.makedirs(d, exist_ok=True)
+            # 技能名是中文，cv2/文件名不吃非 ASCII → 先转英文缩写，
+            # 否则 core1_投射 变成 core1___，人工分不清是哪个技能。
+            zh2en = {"投射": "Shoot", "弹跳": "Jump", "防守": "Def",
+                     "体能": "Phys", "运控": "Dribble", "意识": "IQ"}
+            tag = str(tag)
+            for zh, en in zh2en.items():
+                tag = tag.replace(zh, en)
             tag = "".join(c if (c.isascii() and (c.isalnum() or c in "-_")) else "_"
-                          for c in str(tag))
+                          for c in tag)
             return os.path.join(d, f"{time.strftime('%H%M%S')}_{tag}")
         except Exception:
             return None
