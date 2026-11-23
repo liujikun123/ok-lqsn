@@ -163,6 +163,23 @@ check("LOGO过场 → 继续等待", r, True)
 check("LOGO过场无点击", [x for x in s.logs if x[0] == "click"], [])
 check("LOGO过场无 unknown_texts", len(s.unknown_texts), 0)
 
+# D. 紫色半透明蒙版（2026-11-23 17:26 实跑）：每日页上方盖紫色转场蒙版，
+#    底下真实页还在、OCR 读出十几段文字，B 的「文字≤2段」不满足。
+#    整屏偏紫(占比≈68%)、低对比(std≈18)。合成一张：紫色底 + 少量暗块模拟图文。
+veil = _np.zeros((1080, 1920, 3), dtype="uint8")
+veil[:, :] = (227, 178, 206)   # 偏紫 BGR：B227 G178 R206
+_cv2.rectangle(veil, (200, 400), (700, 900), (150, 120, 160), -1)  # 底下隐约的图文（低对比）
+vg = _cv2.cvtColor(veil, _cv2.COLOR_BGR2GRAY)
+check("紫蒙版低对比", round(float(vg.std()), 1) < 35, True)
+many_items = items("第3周", "星期二", "101/130", "商店", "训练", "投射", "体能", "弹跳",
+                   "防守", "运控", "意识")  # 文字多，走不到 B 的 ≤2 段
+check("紫蒙版帧被识别", s._is_loading_frame(veil, many_items), True)
+check("正常页不误判紫蒙版", s._is_loading_frame(normal_frame, many_items), False)
+s = Stub()
+r = s._do_unknown(many_items, veil)
+check("紫蒙版 → 继续等待", r, True)
+check("紫蒙版无 unknown_texts", len(s.unknown_texts), 0)
+
 print("--- 3.5 页面转移软约束（只警告不拦截）---")
 s = Stub()
 # 明确不可能：选人环节退回每日页

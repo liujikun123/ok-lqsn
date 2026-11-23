@@ -3600,7 +3600,11 @@ class AutoTask(MyBaseTask):
            LOGO 动画，OCR 只读出「m」1 段就暂停。这帧有对比度(full std≈37)、
            不符合 A/B，但顶部无 HUD(hud std≈1.2)、大片蓝色剪影(占比≈27%)、
            背景米白(mean≈216)。离线扫全部截图只有这类帧命中，零误伤。
-        正常游戏页 full std 通常 >80，三种条件都碰不到，不会误伤。
+        D. 紫色半透明蒙版（2026-11-23 17:26 实跑）：每日页上方盖一层紫色转场
+           蒙版（左紫三角+篮球水印+右斜杠），底下真实页面还在、OCR 能读出十几段
+           文字（含训练/商店按钮），所以 B 的「文字≤2段」不满足。但这帧整屏偏紫
+           (紫色像素占比≈68%)、整屏低对比(std≈18)。等蒙版消失即可，别当未知页。
+        正常游戏页 full std 通常 >80、紫色占比极低，四种条件都碰不到，不会误伤。
         """
         if frame is None:
             return False
@@ -3625,6 +3629,13 @@ class AutoTask(MyBaseTask):
                 bl, rr = frame[:, :, 0], frame[:, :, 2]
                 blue_ratio = float(((bl > 140) & (rr < 130) & (bl - rr > 50)).mean())
                 if blue_ratio > 0.15:
+                    return True
+            # D. 紫色半透明蒙版盖住真实页面：整屏偏紫 + 低对比（文字多，B 不满足）
+            if items is not None and gray.std() < 35.0:
+                bl, gc, rr = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
+                purple_ratio = float(((bl > 140) & (rr > 110)
+                                      & (bl - rr > 15) & (bl - gc > 10)).mean())
+                if purple_ratio > 0.5:
                     return True
             return False
         except Exception:
