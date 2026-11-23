@@ -2190,6 +2190,17 @@ class AutoTask(MyBaseTask):
             self._click_item(r, "[展开编队]")
             # 选中态会一直保留，起手等 0.4s 就够（由 _sample_core 的 warmup 控制）
             names, pct, level, equips = self._sample_core(r)
+
+            # 页面守卫：采样途中页面可能已经变了（实测第 6 周点开「体能」时，
+            # 画面已经跳到「器材事件」，后面 3 步全在对着事件页点技能 + 点决定）。
+            # 一旦不是训练核心页就立刻交回主循环，别把后续技能也点一遍。
+            f_chk = self._frame()
+            if f_chk is not None:
+                now_page = self._classify(self._texts(f_chk), f_chk)
+                if now_page != "训练核心":
+                    self.log_warning(f"采样途中页面已变成「{now_page}」→ 放弃本次编队比较，交给主循环")
+                    return True
+
             if not names and pct is None and level is None:
                 # 2026-11-23 实测：「意识」这一档常点了没反应（选中的还是上一个技能），
                 # 因为它贴在最底下、离属性条太近。往上挪 26px 重点一次再读。
@@ -2375,6 +2386,7 @@ class AutoTask(MyBaseTask):
         equips = []
         used = 0
         tries = 0
+        bad_streak = 0
         while used < frames and tries < max_tries:
             tries += 1
             f = self._frame_retry()
@@ -2404,8 +2416,15 @@ class AutoTask(MyBaseTask):
                                      "心·技·体", "属性加成", "表情升级", "倍率加成"))
             looks_core = (not off_core) and (hits >= 1 or has_pct or has_lv or len(names) >= 2)
             if not looks_core:
+                # 连续 4 帧都不像训练核心页 = 页面已经走了（训练结束弹出「器材事件」
+                # 这类随机事件最常见），再采下去只是白烧 10 次 × 0.18s + OCR 时间。
+                bad_streak += 1
+                if bad_streak >= 4 and used == 0:
+                    self.log_warning("连续 4 帧都不像训练核心页 → 页面已经切走，停止采样")
+                    break
                 self.sleep(gap)
                 continue
+            bad_streak = 0
             used += 1
             p = self._read_pct(its)
             if p is not None and p <= 100:      # 210%、230% 这类是 OCR 把两个数字粘了

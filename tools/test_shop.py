@@ -44,11 +44,13 @@ def shelf(goods, tab=True):
     items = [it("上新时间 7天后", 300, 200)]
     if tab:
         items += [it("比赛", 700, 1030), it("商店", 960, 1030), it("能力详情", 1220, 1030)]
+    # 布局按实机 1920x1080 截图逐字量出来的间距：
+    #   名字 y → 「剩余：1」y+79 → 价格 y+124（价格在剩余下面约 43px）
     for name, x, y, price in goods:
         items.append(it(name, x, y))
+        items.append(it("剩余：1", x, y + 79))
         if price is not None:
-            items.append(it(str(price), x, y + 52))
-        items.append(it("剩余:1", x, y + 104))
+            items.append(it(str(price), x, y + 124))
     return items
 
 
