@@ -87,6 +87,14 @@ class AutoTask(MyBaseTask):
         self.weekday = None
         self.core_checked = False
         self.trip_picked = False
+        # 「出行先探笔记，笔记 > 训练」（玩家 2026-11-23）：
+        #   每日页同时有「训练」和「出行」时，先进出行页看地点标签里有没有笔记。
+        #   有 → 直接出行；没有 → 退回每日页走训练。
+        #   用「第N周-星期X」记今天已经探过，避免同一天反复进出。
+        self.trip_probe = False          # 本次进出行页是「探笔记」，不是真要出行
+        self.trip_probe_done = None      # 已经探过的那天，例如 "6-7"
+        self.trip_probe_disabled = False # 出行页退不出去 → 以后不再探，直接按原顺序
+        self.trip_back_tries = 0         # 本次退出出行页试了几次
         self.unknown_count = 0
         self.minigame_tries = 0
         self.stock_idx = 0
@@ -168,6 +176,30 @@ class AutoTask(MyBaseTask):
         except Exception as e:
             self.log_warning(f"强制恢复窗口失败: {e}")
             return False
+
+    def _ensure_foreground(self):
+        """点击前确认游戏在前台。
+
+        为什么必须做（2026-11-23 查框架源码确认）：
+          * 截图走 BitBlt_RenderFull(PrintWindow) → **后台也能抓**，被别的窗口挡住无所谓；
+          * 点击走 Pynput 的真实鼠标事件，框架的 `clickable()` = 窗口 is_foreground()，
+            **窗口不在前台时点击直接被丢弃**（只打一行 info，不报错）。
+          表现就是「日志一直在走、游戏一动不动」，很像卡死。
+        这里最多每 3 秒抢一次前台，避免每步都暴力 SetForegroundWindow。
+        """
+        now = time.time()
+        if now - getattr(self, "_last_fg_try", 0.0) < 3.0:
+            return
+        try:
+            import win32gui
+            h = win32gui.FindWindow(None, "篮球少女：飞跃巅峰")
+            if not h or win32gui.GetForegroundWindow() == h:
+                return
+        except Exception:
+            return
+        self._last_fg_try = now
+        self.log_info("游戏窗口不在前台 → 点击会被丢弃，正在抢回前台")
+        self._force_visible()
 
     def _start_watchdog(self):
         """看门狗：跑的过程中窗口被隐藏/最小化，next_frame() 会**永久阻塞**，
@@ -793,6 +825,17 @@ class AutoTask(MyBaseTask):
         go = self._btn_in_area(items, ["出行"], frame)
 
         if train and enough:
+            # 玩家 2026-11-23：「出行看有没有笔记，大于训练」。
+            # 今天还有训练可打，但先把出行页点开瞄一眼地点标签 ——
+            # 有笔记就直接出行（笔记 tier 最高），没笔记 _do_trip 会退回这里走训练。
+            # 每天只探一次（trip_probe_done 记账），退不出去会自动永久关掉这条路。
+            day_key = self._day_key(items)
+            if go and self._can_probe_trip(day_key):
+                self.trip_probe = True
+                self.trip_probe_done = day_key
+                self.trip_back_tries = 0
+                self._click_btn(go, f"[探出行-看有没有笔记 精力{self.stamina}/{self.stamina_max}]", frame)
+                return True
             self._click_btn(train, f"[训练 精力{self.stamina}/{self.stamina_max}]", frame)
             return True
 
@@ -1106,6 +1149,27 @@ class AutoTask(MyBaseTask):
         words = [x.strip() for x in re.split(r"[,，、\s]+", raw) if x.strip()]
         return any(x in text for x in words)
 
+    def _day_key(self, items):
+        """今天是谁：'第N周-星期X'，读不到就 None（读不到就不探路，免得不记账反复进出）。"""
+        w, d = self._read_week(items)
+        return f"{w}-{d}" if (w and d) else None
+
+    def _can_probe_trip(self, day_key):
+        """今天还能不能为「看笔记」去点出行。"""
+        if self.trip_probe_disabled or not day_key:
+            return False
+        return self.trip_probe_done != day_key
+
+    def _place_tag(self, n, items, frame):
+        """取某个出行地点名下方那行收益标签（精力+/属性+/笔记 …）。"""
+        h, w = frame.shape[:2]
+        for it in items:
+            if abs(it["cx"] - n["cx"]) < w * 0.14 and 0 < it["cy"] - n["cy"] < h * 0.22:
+                t = it["t"].replace("＋", "+")
+                if any(k in t for k in self.GAIN_KEYS):
+                    return t
+        return ""
+
     def _do_trip(self, items, frame):
         """周末出行：笔记 > 技能 > 未溢出的精力 > 属性 > 零用钱，游戏厅排除。
 
@@ -1138,15 +1202,29 @@ class AutoTask(MyBaseTask):
             self.log_warning(f"出行页没有可用地点（可能误判了页面）：{[i['t'] for i in items][:10]}")
             return self._do_unknown(items, frame)
 
+        # ===== 探路：玩家 2026-11-23「出行看有没有笔记，大于训练」=====
+        # 这次是每日页为「看笔记」点进来的：扫一遍地点标签
+        #   有笔记 → 不退回，走下面的正常打分（笔记 tier 最高，必然排第一）；
+        #   没笔记 → 立刻退出回每日页，改走训练。
+        if self.trip_probe:
+            self.trip_probe = False
+            notes = [n for n in names if "笔记" in self._place_tag(n, items, frame)]
+            if notes:
+                self.log_info(f"出行有笔记 {[n['t'] for n in notes]} → 笔记优先，本次出行而不是训练")
+            else:
+                self.log_info("出行页没有笔记 → 退回每日页走训练")
+                self.trip_back_tries += 1
+                return self._leave(items, frame)
+        elif self.trip_back_tries > 0 and self._day_key(items) == self.trip_probe_done:
+            # 上一帧刚点过「退出」，这一帧还在出行页 → 这页根本退不出去。
+            # 不再折腾：永久关掉探路，按原规则直接出行（否则会卡在这一页空转）。
+            self.trip_back_tries = 0
+            self.trip_probe_disabled = True
+            self.log_warning("出行页退不出去（点过退出仍在原页）→ 以后不再探笔记，直接按原规则出行")
+
         best, best_val, best_key = None, -1, None
         for n in names:
-            tag = ""
-            for it in items:
-                if abs(it["cx"] - n["cx"]) < w * 0.14 and 0 < it["cy"] - n["cy"] < h * 0.22:
-                    t = it["t"].replace("＋", "+")
-                    if any(k in t for k in self.GAIN_KEYS):
-                        tag = t
-                        break
+            tag = self._place_tag(n, items, frame)
             text = n["t"] + " " + tag
             key = self._reward_key(text)
             # 公园是唯一能大额回精力的入口，精力还有缺口时把它的位次抬到
@@ -1693,23 +1771,30 @@ class AutoTask(MyBaseTask):
     # 只用于识别**粘连词**（「百希雅」=百目鬼+希雅，含主力名且超 2 字 → 判为拼接产物）。
     # 2026-11-23 起不再用它从队友里剔人：主训每局会换，靠 _resident_names 自动判。
     MAIN_CHAR = "希雅"
-    # 场上但不算队友的角色。
-    # 玩家 2026-11-23 明确：「经理也是算作队友的」→ 把球队经理/经理从名单里去掉，
-    # 场上站着的都算（含主训本人）。恒在场的角色对每个技能都是 +1，不影响排名，
-    # 剔掉反而会因为某帧 OCR 漏读而让那个技能少算一分。
-    TEAM_NON_MATES = ("替补", "解说")
+    # 场上角色的口径（玩家 2026-11-23 定稿）：
+    #   「经理也是算作队友的」，而且训练核心页根本没有「替补 / 解说」这类标签，
+    #   所以**场上站着的都算队友**（含经理、含主训本人），不做任何名字级剔除。
+    #   恒在场的角色对每个技能都是 +1，不影响排名；剔掉反而会因为某帧 OCR
+    #   漏读而让那个技能少算一分。只保留通用护栏（技能名 / 粘连词 / 加成浮层词）。
     # 出现在球场上但明显不是人名的词：加成浮层条目 + 出行地点名
     MATE_STOP_WORDS = ("加成", "队友", "表情", "倍率", "一致", "额外", "组合", "概率",
                        "上限", "游戏厅", "公园", "餐厅", "步行街", "散步", "野餐", "划船")
 
     def _badge_near(self, frame, row):
-        """技能胶囊右上角那枚橙色小人角标；没有就返回 None。"""
+        """技能胶囊右上角那枚橙色小人角标；没有就返回 None。
+
+        尺寸自适应（2026-11-23）：原来用的是 1920x1080 下标出来的绝对像素
+        （偏移 40/190/110/25、角标 16~52px、面积 260）。玩家把窗口拖小或改成
+        1600x900 之后，角标同比缩小，下限 16px 会把最小的角标漏掉 → 明明有角标
+        却判成「没有」。现在统一按 1920x1080 折算成比例再乘回当前帧尺寸。
+        """
         h, w = frame.shape[:2]
+        sx, sy = w / 1920.0, h / 1080.0
         b = row["b"]
-        x1 = max(int(b.x + b.width - 40), 0)
-        x2 = min(int(b.x + b.width + 190), w)
-        y1 = max(int(b.y - 110), 0)
-        y2 = min(int(b.y + 25), h)
+        x1 = max(int(b.x + b.width - 40 * sx), 0)
+        x2 = min(int(b.x + b.width + 190 * sx), w)
+        y1 = max(int(b.y - 110 * sy), 0)
+        y2 = min(int(b.y + 25 * sy), h)
         if x2 <= x1 or y2 <= y1:
             return None
         roi = frame[y1:y2, x1:x2]
@@ -1722,11 +1807,11 @@ class AutoTask(MyBaseTask):
         best = None
         for c in cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
-            if not (16 <= bw <= 52 and 16 <= bh <= 52):
+            if not (16 * sx <= bw <= 52 * sx and 16 * sy <= bh <= 52 * sy):
                 continue
             if not (0.6 < bw / max(bh, 1) < 1.7):
                 continue
-            if bw * bh < 260:
+            if bw * bh < 260 * sx * sy:
                 continue
             if best is None or bw * bh > best[0]:
                 best = (bw * bh, (x1 + bx + bw / 2, y1 + by + bh / 2))
@@ -1764,7 +1849,7 @@ class AutoTask(MyBaseTask):
         """
         if not re.fullmatch(r"[\u4e00-\u9fa5]{2,5}", t):
             return False
-        if t in self.SKILLS or t in self.TEAM_NON_MATES:
+        if t in self.SKILLS:
             return False
         if any(w in t for w in self.MATE_STOP_WORDS):
             return False
@@ -2485,6 +2570,14 @@ class AutoTask(MyBaseTask):
         self.weekday = None
         self.core_checked = False
         self.trip_picked = False
+        # 「出行先探笔记，笔记 > 训练」（玩家 2026-11-23）：
+        #   每日页同时有「训练」和「出行」时，先进出行页看地点标签里有没有笔记。
+        #   有 → 直接出行；没有 → 退回每日页走训练。
+        #   用「第N周-星期X」记今天已经探过，避免同一天反复进出。
+        self.trip_probe = False          # 本次进出行页是「探笔记」，不是真要出行
+        self.trip_probe_done = None      # 已经探过的那天，例如 "6-7"
+        self.trip_probe_disabled = False # 出行页退不出去 → 以后不再探，直接按原顺序
+        self.trip_back_tries = 0         # 本次退出出行页试了几次
         self.unknown_count = 0
         self.minigame_tries = 0
         self.stock_idx = 0
@@ -2539,6 +2632,7 @@ class AutoTask(MyBaseTask):
 
         for step in range(1, max_steps + 1):
             self._last_step_at = time.time()
+            self._ensure_foreground()
             frame = self._frame()
             if frame is None:
                 blind += 1
