@@ -1062,9 +1062,16 @@ class AutoTask(MyBaseTask):
         #      ['第1周','星期二','3 113/130','60','6','数早三','购买并使用防守秘籍']
         #      被当未知页，白点好几步）。「第N周 + 星期X + 精力 a/b」这三件套
         #      是这游戏里每日页独有的，凑齐就认；再用其他页的硬特征排掉。
+        #      2026-11-23 16:18：商店购买后弹「购买并使用XX」浮层，OCR 只读到
+        #      顶栏+「购买并」6 段字、没有行动按钮，以前会被这条当每日页 →
+        #      _do_daily 找不到按钮就点屏幕中间 → 点回商品重复买。
+        #      所以：带「购买并」且没有行动按钮时不认每日页，交给 overlay 等待消失。
+        buy_toast = ("购买并" in joined or "购买并使用" in joined) \
+            and not self._action_btn(items, frame)
         if (re.search(r"第\s*\d+\s*周", joined)
                 and re.search(r"星期[一二三四五六日天]", joined)
                 and re.search(r"\d{1,3}\s*/\s*\d{1,3}", joined)
+                and not buy_toast
                 and not has("MVP", "赛前准备", "目标达成", "点击屏幕继续", "心·", "·体")):
             return "每日页"
         # 12.2 视觉兜底：OCR 一个字都没认全，但右侧有 ≥2 张带等级牌的成员卡
