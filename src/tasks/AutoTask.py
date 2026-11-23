@@ -1361,18 +1361,21 @@ class AutoTask(MyBaseTask):
                 self.log_info(f"每日页没找到「商店」按钮（本周期还没看过货架）"
                               f"｜文字 {[it['t'] for it in items][:12]}")
 
+        # 探笔记：2026-11-23 22:14 玩家反馈「周日没有检查笔记，直接去公园了」。
+        #   旧逻辑把探笔记塞在「有训练且精力够」分支里，周日没有训练（休息日），
+        #   直接走下面的「精力不足 → 出行去公园」，整周最后一天从不检查笔记。
+        #   现在统一提到所有行动分支之前：每天只要有出行入口，先探一次步行街扭蛋
+        #   看有没有【笔记 / 继承】；没有就两级右上角退回，再按原规则训练/去公园。
+        #   每天仍只探一次（trip_probe_done 记账），退回失败只放弃当天。
+        day_key = self._day_key(items)
+        if go and self._can_probe_trip(day_key):
+            self.trip_probe = True
+            self.trip_probe_done = day_key
+            self.trip_back_tries = 0
+            self._click_btn(go, f"[探出行-看有没有笔记 精力{self.stamina}/{self.stamina_max}]", frame)
+            return True
+
         if train and enough:
-            # 玩家 2026-11-23：「出行看有没有笔记，大于训练」。
-            # 今天还有训练可打，但先把出行页点开瞄一眼地点标签 ——
-            # 有笔记就直接出行（笔记 tier 最高），没笔记 _do_trip 会退回这里走训练。
-            # 每天只探一次（trip_probe_done 记账），退不出去会自动永久关掉这条路。
-            day_key = self._day_key(items)
-            if go and self._can_probe_trip(day_key):
-                self.trip_probe = True
-                self.trip_probe_done = day_key
-                self.trip_back_tries = 0
-                self._click_btn(go, f"[探出行-看有没有笔记 精力{self.stamina}/{self.stamina_max}]", frame)
-                return True
             probed = (self.trip_probe_done == day_key)
             if probed:
                 self.log_info(f"[探笔记] 已回到每日页 → 当天照常训练（精力 {self.stamina}/{self.stamina_max}）")
@@ -1382,6 +1385,8 @@ class AutoTask(MyBaseTask):
 
         # 精力不足：先看能不能去公园（唯一能明显回精力的地方）
         if go and not enough:
+            if self.trip_probe_done == day_key:
+                self.log_info("[探笔记] 已回到每日页 → 今天没有训练，按原规则去公园补精力")
             self._click_btn(go, f"[精力{self.stamina}<{stamina_min}-出行去公园补精力]", frame)
             return True
 
@@ -3077,14 +3082,18 @@ class AutoTask(MyBaseTask):
         # ===== 失败率硬门槛（玩家 2026-11-23：手动打从来不失败）=====
         scored = self._apply_fail_limit(scored, cfg)
 
+        mgr_names = set(cfg.get("manager_names") or [])
+        mgr_w = float(cfg.get("manager_weight", cfg.get("teammate", 1.0)))
         for d in scored:
             real = set(d["names"])          # 经理 / 主训 / 队友全算（玩家 2026-11-23）
             d["mates"] = len(real)
+            mgr_hit = sorted(real & mgr_names)
+            mgr_txt = f" 经理{mgr_hit}×{mgr_w}" if mgr_hit else ""
             d["score"] = self._score_core(sorted(real), d["level"], d["pct"], cfg,
                                           d.get("equips"))
             eq = d.get("equips") or []
             self.log_info(f"「{d['row']['t']}」{d['level'] or '?'} 失败率={d['pct']}% "
-                          f"队友{d['mates']}{sorted(real)} 器材{len(eq)}{eq} "
+                          f"队友{d['mates']}{sorted(real)}{mgr_txt} 器材{len(eq)}{eq} "
                           f"→ 得分 {d['score']:.2f}")
 
         # ===== 意识加权 = 精力泵（玩家 2026-11-23）=====
@@ -3461,7 +3470,13 @@ class AutoTask(MyBaseTask):
           3. 失败率（失败 = 白扔体力）→ 整包乘法打折
           4. 技能等级 Lv.1/Lv.2/MAX ← 只记录，**不计分**（玩家口径）
         """
-        base = len(mates) * float(cfg.get("teammate", 1.0))
+        # 队友计分：普通队友 teammate（默认 1.0），球队经理单独 manager_weight（默认 1.5）。
+        # 玩家 2026-11-23 22:14：「经理的权重调为1.5」。经理场边常驻、每个技能都在场，
+        # 名字命中 manager_names 就按这个权重算；老配置没配经理名时退化为「全员同权」，行为不变。
+        teammate_w = float(cfg.get("teammate", 1.0))
+        mgr_w = float(cfg.get("manager_weight", teammate_w))
+        mgr_names = set(cfg.get("manager_names") or [])
+        base = sum(mgr_w if m in mgr_names else teammate_w for m in mates)
 
         # 器材：训练核心页中场摆着的 1~3 张支援卡，按外框光效计分。
         #   玩家原口径：「队友 +1、器材 0.5、金光 1、彩光 1.5」

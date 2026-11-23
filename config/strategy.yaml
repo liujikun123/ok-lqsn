@@ -125,6 +125,11 @@ tuning:
   #   玩家 2026-11-23：**等级不参与计分**，所以 level_bonus 三档全 0（仍读出来打日志）。
   core_score:
     teammate: 1.0
+    # 球队经理：场边常驻、每个技能都在场。玩家 2026-11-23 22:14 要求「经理的权重调为1.5」
+    #   —— 经理虽常被 OCR 认成队友，但它不是真队友，给单独权重 1.5（其余队友仍 1.0）。
+    #   manager_names 命中即按 manager_weight 计分；名字可增补。
+    manager_names: [球队经理]
+    manager_weight: 1.5
     level_bonus:
       Lv.1: 0.0                     # 等级不计分（玩家口径）
       Lv.2: 0.0

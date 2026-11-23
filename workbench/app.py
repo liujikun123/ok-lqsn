@@ -11,11 +11,12 @@ import time
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QFont, QTextCursor, QColor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QGroupBox, QHBoxLayout,
-    QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QApplication, QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout,
+    QInputDialog, QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from workbench import profiles as P
 from workbench import runner as R
 from workbench.settings_ui import SettingsPanel
 
@@ -202,6 +203,37 @@ class Workbench(QMainWindow):
         row.addWidget(btn_open)
         lay.addWidget(g1)
 
+        # 训练方案：一份方案 = 整套局内规则（profiles/<名字>.json，可导入导出）。
+        # 切换 = 把方案里的 strategy.yaml 原文写回，现有设置面板/任务读取链路不变。
+        g2 = QGroupBox("训练方案")
+        g2v = QVBoxLayout(g2)
+        row2 = QHBoxLayout()
+        self.cmb_profile = QComboBox()
+        self.cmb_profile.currentTextChanged.connect(self.preview_profile)
+        row2.addWidget(self.cmb_profile, 1)
+        self.btn_apply_profile = QPushButton("应用")
+        self.btn_apply_profile.clicked.connect(self.apply_selected_profile)
+        row2.addWidget(self.btn_apply_profile)
+        g2v.addLayout(row2)
+        row3 = QHBoxLayout()
+        self._profile_buttons = []
+        for label, slot in (("保存改动", self.save_current_profile),
+                            ("另存为", self.save_as_profile),
+                            ("重命名", self.rename_profile),
+                            ("删除", self.delete_profile),
+                            ("导入", self.import_profile),
+                            ("导出", self.export_profile)):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            row3.addWidget(b)
+            self._profile_buttons.append(b)
+        g2v.addLayout(row3)
+        self.lab_profile = QLabel("")
+        self.lab_profile.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        self.lab_profile.setWordWrap(True)
+        g2v.addWidget(self.lab_profile)
+        lay.addWidget(g2)
+
         self.tabs = QTabWidget()
         self.panel_settings = SettingsPanel(ROOT, self)
         self.panel_settings.log.connect(self.append_log)
@@ -358,6 +390,140 @@ class Workbench(QMainWindow):
         return g
 
     # ------------------------------------------------------------ 配置
+    # ------------------------------------------------------------ 方案管理
+    def reload_profiles(self) -> None:
+        names = P.list_profiles(ROOT)
+        cur = P.active_name(ROOT)
+        self.cmb_profile.blockSignals(True)
+        self.cmb_profile.clear()
+        self.cmb_profile.addItems(names)
+        if cur in names:
+            self.cmb_profile.setCurrentText(cur)
+        self.cmb_profile.blockSignals(False)
+        self._show_profile_desc()
+
+    def _show_profile_desc(self) -> None:
+        name = self.cmb_profile.currentText()
+        if not name:
+            self.lab_profile.setText("（还没有方案，点「另存为」创建一份）")
+            return
+        mark = "当前生效" if name == P.active_name(ROOT) else "未应用"
+        self.lab_profile.setText(f"{mark}：{P.describe(name, ROOT)}")
+
+    def preview_profile(self) -> None:
+        """下拉选中即应用；程序化 reload 时信号被 block，不会误触发。"""
+        name = self.cmb_profile.currentText()
+        if not name or name == P.active_name(ROOT):
+            self._show_profile_desc()
+            return
+        try:
+            P.apply_profile(name, ROOT)
+            self.reload_rules()          # 规则原文/摘要跟着刷新
+            self.append_log("info", f"已切换训练方案「{name}」→ 规则文件已更新")
+        except Exception as e:
+            self.append_log("error", f"切换方案失败：{e}")
+        self._show_profile_desc()
+
+    def apply_selected_profile(self) -> None:
+        self.preview_profile()
+
+    def save_current_profile(self) -> None:
+        name = self.cmb_profile.currentText()
+        if not name:
+            QMessageBox.information(self, "保存方案", "请先选中一份方案")
+            return
+        desc = ""
+        try:
+            desc = P.load_profile(name, ROOT).get("description") or ""
+        except Exception:
+            pass
+        ret = QMessageBox.question(
+            self, "保存方案",
+            f"把当前规则原文（含注释）存到方案「{name}」？\n会覆盖这份方案的旧快照。")
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            P.snapshot_current(name, desc, ROOT)
+            self.append_log("info", f"方案「{name}」已保存")
+            self._show_profile_desc()
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", str(e))
+
+    def save_as_profile(self) -> None:
+        name, ok = QInputDialog.getText(self, "另存为方案", "方案名字：",
+                                        text="百目鬼训练-副本")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in P.list_profiles(ROOT):
+            QMessageBox.warning(self, "另存为", f"方案「{name}」已存在")
+            return
+        desc, _ = QInputDialog.getText(self, "另存为方案", "一句话说明（可留空）：")
+        try:
+            P.snapshot_current(name, desc, ROOT)
+            P.set_active(name, ROOT)
+            self.reload_profiles()
+            self.reload_rules()
+            self.append_log("info", f"新方案「{name}」已创建并启用")
+        except Exception as e:
+            QMessageBox.warning(self, "另存为失败", str(e))
+
+    def rename_profile(self) -> None:
+        old = self.cmb_profile.currentText()
+        if not old:
+            return
+        new, ok = QInputDialog.getText(self, "重命名方案", "新名字：", text=old)
+        if not ok or not new.strip() or new.strip() == old:
+            return
+        try:
+            P.rename_profile(old, new.strip(), ROOT)
+            self.reload_profiles()
+            self.append_log("info", f"方案「{old}」已改名为「{new.strip()}」")
+        except Exception as e:
+            QMessageBox.warning(self, "重命名失败", str(e))
+
+    def delete_profile(self) -> None:
+        name = self.cmb_profile.currentText()
+        if not name:
+            return
+        ret = QMessageBox.question(
+            self, "删除方案",
+            f"确定删除方案「{name}」？\n（删的是 profiles/ 里的快照，不影响当前规则文件）")
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            P.delete_profile(name, ROOT)
+            self.reload_profiles()
+            self.reload_rules()
+            self.append_log("info", f"方案「{name}」已删除")
+        except Exception as e:
+            QMessageBox.warning(self, "删除失败", str(e))
+
+    def import_profile(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "导入方案", "", "方案 JSON (*.json)")
+        if not path:
+            return
+        try:
+            name = P.import_profile(path, ROOT)
+            self.reload_profiles()
+            self.append_log("info", f"方案「{name}」已导入（选中即应用）")
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", str(e))
+
+    def export_profile(self) -> None:
+        name = self.cmb_profile.currentText()
+        if not name:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出方案", f"{name}.json",
+                                              "方案 JSON (*.json)")
+        if not path:
+            return
+        try:
+            out = P.export_profile(name, path, ROOT)
+            self.append_log("info", f"方案「{name}」已导出：{out}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+
     def reload_rules(self) -> None:
         files = R.list_rule_files(ROOT)
         cur = self.cmb_rule.currentText()
@@ -412,6 +578,7 @@ class Workbench(QMainWindow):
 
     # ------------------------------------------------------------ 自检
     def refresh_all(self) -> None:
+        self.reload_profiles()
         self.reload_rules()
         checks = R.preflight(ROOT)
         bad = [c for c in checks if not c.ok]
@@ -484,6 +651,9 @@ class Workbench(QMainWindow):
     def on_state(self, st: str) -> None:
         busy = st in ("running", "stopping")
         for b in (self.btn_boot, self.btn_full, self.btn_train):
+            b.setEnabled(not busy)
+        # 方案切换会改写 strategy.yaml，运行中禁止（任务已缓存配置，改了也不生效）
+        for b in getattr(self, "_profile_buttons", []) + [self.btn_apply_profile, self.cmb_profile]:
             b.setEnabled(not busy)
         self.btn_stop.setEnabled(st == "running")
         self.statusBar().showMessage({"running": "运行中…", "stopping": "正在停止…",

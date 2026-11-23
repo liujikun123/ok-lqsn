@@ -194,5 +194,33 @@ check("回来后点「训练」", [c[0] for c in s2.clicked][:1], ["训练"])
 check("训练日志标注探笔记后", any("探笔记后-训练" in x for x in [c[1] for c in s2.clicked]), True)
 check("日志写明已回每日页照常训练", any("已回到每日页" in x for x in s2.logs), True)
 
+print("\n== 8. 周日每日页：没有训练也要先探笔记，再去公园 ==")
+# 2026-11-23 22:14 玩家反馈「周日没有检查笔记，直接去公园了」。
+# 旧逻辑把探笔记塞在「有训练且精力够」分支里，周日休息无训练 → 直接去公园，
+# 整周最后一天从不检查笔记。现在探笔记提到所有行动分支之前。
+SUNDAY = [it("第3周", 100, 42), it("星期日", 256, 42), it("8/130", 486, 44),
+          it("出行", 1708, 930), it("休息", 1726, 718)]
+s3 = make_stub()
+s3._btn_in_area = btn
+s3._shop_button = lambda items, frame: None
+s3.stamina = 8
+s3._read_week = lambda items: (3, "日")
+s3._do_daily(SUNDAY, FRAME)
+check("周日先点「出行」探笔记", [c[0] for c in s3.clicked][:1], ["出行"])
+check("周日已记账 3-日", s3.trip_probe_done, "3-日")
+check("周日置 trip_probe=True", s3.trip_probe, True)
+check("周日没去点休息", all("休息" not in c[0] for c in s3.clicked), True)
+
+s4 = make_stub()
+s4._btn_in_area = btn
+s4._shop_button = lambda items, frame: None
+s4.stamina = 8
+s4._read_week = lambda items: (3, "日")
+s4.trip_probe_done = "3-日"      # 探完已退回每日页
+s4._do_daily(SUNDAY, FRAME)
+check("探完回每日页 → 出行去公园", [c[0] for c in s4.clicked][:1], ["出行"])
+check("日志写明去公园补精力", any("去公园补精力" in x for x in s4.logs), True)
+check("不会重复探笔记", s4.trip_probe, False)
+
 print(f"\n=== 通过 {PASS} / 失败 {FAIL} ===")
 sys.exit(1 if FAIL else 0)
