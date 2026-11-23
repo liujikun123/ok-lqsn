@@ -233,12 +233,22 @@ tuning:
   unknown:
     fallback: pause                # pause=没见过的页直接停下等人工；center=照旧点屏幕中间
     max_center_clicks: 10          # fallback=center 时，连续多少次还没走出去就停
+    wait_seconds: 2.0              # action=wait 的过场横幅等多久（秒），等它自己消失
     overlays:
+      # action=wait：会自动播完消失的过场/动画，只等不点
+      #   - 2026-11-23 15:11「CD收集心愿开始」横幅，下一两秒自动进每日页
+      #   - 2026-11-23 15:17 训练结果 Bonus:594% 华丽动画（六属性涨幅在飘），
+      #     此时「点击屏幕继续/黄色主按钮」还没出现，等一下才出现
+      #   Bonus keys 故意避开「确定/请选择」——那些是加强训练页，不能被当动画等掉
+      - {name: 收集心愿过场, keys: [收集心愿, 心愿开始], action: wait}
+      - {name: 训练结算动画, keys: ["Bonus:", "Bonus："], action: wait}
       - {name: 比赛结果横幅, keys: [NBA, 战胜, 赢得比赛], action: next}
       - {name: 合宿结算,     keys: [海边合宿结束, 心愿达成, 完美], action: next}
       - {name: 本周总结,     keys: [本周总结, 球队评分], action: next}
       # 心·技（缺末字）是 2026-11-23 14:59 实跑抓到的过渡帧残缺读数，曾导致 0/1 提前收工
-      - {name: 属性加成,     keys: [初始加成, 属性加成, 心·技·体, 心·技, 心枝, 倍率加成], action: next}
+      # exclude: 加强训练页也有「心·技·体」和 +85 涨幅，但它有「确定」按钮要真的选，
+      #          不能当纯浮层点掉；出现「请选择/确定」就不是属性浮层
+      - {name: 属性加成,     keys: [初始加成, 属性加成, 心·技·体, 心·技, 心枝, 倍率加成], exclude: [请选择一种加强训练, 确定], action: next}
       - {name: 野餐中,       keys: [野餐中, 划船中, 散步中], action: next}
       - {name: 专业指导,     keys: [专业指导, 精力提升了], action: next}
 

@@ -51,9 +51,10 @@ class Stub:
     def _click_item(self, it, label): self.logs.append(("click", label))
     def click_relative(self, x, y): self.logs.append(("click", f"rel {x},{y}"))
     def _event_cards(self, frame, items): return []
+    def sleep(self, sec): self.logs.append(("sleep", sec))
 
 
-for m in ("_match_overlay", "_do_unknown", "_print_summary"):
+for m in ("_match_overlay", "_do_unknown", "_print_summary", "_is_loading_frame"):
     setattr(Stub, m, getattr(AutoTask, m))
 
 
@@ -75,6 +76,15 @@ for texts, want in [
     (("心·技", "投射C367/1784", "体能C284/1640", "弹跳A679/+25"), "属性加成"),
     (("野餐中",), "野餐中"),
     (("专业指导", "精力提升了10"), "专业指导"),
+    # 15:11 实跑：过场未播完只读到标题，下一两秒自动进每日页
+    (("CD收集心愿开始",), "收集心愿过场"),
+    (("收集心愿",), "收集心愿过场"),
+    # 15:17 实跑：训练结算 Bonus 华丽动画，按钮还没出现，等它播完
+    (("Bonus:", "594%", "投射A616/1784", "运控A 612143"), "训练结算动画"),
+    (("Bonus：", "体能 +143"), "训练结算动画"),
+    # 加强训练页：有「心·技·体」但有「确定」按钮，被 exclude 排除，不算属性浮层
+    (("请选择一种加强训练", "心·技·体", "+85", "确定"), None),
+    (("心·技·体", "确定", "65%"), None),
     (("完全没见过的画面",), None),
 ]:
     hit = s._match_overlay(items(*texts))
@@ -93,6 +103,42 @@ r = s._do_unknown(items("NBA"), frame)
 check("NBA → 继续推进", r, True)
 check("命中被记账", s.known_overlay_hits.get("比赛结果横幅"), 1)
 check("没有 unknown_texts", len(s.unknown_texts), 0)
+
+print("--- 3b. 过场横幅走 wait，只等不点、不算未知 ---")
+s = Stub()
+r = s._do_unknown(items("CD收集心愿开始"), frame)
+check("过场 → 继续（等过去）", r, True)
+check("命中被记账", s.known_overlay_hits.get("收集心愿过场"), 1)
+check("没有点击", [x for x in s.logs if x[0] == "click"], [])
+check("有等待日志", any(x[0] == "info" and "等待" in x[1] for x in s.logs), True)
+check("没有 unknown_texts", len(s.unknown_texts), 0)
+
+print("--- 3c. 白屏加载帧：等待，不算未知 ---")
+import numpy as _np, cv2 as _cv2
+# 造一张「顶部有 HUD、主体纯白」的帧
+load_frame = _np.full((1080, 1920, 3), 245, dtype="uint8")
+_cv2.rectangle(load_frame, (0, 0), (1920, 60), (90, 150, 200), -1)  # 顶部彩色 HUD
+normal_frame = _np.random.randint(60, 220, (1080, 1920, 3), dtype="uint8")  # 主体有内容
+s = Stub()
+check("白屏帧被识别", s._is_loading_frame(load_frame), True)
+check("正常页不误判", s._is_loading_frame(normal_frame), False)
+s = Stub()
+r = s._do_unknown(items("第2周", "星期-", "102/130"), load_frame)
+check("白屏帧 → 继续等待", r, True)
+check("白屏帧没有点击", [x for x in s.logs if x[0] == "click"], [])
+check("白屏帧无 unknown_texts", len(s.unknown_texts), 0)
+
+# B. 纯过场背景：整屏紫色渐变、几乎没文字（15:19 实跑只读到一个「9」）
+fade = _np.zeros((1080, 1920, 3), dtype="uint8")
+for y in range(1080):  # 淡紫渐变，std 很低
+    fade[y, :] = (215, 190, 235)
+fade += _np.random.randint(0, 12, fade.shape, dtype="uint8")  # 轻微噪点
+check("紫过场帧被识别", s._is_loading_frame(fade, items("9")), True)
+check("正常页不误判(带items)", s._is_loading_frame(normal_frame, items("训练")), False)
+s = Stub()
+r = s._do_unknown(items("9"), fade)
+check("紫过场帧 → 继续等待", r, True)
+check("紫过场帧无 unknown_texts", len(s.unknown_texts), 0)
 
 print("--- 4. 收工摘要 ---")
 s = Stub()

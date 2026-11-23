@@ -770,6 +770,32 @@ class AutoTask(MyBaseTask):
         except Exception:
             return 0
 
+    def _has_dialog_arrow(self, frame):
+        """右下角白色倒三角▼ —— 剧情对话「点一下继续」的标记。
+
+        实测 2026-11-23 15:23：对话页只有一句台词「喂！不要一言不发就跑掉啊！」，
+        没有「跳过」按钮，OCR 读不到任何页面关键词 → 判未知停机；其实底部有
+        白色小三角（1920x1080 下约 29x26px，在右下角 x>0.9w,y>0.88h），点一下就过。
+        """
+        if frame is None:
+            return False
+        h, w = frame.shape[:2]
+        sub = frame[int(h * 0.88):h, int(w * 0.90):w]
+        if sub.size == 0:
+            return False
+        try:
+            gray = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
+            m = cv2.inRange(gray, 232, 255)
+            n, lab, stats, cen = cv2.connectedComponentsWithStats(m)
+            for i in range(1, n):
+                x, y, bw, bh, area = stats[i]
+                # 白色小三角：宽高 15~45px、面积够、位置靠右下角
+                if 15 <= bw <= 45 and 15 <= bh <= 45 and area >= 100:
+                    return True
+            return False
+        except Exception:
+            return False
+
     def _classify(self, items, frame=None):
         """判定当前页面。顺序 = 优先级，别随意调换。"""
         texts = [it["t"] for it in items]
@@ -923,8 +949,28 @@ class AutoTask(MyBaseTask):
         #     一轮下来能占十几步（实测未知页 23% 里一大半是它）。
         if is_attr_panel(joined) and sum(1 for w in ATTR_WORDS if w in joined) >= 3:
             return "训练结果"
+        # 7.4b 训练类过场动画（2026-11-23 15:25 / 15:27 实跑）通用识别：
+        #     开训动画（球场+底部属性条）、训练后成长动画（+13/+6 飘字、S 1011/+26）
+        #     都读不到「心·技·体」，但都有**多个属性名 + 没有任何可点按钮**，
+        #     而且游戏自己会播完。与其逐帧补关键词，用这个结构特征一次覆盖。
+        #     排除所有主按钮词：每日页(训练/商店)、选人页(筛选/下一步)、
+        #     加强训练(确定)、剧情(跳过/继续) —— 它们属性名再多也不会误判。
+        if (sum(1 for w in ATTR_WORDS if w in joined) >= 3
+                and not any(b in joined for b in (
+                    "跳过", "决定", "下一步", "确定", "确认", "训练", "比赛",
+                    "商店", "筛选", "自动选择", "选择", "继续", "休息", "出行",
+                    "前往", "野餐", "精力+"))):
+            return "训练结果"
         # 7.5 出行/工资之类的结果屏：成功！+ 获得 + 下一步（顶栏也有第N周，会误判成每日页）
         if has("成功！", "成功!") and has("获得", "工资") and exact("下一步"):
+            return "行程结果"
+        # 7.6 出行结果剧情页（2026-11-23 15:21 实跑）：顶栏第N周 + 属性涨幅飘字
+        #     「弹跳+20，防守+20」+ 剧情立绘，底部▼/点继续推进，没有行动按钮。
+        #     周切换瞬间「星期-」还没刷新，OCR 读残就落到未知页停了。用「属性+数字」
+        #     这种通用模式匹配，不写死具体数值/地点名。要求无行动按钮，避免抢每日页。
+        gain = re.search(r"(?:%s)\s*[+＋-]\s*\d+" % "|".join(ATTR_WORDS), joined)
+        if (gain and re.search(r"第\s*\d+\s*周", joined)
+                and not self._action_btn(items, frame)):
             return "行程结果"
         # 7.9 居中竖排胶囊选项（集训事件三选一这类）：先认出来再选，
         #     不必先白白点 3 次「跳过」等 same_count 攒够（每次约 5 秒）。
@@ -932,6 +978,13 @@ class AutoTask(MyBaseTask):
             return "选项"
         # 8. 剧情 / 事件（有「跳过」的大多是对话页；事件页另有黄卡片兜底）
         if exact("跳过") or "跳过" in joined:
+            return "剧情事件"
+        # 8.1 无「跳过」的纯对话页：右下角白色▼ 就是「点一下继续」的唯一标记。
+        #     2026-11-23 15:23「喂！不要一言不发就跑掉啊！」；15:32 剧本事件对话
+        #     「是！那就请您继续指导球队训练吧！」——后者还读出「剧本事件/角色名」
+        #     等标签，文字多达 11 段，所以**不按文字段数限制**，只靠▼视觉+无行动按钮。
+        if (frame is not None and self._has_dialog_arrow(frame)
+                and not self._action_btn(items, frame)):
             return "剧情事件"
         # 8.5 训练事件 / 球星卡事件：正文常提到「公园」这类词，会被下面的出行规则抢走
         if "训练事件" in joined and not exact("跳过"):
@@ -1231,11 +1284,18 @@ class AutoTask(MyBaseTask):
         之前不判颜色直接点「确定」，于是在这页空转 8 次停下。
         """
         h, w = frame.shape[:2]
+        joined_all = " ".join(it["t"] for it in items)
+        # 2026-11-23 15:40 实跑：行为卡页顶部「请选择1个技能」**选完卡也不消失**，
+        # 右下「确定」按钮一直黄。所以既不能只看颜色点确定（没选卡点了没用），
+        # 也不能只看标题一直选卡（选完卡还选 → 连 15 步不变）。
+        # 用 card_pick_pending 在两个动作间交替：选一次卡 → 下一轮点一次确定。
+        pick_pending = getattr(self, "card_pick_pending", False)
         ok = self._find(items, ["确定", "确认"], exact=True)
-        if ok and self._is_yellow_btn(frame, ok):
+        if ok and pick_pending:
+            self.card_pick_pending = False
             spot = self._yellow_btn_center(frame, ok)
             if spot:
-                self.log_info(f"点击「确定」@({int(spot[0])},{int(spot[1])}) [按黄色按钮定位]")
+                self.log_info(f"点击「确定」@({int(spot[0])},{int(spot[1])}) [选卡后确定]")
                 self.click(spot[0], spot[1])
             else:
                 self._click_item(ok, "[确定行为卡]")
@@ -1267,12 +1327,14 @@ class AutoTask(MyBaseTask):
             if best:
                 break
         best = best or cards[-1]
-        # 注意：OCR 读到的是卡片左上角的「名称标签」，那层标签点不动（22:14 连点 8 次无反应），
-        # 要点卡片主体，所以往下偏移到卡面中部。
+        # 注意：OCR 读到的是卡片上的「名称标签」（约在卡面图下方，y≈0.46h），标签本身点不动。
+        # 2026-11-23 15:41 实跑修正：旧代码往下偏移(y+0.2h≈0.66h)点到了卡片下方空白，
+        # 连点 15 次没反应；真正的卡面图在标签**上方**（y≈0.25h），往上偏移才选中。
         x = best["cx"]
-        y = min(best["cy"] + h * 0.20, h * 0.72)
+        y = max(best["cy"] - h * 0.22, h * 0.12)
         self.log_info(f"选行为卡「{best['t']}」→ 点卡面 @({int(x)},{int(y)})")
         self.click(x, y)
+        self.card_pick_pending = True    # 下一轮直接点确定，别再重复选卡
         self.sleep(0.8)
         return True
 
@@ -3263,6 +3325,8 @@ class AutoTask(MyBaseTask):
 
         指纹表在 strategy.yaml → tuning.unknown.overlays。每项是
         `{name, keys: [...], action: next}`；keys 里任一关键词出现在画面文字里就算命中。
+        可选 `exclude: [...]`：出现任一排除词则本条不命中（用来区分长得像的可交互页，
+        例如加强训练页也有「心·技·体」，但有「确定」按钮，不该当属性浮层点掉）。
         纯展示页（比赛横幅、周总结、属性加成…）命中后走 `next`（点继续/中间推进），
         不再算「未知」——这样摘要里的未知次数才是真的「没见过」。
         """
@@ -3271,14 +3335,55 @@ class AutoTask(MyBaseTask):
         for ov in cfg.get("overlays") or []:
             if not isinstance(ov, dict):
                 continue
+            excludes = ov.get("exclude") or []
+            if excludes and any(str(k) in joined for k in excludes):
+                continue
             keys = ov.get("keys") or []
             if any(str(k) in joined for k in keys):
                 return (str(ov.get("name") or "已知浮层"), str(ov.get("action") or "next"))
         return None
 
+    def _is_loading_frame(self, frame, items=None):
+        """过场/加载帧 —— 画面还没渲染完或正在播过场，等一下就好，别判未知。
+
+        实测两类（2026-11-23 15:15 / 15:19）：
+        A. 白屏加载：顶部 HUD 在、主体整屏白。body std≈4，hud std≈42。
+        B. 纯过场背景：紫色渐变+光斑，连 HUD 都没有，OCR 只从光斑里读出「9」。
+           full std≈22、hud std≈16（远低于正常页的 90+），文字 ≤2 段。
+        正常游戏页 full std 通常 >80，两种条件都碰不到，不会误伤。
+        """
+        if frame is None:
+            return False
+        try:
+            h, w = frame.shape[:2]
+            if h < 200 or w < 400:
+                return False
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            hud_std = float(gray[0:70, :].std())
+            body_std = float(gray[80:h, :].std())
+            # A. 白屏加载：主体空白 + 顶部 HUD 还在
+            if body_std < 12.0 and hud_std > 20.0:
+                return True
+            # B. 纯过场背景：整屏低对比 + 几乎没读到文字（HUD 都还没出现）
+            #    mean 下限排除全黑/纯黑帧（正常过场是亮紫色，mean≈200）
+            if items is not None and gray.std() < 30.0 and hud_std < 25.0 \
+                    and 60.0 < float(gray.mean()) < 250.0 and len(items) <= 2:
+                return True
+            return False
+        except Exception:
+            return False
+
     def _do_unknown(self, items, frame):
         joined = " ".join(i["t"] for i in items)
         texts = [i["t"] for i in items][:16]
+        cfg = self._tuning().get("unknown") or {}
+
+        # 0) 过场/加载帧：等它渲染完，绝不当未知页停下（也不点，避免误触）
+        if self._is_loading_frame(frame, items):
+            wait_s = float(cfg.get("wait_seconds") or 2.0)
+            self.log_info(f"白屏加载帧（HUD 在、主体空）→ 等 {wait_s}s 让页面渲染")
+            self.sleep(wait_s)
+            return True
 
         if any(k in joined for k in ("拼图", "碎片", "小游戏")):
             self.log_warning("未知页面但看着像小游戏，按放弃处理")
@@ -3295,6 +3400,14 @@ class AutoTask(MyBaseTask):
             if action == "pause":
                 self.log_warning(f"已知浮层「{name}」按配置暂停，等你处理")
                 return None
+            # wait：自动消失的过场横幅（如「CD收集心愿开始」），等它自己过去，别点、
+            #       也别判未知。实测 2026-11-23 15:11：过场未播完时 OCR 只读到标题，
+            #       下一两秒游戏自己就进了每日页；此时点屏幕中间是多余的。
+            if action == "wait":
+                wait_s = float(cfg.get("wait_seconds") or 2.0)
+                self.log_info(f"已知浮层「{name}」→ 等待 {wait_s}s 让过场自己过去")
+                self.sleep(wait_s)
+                return True
             # next：优先点页面上的「继续/下一步/确定」，实在没有再点中间
             if self._click_confirm(items, frame) or self._click_next_word(items, frame):
                 self.log_info(f"已知浮层「{name}」→ 点继续推进")
@@ -3307,7 +3420,6 @@ class AutoTask(MyBaseTask):
         if self._click_confirm(items, frame):
             return True
 
-        cfg = self._tuning().get("unknown") or {}
         # 老配置「未知页面兜底」= 暂停 仍优先（兼容）；否则用新配置 fallback
         old = str(self.config.get("未知页面兜底") or "")
         fallback = ("pause" if old == "暂停"
@@ -4042,6 +4154,13 @@ class AutoTask(MyBaseTask):
 
             # 注意：不能用 repeat —— 它比的是 (页面, 文字段数)，而文字段数每帧都在抖，
             # 永远累加不到阈值。改用「页面名连续没变」来判卡死。
+            # 2026-11-23 15:34 实跑：每日页连点「训练」15 步页面不变，手动点一下就进——
+            # 原因是窗口焦点被抢、pynput 点击被丢弃，而 _ensure_foreground 的 3 秒节流
+            # 期间没重抢。这里在卡住 4 步时**绕过节流强制置前**，给一次自愈机会。
+            if same_count in (4, 9):
+                self.log_warning(f"页面「{page}」连续 {same_count} 步没变化，"
+                                 f"强制把游戏窗口拉到前台再试（点击可能被丢弃）")
+                self._force_visible()
             if same_count >= 15:
                 self.log_error(f"页面「{page}」连续 {same_count} 步没变化，停下看看", notify=True)
                 self._shot(frame, f"stuck_{step}")
