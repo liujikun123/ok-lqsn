@@ -99,6 +99,7 @@ class AutoTask(MyBaseTask):
         # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
         # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
         self.shop_day = None
+        self.shop_week = None          # 已经例行看过货的那一周（商店 7 天刷新）
         self.unknown_count = 0
         self.minigame_tries = 0
         self.stock_idx = 0
@@ -106,6 +107,8 @@ class AutoTask(MyBaseTask):
         self.stock_picked = False
         self.slots_autofill = 0
         self.slots_empty = 0
+        # 上一场训练在场上看到的器材数（商店买「器材暴击」要先确认器材上有人）
+        self.last_equip_count = 0
         # 商店有没有精力道具卖：None=本期还没进过店 / True=有 / False=没有。
         # 「失败率全部>30 且无精力药 → 改练意识」这条规则要用它，没进店就不敢乱判。
         self.shop_has_stamina = None
@@ -834,7 +837,8 @@ class AutoTask(MyBaseTask):
         #   放在训练前：先把能补的精力补上，再决定练什么。
         if shop and self._want_shop(items):
             self.shop_day = self._day_key(items)
-            self._click_btn(shop, f"[进商店 精力{self.stamina} 看精力药/0元]", frame)
+            self.shop_week = (self.shop_day or "").split("-")[0] or None
+            self._click_btn(shop, f"[进商店 精力{self.stamina} 看货架]", frame)
             return True
 
         if train and enough:
@@ -1063,6 +1067,10 @@ class AutoTask(MyBaseTask):
 
     TRIP_NAMES = ["散步", "划船", "野餐", "公园", "游戏厅", "餐厅", "步行街", "休息", "发呆"]
     TRIP_FALLBACK = ["公园", "散步", "野餐", "划船", "餐厅", "步行街"]
+    # 公园子页的兜底顺序。玩家 2026-11-23：「周日的休息指的就是去公园」——
+    # 休息日的唯一目的就是把精力补回来，所以标签读不到数值时也要先挑野餐（大量恢复），
+    # 而不是按地点顺序挑散步。原表是 公园>散步>野餐>划船，进子页后会把散步排到野餐前。
+    PARK_FALLBACK = ["野餐", "划船", "散步"]
     GAIN_KEYS = ("精力", "属性", "零用钱", "金钱", "笔记")
 
     # OCR 吞掉数字时（只留「精力++」/「精力+」），按加号个数还原档位。
@@ -1176,20 +1184,29 @@ class AutoTask(MyBaseTask):
     def _want_shop(self, items):
         """今天要不要进商店看一眼。
 
-        玩家口径（2026-11-23）：只买 0 元的东西；精力 < 50 时买精力药。
-        所以只有「精力低于阈值」才值得特地点进去（进店后 _do_shop 会顺手拿 0 元）。
+        商店现在不只买精力药了 —— 特训牛奶 / 金色秘籍 / 器材暴击 / 0 元馈赠都值得买
+        （wiki 训练流口径）。但每天都绕一趟要白烧 2~3 步，所以只在两种时候进：
+          1) 精力 < 50：缺精力，得看有没有 50 元以下的饮料；
+          2) 换周了：商店「上新时间 7天后」，一周才刷一次货，例行进去把该买的买齐。
         按天记账，一天最多进一次，避免每日页 ↔ 商店来回打转。
         """
         shop_cfg = self._tuning().get("shop") or {}
         if not self.config.get("商店自动购买", True):
             return False
-        if self.shop_day is not None and self.shop_day == self._day_key(items):
+        day = self._day_key(items)
+        if self.shop_day is not None and self.shop_day == day:
             return False
-        if self.shop_bought >= int(shop_cfg.get("max_buy_per_run", 2)):
+        if self.shop_bought >= int(shop_cfg.get("max_buy_per_run", 4)):
             return False
-        st = self.stamina if self.stamina is not None else 0
-        below = int(shop_cfg.get("stamina_item_when_below", 50))
-        return st < below
+        st = self.stamina if self.stamina is not None else 999
+        below = int(((shop_cfg.get("rules") or {}).get("stamina") or {}).get("when_below", 50))
+        if st < below:
+            return True
+        week = day.split("-")[0] if day else None
+        if week and self.shop_week != week:
+            self.log_info(f"新的一周（{week}）→ 例行进店看货（商店 7 天刷新一次）")
+            return True
+        return False
 
     def _place_tag(self, n, items, frame):
         """取某个出行地点名下方那行收益标签（精力+/属性+/笔记 …）。"""
@@ -1269,7 +1286,9 @@ class AutoTask(MyBaseTask):
                 best, best_val, best_key = n, val, key
 
         if best is None or best_key is None or best_key[0] == 0:
-            order = self.TRIP_FALLBACK
+            # 公园子页（散步/划船/野餐）用单独的顺序：休息日只求把精力补回来
+            in_park = all(n["t"] in ("散步", "划船", "野餐", "发呆") for n in names)
+            order = self.PARK_FALLBACK if in_park else self.TRIP_FALLBACK
             cand = sorted(names, key=lambda x: order.index(x["t"]) if x["t"] in order else 99)
             best = cand[0]
             self.log_info(f"地点都没读到收益标签，按兜底顺序选「{best['t']}」")
@@ -1307,70 +1326,188 @@ class AutoTask(MyBaseTask):
         self._click_item(best or gos[0], f"[前往-档位{best_key}]")
         return True
 
-    def _do_shop(self, items, frame):
-        """商店：只做两件事 —— 买 0 元红包、精力低于阈值买精力药；其余一律不动。
+    # ---------- 商店 ----------
+    # 商品分类：名称关键词 → 类别。类别口径来自 wiki（篮球少女：飞跃巅峰 · 训练流）
+    #   值得买：精力饮料 / 特训牛奶（降训练精力消耗）/ 器材暴击（有负面，且只有器材上
+    #          站人才买）/ 金色教科书 / 金色属性秘籍 / 表情提升护符 / 老板的馈赠（0 元）
+    #   不买：紫色白色杂项、效率等级书（性价比极低）、超过 50 元的回精力道具
+    SHOP_CATS = (
+        ("free",    ("馈赠", "红包", "免费")),
+        ("milk",    ("牛奶", "特训")),
+        ("stamina", ("饮料", "精力", "能量饮")),
+        ("crit",    ("暴击",)),
+        ("book",    ("教科书", "教材", "等级书")),
+        ("stat",    ("秘籍", "属性书", "指南")),
+        ("charm",   ("护符", "表情")),
+    )
+    # 不是商品名的词：数量、上新、按钮、tab、价格单位
+    SHOP_NON_ITEM = ("剩余", "上新", "天后", "购买", "关闭", "使用", "比赛",
+                     "商店", "能力详情", "元", "零用钱")
 
-        玩家 2026-11-23 口径：
-          - 「只买 0 元的」：新品到货的免费/红包，其他商品不碰。
-          - 「精力值低于 50 的时候买精力药」：阈值 50（原 30），不分工作日/周末。
-          - 顺带记录**这家店到底卖不卖精力道具**，训练核心页那条
-            「失败率全部>30 且无精力药 → 改练意识」要用这个结论。
-            注意：只统计当前可见的商品，商店能滚动的话可能看不全，日志会标明。
+    def _shop_kind(self, name):
+        """商品名 → 类别。认不出来返回 other（=不买）。"""
+        n = (name or "").replace("＋", "+").strip()
+        if "精力上限" in n:          # 「精力上限+」是上限书，不是回精力，别当药买
+            return "stat"
+        for cat, words in self.SHOP_CATS:
+            if any(w in n for w in words):
+                return cat
+        return "other"
+
+    def _shop_price(self, items, item):
+        """商品卡附近的价格（元）。先认『N元』，再认卡片下方的纯数字。
+
+        实机事实：游戏里卡片上的价格是**纯数字**（如 130 / 40 / 50），
+        不带「元」字，所以只按 `\\d+元` 匹配会全部读不到价，白名单的价格上限就失效。
+        """
+        h = item["b"].height
+        best, best_d = None, 1e9
+        for it in items:
+            t = (it["t"] or "").replace(" ", "")
+            m = re.search(r"(\d{1,4})\s*元", t)
+            if m:
+                val = int(m.group(1))
+            elif re.fullmatch(r"\d{1,4}", t) and "剩余" not in t:
+                val = int(t)
+            else:
+                continue
+            dy = it["cy"] - item["cy"]
+            if dy < -0.8 * h or dy > 3.2 * h:      # 价格在名字下方 0~3 个字高内
+                continue
+            d = abs(dy) + abs(it["cx"] - item["cx"]) * 0.5
+            if d < best_d:
+                best, best_d = val, d
+        return best
+
+    def _shop_offers(self, items, frame):
+        """把商店货架 OCR 聚合成 [{name, kind, price, item}]。
+
+        页面事实（wiki 截图 OCR 校对）：
+          每行 3 张卡，卡内是「道具名（可带 + / ++ 强化后缀）→ 价格数字 → 剩余:N」，
+          卡旁是效果说明（「零用钱+80」「两个推荐属性随机+25~35」），
+          顶部「上新时间 7天后」，右上角 X，底部 tab「比赛 / 商店 / 能力详情」。
+        """
+        offers = []
+        for it in items:
+            t = (it["t"] or "").strip()
+            if not t or len(t) < 2:
+                continue
+            if any(k in t for k in self.SHOP_NON_ITEM):
+                continue
+            if re.fullmatch(r"[\d\s\.\+\-%]+", t):   # 纯数字 = 价格，不是商品
+                continue
+            kind = self._shop_kind(t)
+            if kind == "other":
+                continue
+            offers.append({"name": t, "kind": kind,
+                           "price": self._shop_price(items, it), "item": it})
+        # 同一个商品名 OCR 可能重复给出（卡片名 + 效果区），按 (名字, 价格) 去重
+        seen, uniq = set(), []
+        for o in offers:
+            k = (o["name"], o["price"])
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(o)
+        return uniq
+
+    def _shop_plan(self, offers, cfg):
+        """按白名单挑一件要买的，返回 (offer, 原因) 或 (None, 不买的原因)。
+
+        优先级 order：0 元馈赠 > 特训牛奶 > 精力饮料 > 器材暴击 > 教科书 > 属性秘籍 > 护符
+        每条规则都能单独关（on: false）、单独设价格上限（max_price）、
+        精力饮料还要求「精力 < when_below」，器材暴击还要求「上一场器材上有人」。
+        """
+        rules = cfg.get("rules") or {}
+        order = cfg.get("order") or ["free", "milk", "stamina", "crit", "book", "stat", "charm"]
+        st = self.stamina
+        eq = getattr(self, "last_equip_count", 0) or 0
+
+        # 紧急档：精力见底时先买饮料保命（否则今天直接练不动，牛奶再划算也没用）。
+        # 精力还宽裕时才按 order 走，牛奶（永久降低训练精力消耗）排在饮料前面。
+        urgent_rule = rules.get("stamina") or {}
+        urgent = int(urgent_rule.get("urgent_below", 35))
+        if st is not None and st < urgent:
+            pool = [o for o in offers if o["kind"] == "stamina"]
+            cap = urgent_rule.get("max_price")
+            pool = [o for o in pool if cap is None or o["price"] is None or o["price"] <= float(cap)]
+            if pool:
+                pool.sort(key=lambda o: (o["price"] is None, o["price"] or 0))
+                self.log_info(f"精力 {st} < {urgent}（见底）→ 优先买精力饮料")
+                return pool[0], "stamina-urgent"
+
+        for cat in order:
+            rule = rules.get(cat) or {}
+            if rule.get("on", True) is False:
+                continue
+            pool = [o for o in offers if o["kind"] == cat]
+            if not pool:
+                continue
+            # 便宜的优先；读不到价格的排最后（不敢乱花）
+            pool.sort(key=lambda o: (o["price"] is None, o["price"] or 0))
+
+            if cat == "stamina":
+                below = int(rule.get("when_below", 50))
+                if st is None or st >= below:
+                    self.log_info(f"商店有精力饮料，但精力 {st} ≥ {below} → 先不买")
+                    continue
+            if cat == "crit" and rule.get("need_equip", True) and not eq:
+                self.log_info("商店有器材暴击道具，但上一场训练没采到器材 "
+                              "（wiki：只有器材上站人才买）→ 跳过")
+                continue
+
+            o = pool[0]
+            cap = rule.get("max_price")
+            if cap is not None and o["price"] is not None and o["price"] > float(cap):
+                self.log_warning(f"「{o['name']}」{o['price']} 元 > 上限 {cap} 元 → 不买")
+                continue
+            return o, cat
+        return None, "没有符合白名单的商品"
+
+    def _do_shop(self, items, frame):
+        """商店：严格按 wiki 白名单买，其余一律不碰。
+
+        玩家 2026-11-23：「商店具体的效果你去 wiki 看看，决定可以买哪些、长什么样」。
+        查证（篮球少女：飞跃巅峰·训练流攻略，多篇一致）：
+          ✅ 精力饮料（回精力，**只买 50 元以下**）
+          ✅ 特训牛奶（减少训练精力消耗 → 等于多练一天，本作最划算的一件）
+          ✅ 器材暴击道具（带负面效果，且**只有当天器材上有站人时才买**）
+          ✅ 金色教科书 / 金色属性秘籍（属性；单项 >1200 后收益减半，不买）
+          ✅ 表情提升 5% 护符
+          ✅ 老板的馈赠 / 馈赠+（标价 0，零用钱 +80，白拿）
+          ❌ 紫色/白色杂项、效率等级书（性价比极低）、高价回精力道具
         """
         cfg = self._tuning().get("shop") or {}
-        texts = [it["t"] for it in items]
-
-        # 1) 先回答「有没有精力道具在卖」——这条结论比买不买更重要
-        stamina_items = [it for it in items
-                         if "精力" in it["t"] and "精力上限" not in it["t"]
-                         and "精力消耗" not in it["t"]]
-        self.shop_has_stamina = bool(stamina_items)
-        self.log_info(f"商店：可见范围内{'有' if stamina_items else '没有'}精力道具"
-                      f"（文字 {texts[:10]}）")
+        offers = self._shop_offers(items, frame)
+        # 一件都没读出来 = 这页没解析成功，不能据此断言「店里没有精力道具」
+        # （否则会把「高风险改练意识」那条规则带偏），保持 None。
+        if offers:
+            self.shop_has_stamina = any(o["kind"] == "stamina" for o in offers)
+        self.log_info(f"商店货架「{[o['name'] for o in offers]}」"
+                      f"价格{[o['price'] for o in offers]}｜精力 {self.stamina}")
+        if cfg.get("snapshot", True):
+            self._shot(frame, "shop")
 
         if not self.config.get("商店自动购买", True):
             return self._leave(items, frame)
 
-        max_buy = int(cfg.get("max_buy_per_run", 2))
+        max_buy = int(cfg.get("max_buy_per_run", 4))
         if self.shop_bought >= max_buy:
-            self.log_info(f"本期商店已买 {self.shop_bought} 次（上限 {max_buy}），不再买")
+            self.log_info(f"本期商店已买 {self.shop_bought} 件（上限 {max_buy}），不再买")
             return self._leave(items, frame)
 
-        # 2) 0 元红包优先
-        if cfg.get("free_red_packet", True):
-            free = self._all(items, r"0\s*元|免费|红包")
-            if free:
-                self.shop_bought += 1
-                self._click_item(free[0], "[0元红包]")
-                self.sleep(self.config.get("等待秒数"))
-                f2 = self._frame()
-                if f2 is not None:
-                    self._click_confirm(self._texts(f2), f2)
-                return True
+        o, why = self._shop_plan(offers, cfg)
+        if o is None:
+            self.log_info(f"商店：{why}")
+            return self._leave(items, frame)
 
-        # 3) 精力低于阈值 → 买精力药
-        below = int(cfg.get("stamina_item_when_below", 50))
-        st = self.stamina
-        if stamina_items and st is not None and st < below:
-            it = stamina_items[0]
-            price = self._price_near(items, it, frame)
-            cap = int(cfg.get("stamina_item_max_price", 0) or 0)
-            if cap and price is not None and price > cap:
-                self.log_warning(f"精力道具 {price} 元超过上限 {cap}，不买")
-            else:
-                self.shop_bought += 1
-                self._click_item(it, f"[精力{st}<{below}-买精力药 {price if price is not None else '?'}元]")
-                self.sleep(self.config.get("等待秒数"))
-                f2 = self._frame()
-                if f2 is not None:
-                    self._click_confirm(self._texts(f2), f2)
-                return True
-        elif stamina_items and st is not None:
-            self.log_info(f"精力 {st} ≥ {below}，不买精力药")
-        elif not stamina_items:
-            self.log_info("商店没有精力道具，跳过")
-
-        return self._leave(items, frame)
+        self.shop_bought += 1
+        self._click_item(o["item"], f"[商店-{why} 「{o['name']}」{o['price']}元]")
+        self.sleep(self.config.get("等待秒数"))
+        f2 = self._frame()
+        if f2 is not None:
+            self._click_confirm(self._texts(f2), f2)
+        return True
 
     def _price_near(self, items, item, frame):
         """道具卡片上/下的「N 元」价格，读不到返回 None。"""
@@ -1965,6 +2102,12 @@ class AutoTask(MyBaseTask):
             self.log_warning("带角标的技能都没读到编队，按当前默认项决定")
             return self._decide(items, frame)
 
+        # 记下这一场器材最多有几张 —— 商店那边「器材暴击道具只有器材上站人才买」
+        # 要用它（wiki 原话）。商店页看不到器材，只能靠训练核心页这一眼。
+        seen_eq = max([len(d.get("equips") or []) for d in scored] or [0])
+        if seen_eq:
+            self.last_equip_count = seen_eq
+
         usable = [d for d in scored if d["valid"]]
         if usable:
             if len(usable) < len(scored):
@@ -2020,6 +2163,14 @@ class AutoTask(MyBaseTask):
         if forced and scored[0] is not forced:
             self.log_info(f"按规则覆盖排名：改练「{forced['row']['t']}」"
                           f"（原第一「{scored[0]['row']['t']}」）")
+
+        # 选中项带失败率 → 明确打一条「赌」的日志，事后复盘输赢用
+        if best.get("pct"):
+            alt = [d for d in scored if d is not best and not d.get("pct")]
+            self.log_warning(f"赌一把：「{best['row']['t']}」失败率 {best['pct']}%，"
+                             f"期望得分仍排第一（{best['score']:.2f}）"
+                             + (f"；稳的备选 {[(d['row']['t'], round(d['score'], 2)) for d in alt]}"
+                                if alt else "；今天没有 0% 的稳选项"))
 
         self._click_item(best["row"], f"[最优编队 {best['row']['t']} 得分{best['score']:.1f}]")
         self.sleep(1.0)
@@ -2208,23 +2359,32 @@ class AutoTask(MyBaseTask):
         return best
 
     def _apply_fail_limit(self, scored, cfg):
-        """失败率硬门槛：只要存在 ≤limit 的技能，>limit 的一律踢出排名。
+        """失败率上限：>limit 的踢出排名，≤limit 的**允许赌**。
 
-        玩家 2026-11-23 口径「手动从来不失败」——原来只做乘法折扣，折扣再低也可能
-        选到 40%、50% 的项。现在改成硬过滤；全都高于门槛时才退回原排名，
-        否则那天就彻底没得练了。
-        读不到失败率（pct=None）也算不安全：不能假定它 0%。
+        口径演进（玩家 2026-11-23 三次）：
+          ① 早先：只做乘法折扣 → 可能选到 40%/50% 的项；
+          ② 后来：`fail_limit: 0` 硬性只选 0% → 太保守，把「收益明显更高、
+             失败率 20%」的好课全排掉了；
+          ③ **现在（玩家原话）：「失败可以赌一把，收益如果很高，小于 30 都能去」**
+             → `fail_limit: 30`。30 以内不排除，交给期望收益（_score_core 里的
+             ×(1-p)）排序：收益高到 5 分的课，赌 25% 失败仍然赢过稳拿 1 分的小课。
+        全部技能都 >limit 时才退回原排名 —— 否则当天就彻底没得练了。
+        读不到失败率（pct=None）仍视为不安全（不能假定它 0%）。
         """
         lim = cfg.get("fail_limit")
         if lim is None or not scored:
             return scored
         safe = [d for d in scored if d["pct"] is not None and float(d["pct"]) <= float(lim)]
         if not safe:
-            self.log_warning(f"所有技能失败率都 >{lim}%，只能按原排名（今天做不到 0 失败）")
+            self.log_warning(f"所有技能失败率都 >{lim}%，只能按原排名（今天没得选，硬着头皮练）")
             return scored
         if len(safe) < len(scored):
             drop = [(d["row"]["t"], d["pct"]) for d in scored if d not in safe]
-            self.log_warning(f"失败率 >{lim}% 直接排除（玩家口径：从不失败）→ {drop}")
+            self.log_warning(f"失败率 >{lim}% 不赌，排除 → {drop}")
+        willing = [(d["row"]["t"], d["pct"]) for d in safe if d["pct"]]
+        if willing and cfg.get("log_gamble", True):
+            self.log_info(f"阈值 {lim}% 以内允许赌 → 可下注的项 {willing}"
+                          f"（按 收益×(1-失败率) 排，谁期望高选谁）")
         return safe
 
     def _apply_consciousness_boost(self, scored, cfg):
@@ -2667,6 +2827,7 @@ class AutoTask(MyBaseTask):
         # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
         # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
         self.shop_day = None
+        self.shop_week = None          # 已经例行看过货的那一周（商店 7 天刷新）
         self.unknown_count = 0
         self.minigame_tries = 0
         self.stock_idx = 0
@@ -2674,6 +2835,8 @@ class AutoTask(MyBaseTask):
         self.stock_picked = False
         self.slots_autofill = 0
         self.slots_empty = 0
+        # 上一场训练在场上看到的器材数（商店买「器材暴击」要先确认器材上有人）
+        self.last_equip_count = 0
         # 商店有没有精力道具卖：None=本期还没进过店 / True=有 / False=没有。
         # 「失败率全部>30 且无精力药 → 改练意识」这条规则要用它，没进店就不敢乱判。
         self.shop_has_stamina = None

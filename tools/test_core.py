@@ -105,6 +105,23 @@ def main():
     allok &= check("全都 >0% → 保留全部（没得挑）",
                    len(s._apply_fail_limit(allbad, cfgl)), 2)
 
+    print("--- 失败率 30 以内可以赌（玩家 2026-11-23：收益高的话 <30 都能去）---")
+    cfg30 = dict(CFG, fail_limit=30)
+    pool30 = [item("投射", 3, "LV.1", 0), item("防守", 2, "LV.1", 25),
+              item("弹跳", 2, "LV.1", 30), item("意识", 1, "LV.1", 40)]
+    kept30 = s._apply_fail_limit(pool30, cfg30)
+    allok &= check("≤30% 全留（可赌），>30% 踢掉",
+                   sorted(d["row"]["t"] for d in kept30), ["弹跳", "投射", "防守"])
+
+    # 期望收益的实质：4 队友 ×25% 失败 = 3.0 分，仍然赢过「2 队友 0 失败 = 2.0 分」
+    high = s._score_core(["a", "b", "c", "d"], "LV.1", 25, CFG)
+    safe = s._score_core(["a", "b"], "LV.1", 0, CFG)
+    allok &= check("高收益值得赌：25% 失败的 4 人场赢过 0 失败的 2 人场",
+                   high > safe, True)
+    # 反过来：收益差不多就不该赌
+    same = s._score_core(["a", "b"], "LV.1", 25, CFG)
+    allok &= check("收益一样就别赌：25% 失败输给 0 失败", same < safe, True)
+
     allok &= check("不配 fail_limit → 不过滤", len(s._apply_fail_limit(pool, CFG)), 4)
 
     print("--- 意识加权：精力 < 45 时拉满（不耗精力、小幅回精力）---")
