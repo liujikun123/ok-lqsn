@@ -11,7 +11,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
 datas = []
-for folder in ("config", "profiles", "assets", "icons", "i18n", "knowledge", "docs", "cache"):
+for folder in ("config", "configs", "profiles", "assets", "icons", "i18n", "knowledge", "docs", "cache"):
     src = os.path.join(ROOT, folder)
     if os.path.isdir(src):
         datas.append((src, folder))

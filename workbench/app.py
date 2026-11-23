@@ -137,7 +137,7 @@ class Workbench(QMainWindow):
         head = QHBoxLayout()
         title = QLabel("篮球少女 · 自动训练工作台")
         title.setStyleSheet("font-size:18px; font-weight:700;")
-        sub = QLabel("发布版 0.2 · 可改配置")
+        sub = QLabel("v0.1 · 百目鬼训练方案 · 可改配置")
         sub.setStyleSheet(f"color:{MUTED}; font-size:12px; padding-top:4px;")
         head.addWidget(title)
         head.addWidget(sub)
