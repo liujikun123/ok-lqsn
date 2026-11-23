@@ -3786,6 +3786,31 @@ class AutoTask(MyBaseTask):
         except Exception:
             return False
 
+    def _looks_transient(self, items, frame):
+        """画面还在播过场/动画的通用特征（不依赖具体画面规则）。
+
+        文字 ≤2 段、顶栏 HUD（第N周/星期X/精力）一个都没读出来、也没有
+        任何可点的行动/确认按钮，且画面不是纯黑纯白（那多半是采集失败）。
+        2026-11-23 连续踩到白屏、紫渐变、LOGO、紫蒙版、「属性加成」动画，
+        21:18 那次光柱把「属性加成」遮成「-」又漏了一条规则。与其一种一种补，
+        不如这里做通用兜底：给几步宽限等动画自己过去，超时恢复原未知页处理，
+        所以真实页面最多多等几秒，不会被永久跳过。
+        """
+        if frame is None or items is None or len(items) > 2:
+            return False
+        joined = " ".join(str(i.get("t", "")) for i in items)
+        if any(k in joined for k in ("第", "星期", "/130", "/150")):
+            return False
+        buttons = ("训练", "休息", "出行", "比赛", "商店",
+                   "确定", "下一步", "继续", "跳过", "关闭", "取消")
+        if any(k in joined for k in buttons):
+            return False
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return 8.0 < float(gray.std()) and 25.0 < float(gray.mean()) < 245.0
+        except Exception:
+            return False
+
     def _do_unknown(self, items, frame):
         joined = " ".join(i["t"] for i in items)
         texts = [i["t"] for i in items][:16]
@@ -3797,6 +3822,21 @@ class AutoTask(MyBaseTask):
             self.log_info(f"白屏加载帧（HUD 在、主体空）→ 等 {wait_s}s 让页面渲染")
             self.sleep(wait_s)
             return True
+
+        # 0.5) 疑似过场/动画帧：给 4 步宽限，只等不点（也不记未知页）。
+        #      超时就不再等，按下面的正常未知页流程处理，避免真实页面被跳过。
+        if self._looks_transient(items, frame):
+            n = getattr(self, "_transient_frames", 0) + 1
+            self._transient_frames = n
+            if n <= 4:
+                wait_s = float(cfg.get("wait_seconds") or 2.0)
+                self.log_info(f"[过场宽限] 疑似动画帧（文字 {len(items)} 段、顶栏 HUD 未出现）"
+                              f"→ 等 {wait_s}s 让它自己播完（{n}/4）")
+                self.sleep(wait_s)
+                return True
+            self.log_warning("[过场宽限] 连续 4 步仍是疑似动画帧 → 不再等待，按未知页处理")
+        else:
+            self._transient_frames = 0
 
         if any(k in joined for k in ("拼图", "碎片", "小游戏")):
             self.log_warning("未知页面但看着像小游戏，按放弃处理")

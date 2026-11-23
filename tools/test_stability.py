@@ -62,7 +62,7 @@ class Stub:
 
 
 for m in ("_match_overlay", "_do_unknown", "_print_summary", "_is_loading_frame",
-          "_check_transition"):
+          "_looks_transient", "_check_transition"):
     setattr(Stub, m, getattr(AutoTask, m))
 
 
@@ -194,6 +194,26 @@ s = Stub()
 r = s._do_unknown(anim_items, anim)
 check("训练结果动画 → 继续等待", r, True)
 check("训练结果动画无 unknown_texts", len(s.unknown_texts), 0)
+
+# F. 通用过场宽限（21:18 实跑：光柱把「属性加成」遮成「-」，规则 E 又漏了）
+#    与其一种动画补一条视觉规则，不如给疑似过场帧 4 步宽限，超时恢复原处理。
+anim2 = _np.random.randint(40, 250, (1080, 1920, 3), dtype="uint8")  # std≈60，避开旧 B 低对比规则
+dash = items("-")
+check("疑似过场帧被识别", s._looks_transient(dash, anim2), True)
+check("有顶栏HUD不算疑似过场", s._looks_transient(items("第4周", "星期六"), anim2), False)
+check("有行动按钮不算疑似过场", s._looks_transient(items("训练", "出行"), anim2), False)
+check("文字多不算疑似过场", s._looks_transient(items("甲", "乙", "丙"), anim2), False)
+check("纯黑帧不算疑似过场", s._looks_transient(dash, _np.zeros((1080, 1920, 3), dtype="uint8")), False)
+s = Stub()
+r = s._do_unknown(dash, anim2)
+check("疑似过场 → 等待不暂停", r, True)
+check("疑似过场无 unknown_texts", len(s.unknown_texts), 0)
+check("疑似过场有宽限日志", any("过场宽限" in str(m) for _, m in s.logs), True)
+s2 = Stub()
+rs = [s2._do_unknown(dash, anim2) for _ in range(6)]
+check("前4步都等待", rs[:4], [True] * 4)
+check("第5步起不再等待", rs[4], None)
+check("超时应有警告", any("连续 4 步仍" in str(m) for _, m in s2.logs), True)
 
 print("--- 3.5 页面转移软约束（只警告不拦截）---")
 s = Stub()
