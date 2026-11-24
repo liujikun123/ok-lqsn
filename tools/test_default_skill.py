@@ -10,16 +10,19 @@
 验证：
   1. _selected_skill 能从深蓝高亮胶囊认出当前选中项（浅蓝/橙底两种皮肤、认不出返回 None）；
   2. 默认选中项**第一个采**（在点开任何其它技能之前），且全程不点；
-  3. 默认项不论有没有角标都采（编队本来就摊在画面上，白捡的数据）；
-  4. 认不出高亮时六项一律点开采样；
+  3. 认不出高亮时，所有带角标的技能都点开采样；
+  4. **没角标 = 没人**（玩家 2026-11-24 12:55），不进候选池、不采；
   5. 默认项采样失败只重取帧、不补点；最终选择就是默认项时收尾不点它，直接点「决定」。
 
-【2026-11-24 变更记录】
+【变更记录】
  · 11:25 撤掉「投射不是默认选中项就跳过」的硬规则（实测点胶囊只是展开编队，不会开训，
    旧规则让 W2D4 那局「带经理加成 + 器材」的投射整项掉出候选池）。
- · 11:55 玩家进一步澄清默认态本来就是投射、不点就能采 → 改成**先把默认帧采下来**，
+ · 11:55 玩家澄清默认态本来就是投射、不点就能采 → 改成**先把默认帧采下来**，
    再逐个点开其它技能。旧的实现虽然也判断了 `name == selected` 就不点，但采样顺序按
    胶囊 cy 从上往下，前面若有技能先被点开，轮到默认项时画面早已不是它的编队。
+ · 12:55 玩家纠错：「角标代表有人，没角标的一定没有人！」→ 候选池回到「只含有角标」，
+   没角标的项队友恒为 0，采它只是白烧 OCR、还可能把误读的名字当队友抬分。
+   （11:xx 那版按"角标只是当天加成"六项全采，是理解错了。）
 """
 import os
 import sys
@@ -210,7 +213,7 @@ check("证据标注未点击", "默认选中帧(未点击)" in core0[0][1], True
 check("收尾点了决定", st.decided, ["决定"])
 check("记了一条训练", len(st.runlog), 1)
 
-print("\n== 3. 认不出高亮 → 六项一律点开采样（不再特殊对待投射）==")
+print("\n== 3. 认不出高亮 → 所有带角标的技能都点开采样（不特殊对待投射）==")
 st2 = run_flow(make_frame(None))
 clicked2 = [c[0] for c in st2.clicks]
 check("投射也会被点开", "投射" in clicked2, True)
@@ -234,18 +237,13 @@ check("其余 5 个技能点开", len([c for c in sample_clicks3 if c != "坐标
 dec3 = find_audit(st3, "DECIDE")
 check("DECIDE 标注默认选中弹跳", "【默认选中项】弹跳" in dec3, True)
 
-print("\n== 5. 六个技能都没角标 → 照样全采（角标≠编队里有人）==")
-# 2026-11-24 第三轮实跑复盘：只挑有角标的会让候选池平均只剩 3 项，甚至只剩 1 项
-# （投射 MAX 失败率 77% 那场）。角标只代表"今天这项有加成"，与站几个人无关。
+print("\n== 5. 六项都没角标（=都没人）→ 不采样，直接决定 ==")
+# 玩家 2026-11-24 12:55：「角标代表有人，没角标的一定没有人」→ 没角标的项队友恒为 0，
+# 采它只是白烧几帧 OCR，还可能把误读的名字当队友抬分。
 st4 = run_flow(make_frame("投射"), badges=False)
-sampled4 = [c[0] for c in st4.clicks if c[0] != "坐标点击"]
-check("默认项不点", "投射" in sampled4, False)
-check("其余 5 项都点开", sampled4, ["弹跳", "防守", "体能", "运控", "意识"])
-check("6 项全采到", len(sample_order(st4)), 6)
-dec4 = find_audit(st4, "DECIDE")
-check("投射进了排名", "投射 4.00分" in dec4, True)
-check("最终选投射", "【最终选择】投射" in dec4, True)
-check("收尾直接点决定（不再点它）", st4.decided, ["决定"])
+check("一个采样点击都没有", [c[0] for c in st4.clicks if c[0] != "坐标点击"], [])
+check("一次采样都没有", sample_order(st4), [])
+check("直接点决定", st4.decided, ["决定"])
 
 print("\n== 6. 默认项采样失败：只重取帧、不补点 ==")
 st5 = run_flow(make_frame("投射"), empty_skill="投射")
@@ -255,11 +253,14 @@ dec5 = find_audit(st5, "DECIDE")
 check("DECIDE 说明默认项没采到", "未采到，未参与排名" in dec5, True)
 check("仍选出其它技能", "【最终选择】" in dec5, True)
 
-print("\n== 7. 有角标的排前面：中途被切页也不会把预算花在没加成的项上 ==")
+print("\n== 7. 只采有角标的：默认项没角标就是没人，不采也不点 ==")
 st6 = run_flow(make_frame("投射"), badges={"弹跳", "意识"})
-order = [c[0] for c in st6.clicks if c[0] != "坐标点击"]
-check("点击顺序：有角标在前", order, ["弹跳", "意识", "防守", "体能", "运控"])
-check("仍然 6 项全采", len(sample_order(st6)), 6)
+order = [c[0] for c in st6.clicks if not str(c[1]).startswith("[最优编队")]
+check("只点有角标的两项（收尾点最优不算）", order, ["弹跳", "意识"])
+check("只采这两项", sample_order(st6), ["弹跳", "意识"])
+dec6 = find_audit(st6, "DECIDE")
+check("默认项没采到 → 不参与排名", "未采到，未参与排名" in dec6, True)
+check("仍然写出最终选择", "【最终选择】" in dec6, True)
 
 print(f"\n=== 通过 {PASS} / 失败 {FAIL} ===")
 sys.exit(1 if FAIL else 0)
