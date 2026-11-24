@@ -82,7 +82,7 @@ check("空帧不抛异常", s._selected_skill(np.zeros((0, 0, 3), dtype="uint8")
 class CoreStub(AutoTask):
     """把取帧/OCR/打分/落盘全部打桩，只留 _do_training_core 的真实控制流。"""
 
-    def __init__(self, frame, badges=True, empty_skill=None):
+    def __init__(self, frame, badges=True, empty_skill=None, badge_seq=None):
         self.f = frame
         self.items = [dict(r) for r in ROWS]
         self.config = {"保存截图": False}
@@ -90,6 +90,8 @@ class CoreStub(AutoTask):
         self.stamina, self.stamina_max, self.gold = 84, 130, 120
         self.core_checked = False
         self.badges = badges            # False = 六个技能都没角标
+        self.badge_seq = badge_seq or []  # 模拟逐帧变化：第 i 次重取帧后的角标配置
+        self.frames = 0                 # 取帧次数（验证"坏帧重取"用）
         self.empty_skill = empty_skill  # 这个技能采不到编队（模拟采样失败）
         self.clicks = []                # (技能名, 原因)
         self.trace = []                 # 事件顺序：("click"/"sample", 技能名)
@@ -112,14 +114,17 @@ class CoreStub(AutoTask):
     def _read_week(self, items):
         return 1, 4
 
-    def _badge_near(self, frame, r):
-        # badges: True/None = 六个都有；False = 都没有；集合 = 只有集合里的有
+    def _badge_blobs(self, frame):
+        """打桩角标：真实分配逻辑（_badges_for_rows）照跑，只替换"画面里有哪些角标"。
+
+        合成角标放在 (cx+100, cy-50)：横向落在胶囊列（cx≈1600 > 0.62*1920），
+        纵向比技能行中心高 50px —— 和真实素材实测的 43~45px 一致，在 0.055h(=59px) 内。
+        """
         if self.badges is False:
-            return None
+            return []
         if isinstance(self.badges, (set, list, tuple)):
-            if r["t"] not in self.badges:
-                return None
-        return (r["cx"] + 100, r["cy"] - 50)
+            return [(r["cx"] + 100, r["cy"] - 50) for r in ROWS if r["t"] in self.badges]
+        return [(r["cx"] + 100, r["cy"] - 50) for r in ROWS]
 
     def _click_item(self, r, why=""):
         self.clicks.append((r["t"], why))
@@ -138,6 +143,9 @@ class CoreStub(AutoTask):
         return [f"队友{i}" for i in range(n)], 0, "LV.1", []
 
     def _frame(self, *a, **kw):
+        self.frames += 1
+        if self.badge_seq and self.frames - 1 < len(self.badge_seq):
+            self.badges = self.badge_seq[self.frames - 1]
         return self.f
 
     def _texts(self, f):
@@ -237,13 +245,15 @@ check("其余 5 个技能点开", len([c for c in sample_clicks3 if c != "坐标
 dec3 = find_audit(st3, "DECIDE")
 check("DECIDE 标注默认选中弹跳", "【默认选中项】弹跳" in dec3, True)
 
-print("\n== 5. 六项都没角标（=都没人）→ 不采样，直接决定 ==")
-# 玩家 2026-11-24 12:55：「角标代表有人，没角标的一定没有人」→ 没角标的项队友恒为 0，
-# 采它只是白烧几帧 OCR，还可能把误读的名字当队友抬分。
+print("\n== 5. 六项都没角标 = 残帧 → 先重取 3 次，仍没有才决定 ==")
+# 玩家 2026-11-24 12:55：「角标代表有人，没角标的一定没有人」→ 没角标的项队友恒为 0。
+# 但 2026-11-24 13:00 玩家又追问「不可能一整天都没角标」——对，575 张真实核心帧
+# 0 张是全无（最少 1 个，均值 3.5），所以「全无」是残帧信号，要先重取帧。
 st4 = run_flow(make_frame("投射"), badges=False)
 check("一个采样点击都没有", [c[0] for c in st4.clicks if c[0] != "坐标点击"], [])
 check("一次采样都没有", sample_order(st4), [])
-check("直接点决定", st4.decided, ["决定"])
+check("重取了 3 次帧", st4.frames, 3)
+check("兜底直接点决定", st4.decided, ["决定"])
 
 print("\n== 6. 默认项采样失败：只重取帧、不补点 ==")
 st5 = run_flow(make_frame("投射"), empty_skill="投射")
@@ -261,6 +271,24 @@ check("只采这两项", sample_order(st6), ["弹跳", "意识"])
 dec6 = find_audit(st6, "DECIDE")
 check("默认项没采到 → 不参与排名", "未采到，未参与排名" in dec6, True)
 check("仍然写出最终选择", "【最终选择】" in dec6, True)
+
+print("\n== 8. 残帧重取：第一帧扫不到角标，重取后正常 → 照常比较（不白扔训练）==")
+st7 = run_flow(make_frame("投射"), badges=False, badge_seq=[True])
+check("重取后照常比较（没被当坏帧放弃）", len(sample_order(st7)), 6)
+check("默认项仍第一个采", st7.trace[0], ("sample", "投射"))
+check("写出最终选择", "【最终选择】" in find_audit(st7, "DECIDE"), True)
+
+print("\n== 9. 角标一对一分配：相邻两行不共用同一个角标 ==")
+s9 = AutoTask.__new__(AutoTask)
+f9 = np.full((1080, 1920, 3), 40, dtype="uint8")
+rows9 = [{"t": "A", "cx": 1600, "cy": 500}, {"t": "B", "cx": 1600, "cy": 540}]
+# 只有一个角标 @(1700,480)：离 A 20px、离 B 40px → 只能给 A，B 不许抢
+check("同一个角标只给最近的一行", s9._badges_for_rows(f9, rows9, [(1700, 480)]),
+      {0: (1700, 480)})
+# 两个角标 @480/@540 → 各配一行
+check("两个角标各配一行", len(s9._badges_for_rows(f9, rows9, [(1700, 480), (1700, 540)])), 2)
+check("超纵向阈值的角标不分配", s9._badges_for_rows(f9, rows9, [(1700, 900)]), {})
+check("左侧（属性条区）的角标不分配", s9._badges_for_rows(f9, rows9, [(200, 490)]), {})
 
 print(f"\n=== 通过 {PASS} / 失败 {FAIL} ===")
 sys.exit(1 if FAIL else 0)

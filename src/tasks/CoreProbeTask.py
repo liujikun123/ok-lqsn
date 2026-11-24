@@ -76,8 +76,9 @@ class CoreProbeTask(AutoTask):
             return False
 
         marked = []
-        for r in rows:
-            spot = self._badge_near(frame, r)
+        asg = self._badges_for_rows(frame, rows)
+        for i, r in enumerate(rows):
+            spot = asg.get(i)
             if spot:
                 self.log_info(f"「{r['t']}」有角标 @({int(spot[0])},{int(spot[1])})")
                 marked.append(r)

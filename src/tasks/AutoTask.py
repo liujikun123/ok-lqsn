@@ -3234,42 +3234,93 @@ class AutoTask(MyBaseTask):
     MATE_STOP_WORDS = ("加成", "队友", "表情", "倍率", "一致", "额外", "组合", "概率",
                        "上限", "游戏厅", "公园", "餐厅", "步行街", "散步", "野餐", "划船")
 
-    def _badge_near(self, frame, row):
-        """技能胶囊右上角那枚橙色小人角标；没有就返回 None。
+    def _badge_blobs(self, frame):
+        """全图所有橙色小人角标的圆心 [(x, y), ...]。
 
-        尺寸自适应（2026-11-23）：原来用的是 1920x1080 下标出来的绝对像素
-        （偏移 40/190/110/25、角标 16~52px、面积 260）。玩家把窗口拖小或改成
-        1600x900 之后，角标同比缩小，下限 16px 会把最小的角标漏掉 → 明明有角标
-        却判成「没有」。现在统一按 1920x1080 折算成比例再乘回当前帧尺寸。
+        【2026-11-24 13:00 玩家质疑＋实测改造】玩家问「不可能会有一整天都没有角标
+        的情况，是不是角标识别不准」——对，是识别不准。旧 `_badge_near` 把搜索框
+        绑在 OCR 文本框上（`框右边缘 -40px ~ +190px`），有两个失效点：
+
+          1. OCR 框一旦偏了（日志里见过「文字框偏了 99px」），搜索框跟着偏，
+             角标就跑到框外；
+          2. 角标本身离胶囊右边缘约 83~87px（1600x900 实测），只要框宽多读进去
+             一截（比如把「Lv.1」并进框），搜索框起点右移，角标被切成两半，
+             面积/宽高比双重不过 → 判「没有」。
+
+        改成先全图扫一遍橙色小圆、再按纵向就近归属（见 `_badge_near`），
+        完全不看 OCR 框的横向位置。575 张真实训练核心帧实测：
+        **每帧 1~6 个角标，0 张是「全无」**（1个:3 帧 / 2个:55 / 3个:198 /
+        4个:259 / 5个:58 / 6个:2，均值 3.5）。
+        也就是说「六项全无角标」在真实对局里不存在 —— 出现即坏帧。
         """
         h, w = frame.shape[:2]
         sx, sy = w / 1920.0, h / 1080.0
-        b = row["b"]
-        x1 = max(int(b.x + b.width - 40 * sx), 0)
-        x2 = min(int(b.x + b.width + 190 * sx), w)
-        y1 = max(int(b.y - 110 * sy), 0)
-        y2 = min(int(b.y + 25 * sy), h)
-        if x2 <= x1 or y2 <= y1:
-            return None
-        roi = frame[y1:y2, x1:x2]
-        bb = roi[:, :, 0].astype(int)
-        gg = roi[:, :, 1].astype(int)
-        rr = roi[:, :, 2].astype(int)
+        bb = frame[:, :, 0].astype(int)
+        gg = frame[:, :, 1].astype(int)
+        rr = frame[:, :, 2].astype(int)
         m = ((rr > 195) & (gg > 105) & (gg < 195) & (bb < 95)).astype(np.uint8)
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
         cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = None
+        out = []
         for c in cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
+            # 尺寸按 1920x1080 折算（玩家改过窗口大小：1600x900 下角标只有 35px）
             if not (16 * sx <= bw <= 52 * sx and 16 * sy <= bh <= 52 * sy):
                 continue
             if not (0.6 < bw / max(bh, 1) < 1.7):
                 continue
             if bw * bh < 260 * sx * sy:
                 continue
-            if best is None or bw * bh > best[0]:
-                best = (bw * bh, (x1 + bx + bw / 2, y1 + by + bh / 2))
-        return best[1] if best else None
+            out.append((bx + bw / 2.0, by + bh / 2.0))
+        return out
+
+    def _badge_near(self, frame, row, blobs=None):
+        """技能行对应的橙色小人角标圆心；没有就返回 None。
+
+        单行便捷接口（证据脚本 / CoreProbe 用）。批量判定请用 `_badges_for_rows`，
+        它做了一对一分配，避免两行抢同一个角标。
+        """
+        return self._badges_for_rows(frame, [row], blobs).get(0)
+
+    def _badges_for_rows(self, frame, rows, blobs=None):
+        """给每个技能行分配角标，**一对一**（一个角标只能用一次）。返回 {行下标: 圆心}。
+
+        匹配方式（2026-11-24 改）：只看纵向，不看 OCR 框的横向位置。
+          · 横向只要落在技能胶囊列（`x > 0.62w`）即可 —— 角标贴在胶囊右上角外侧；
+          · 纵向按 `|角标y - 技能行cy|` 从小到大贪心分配，每个角标、每一行各用一次。
+
+        为什么要一对一：技能行间距实测约 108px，半距 54px。若阈值宽于半距，相邻两行
+        会同时「认领」同一个角标 → 本来没人的那项被判成有人，白采一轮还拉低排名。
+        贪心分配把这类抢用直接消掉。
+
+        阈值依据（1600x900 实测）：角标 y 比对应技能行中心高 43~45px（=0.048h），
+        取 0.055h（≈49.5px）刚好覆盖，又明显小于半距 54px。
+        """
+        if blobs is None:
+            blobs = self._badge_blobs(frame)
+        out = {}
+        if not blobs or not rows:
+            return out
+        h, w = frame.shape[:2]
+        dy_max = 0.055 * h
+        pairs = []
+        for ri, r in enumerate(rows):
+            for bi, (bx, by) in enumerate(blobs):
+                if bx < 0.62 * w:
+                    continue
+                dy = abs(by - r["cy"])
+                if dy > dy_max:
+                    continue
+                pairs.append((dy, ri, bi))
+        pairs.sort()
+        used_r, used_b = set(), set()
+        for dy, ri, bi in pairs:
+            if ri in used_r or bi in used_b:
+                continue
+            used_r.add(ri)
+            used_b.add(bi)
+            out[ri] = blobs[bi]
+        return out
 
     def _court_names(self, items, frame):
         """球场上站着的角色名（队友 + 主力），名字是 2~5 个字的小标签。
@@ -3406,6 +3457,46 @@ class AutoTask(MyBaseTask):
             return self._decide(items, frame)
         self.core_checked = True
 
+        # ── 角标扫描 + 坏帧重取 ──
+        # **扫不到可用的角标 = 坏帧，不是「今天没人」**。依据（2026-11-24 13:00）：
+        # 575 张真实训练核心帧，每帧都有 1~6 个角标（1个:3 / 2个:55 / 3个:198 /
+        # 4个:259 / 5个:58 / 6个:2，均值 3.5），**0 张是「全无」**。
+        # 实跑第 3 轮那 3 次「六项都没角标」，同时伴随「没认出默认选中态」
+        # 「只读到 5 个技能（缺防守）」「所有候选都没读到编队」—— 典型的刚切页、
+        # 胶囊和角标还在淡入的残帧。拿这种帧比较必然白扔一次训练。
+        # 所以：角标一个都扫不到，或者扫到了却一个都对不上技能行（OCR 行纵向偏了），
+        # 都先重取帧，最多 3 次；仍不行才降级到按默认项决定。
+        def _scan(fr, its):
+            bl = self._badge_blobs(fr)
+            rws = [it for it in its if it["t"] in self.SKILLS
+                   and it["cx"] / fr.shape[1] > 0.70]
+            rws.sort(key=lambda x: x["cy"])
+            asg = self._badges_for_rows(fr, rws, bl)
+            return bl, rws, [(rws[i], spot) for i, spot in sorted(asg.items())]
+
+        blobs, rows, targets = _scan(frame, items)
+        for attempt in range(1, 4):
+            if targets:
+                break
+            self.log_warning(f"角标不可用（全图 {len(blobs)} 个 / 技能区 {len(rows)} 项 / 对上 {len(targets)} 项）"
+                             f"→ 疑似坏帧，重取第 {attempt} 次")
+            self.sleep(0.5)
+            f2 = self._frame()
+            if f2 is None:
+                continue
+            items = self._texts(f2)
+            b2, r2, t2 = _scan(f2, items)
+            frame, blobs, rows, targets = f2, b2, r2, t2
+            if not rows:
+                self.log_warning("重取后的帧读不到技能胶囊 → 直接按默认项决定")
+                return self._decide(items, frame)
+        if not targets:
+            self.log_warning("连续重取 3 次仍拿不到可用角标 → 按坏帧处理，直接按默认项决定")
+            return self._decide(items, frame)
+        if attempt:
+            self.log_info(f"重取第 {attempt} 次后角标可用：全图 {len(blobs)} 个，对上 {len(targets)} 项")
+        self.log_info(f"角标扫描：全图 {len(blobs)} 个橙色小人，技能区 {len(rows)} 项，有角标 {len(targets)} 项")
+
         # 2026-11-23 玩家指出（14 次实跑全部验证）：训练核心页默认选中的是「投射」，
         # 再点它一次游戏就当作确认开训，3~4 秒后直接跳「训练结果」，整次编队比较作废。
         # 所以当前高亮的那一项只读不点；实测深蓝胶囊就是选中态，用画面认，不写死。
@@ -3423,18 +3514,13 @@ class AutoTask(MyBaseTask):
         #     没角标 = 一定没人 → 队友恒为 0，采它只是白烧几帧 OCR，还可能把误读的名字
         #     当成队友抬分、误导排名。
         # 注：11:xx 那版曾按"角标只是当天加成"把六项全采，是理解错了，已回滚。
-        targets = []
+        hit = {id(r): s for r, s in targets}
         for r in rows:
-            spot = self._badge_near(frame, r)
+            spot = hit.get(id(r))
             if spot:
-                targets.append((r, spot))
                 self.log_info(f"「{r['t']}」右上角有角标 @({int(spot[0])},{int(spot[1])}) → 有人，采")
             else:
                 self.log_info(f"「{r['t']}」没有角标 → 没人，跳过")
-        if not targets:
-            # 六项都没人：练哪项队友都是 0，区分只剩失败率与器材，不值得逐项点开。
-            self.log_warning("六项都没角标（都没人）→ 直接按默认选中项决定，不采样")
-            return self._decide(items, frame)
 
         # 器材基线：进页面这一帧先读一次。卡片是**淡入淡出**的（实测同一场训练里
         # 4 个技能帧分别读到 2/1/0/0 张），而同一场带的器材是固定的 ——
