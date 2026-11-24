@@ -102,8 +102,16 @@ def main():
     allok &= check("只剩 0% 的两项", sorted(d["row"]["t"] for d in kept), ["弹跳", "投射"])
 
     allbad = [item("投射", 2, "LV.1", 40), item("防守", 2, "LV.1", 50)]
-    allok &= check("全都 >0% → 保留全部（没得挑）",
-                   len(s._apply_fail_limit(allbad, cfgl)), 2)
+    # 2026-11-24 新口径（strict_fallback: min_fail）：全都 >0% 时不再「保留全部随便赌」，
+    #   只留失败率最低的那档。全部 >30% 时 _force_skill_when_risky 会改练意识。
+    allok &= check("全都 >0% → 只留最低失败率那档",
+                   len(s._apply_fail_limit(allbad, cfgl)), 1)
+    allok &= check("最低档确实是 40% 那项",
+                   sorted(d["row"]["t"] for d in s._apply_fail_limit(allbad, cfgl)), ["投射"])
+    # 老行为（strict_fallback: old）仍可切回来：退回原排名，全部保留
+    cfgl_old = dict(cfgl, strict_fallback="old")
+    allok &= check("strict_fallback=old → 退回全部",
+                   len(s._apply_fail_limit(allbad, cfgl_old)), 2)
 
     print("--- 失败率 30 以内可以赌（玩家 2026-11-23：收益高的话 <30 都能去）---")
     cfg30 = dict(CFG, fail_limit=30)

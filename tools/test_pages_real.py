@@ -200,12 +200,29 @@ check("扭蛋选择页不算购买弹窗",
       s._is_buy_popup("扭蛋选择", items("请选择1个扭蛋 精力恢复++ 精力补充 意识增加+ 确定".split())), False)
 check("商店页不算购买弹窗",
       s._is_buy_popup("商店", items("精力饮料 购买 30".split())), False)
-check("未知页购买浮层→弹窗",
-      s._is_buy_popup("未知", items("第5周 星期7 24/130 购买并 精力".split())), True)
-check("每日页购买浮层→弹窗",
-      s._is_buy_popup("每日页", items("第4周 星期5 5/253 购买 体力".split())), True)
+# 2026-11-24 修：这两条夹具原来写的是 True —— 也就是把「词共现就弹窗」的 bug
+# 当成了正确行为。15:29 实跑就是因为「购买 + 精力」判成体力不足弹窗 →
+# 找不到取消 → 点左上角 → 连点 600+ 步空转。买药后的浮层根本不是弹窗。
+check("买药后的购买并使用浮层→不是弹窗",
+      s._is_buy_popup("未知", items("第5周 星期7 24/130 购买并 精力".split())), False)
+check("15:29 连点600步那一次的页面→不是弹窗",
+      s._is_buy_popup("每日页", items("第4周 星期5 5/253 购买 体力".split())), False)
+# 真弹窗必须有取消类按钮，才允许按「绝不点购买」处理
+check("带取消的真体力不足弹窗→弹窗",
+      s._is_buy_popup("未知", items("体力不足 购买 取消".split())), True)
+check("只有购买没有取消→交给推进器",
+      s._is_buy_popup("未知", items("体力不足 购买 150".split())), False)
 check("只有补充没有购买→不算弹窗",
       s._is_buy_popup("未知", items("精力补充 体力".split())), False)
+
+# 2026-11-24 08:49 实跑第2周：训练结果「数字滚动」残缺帧，底栏只被 OCR 读到两项属性
+# （「投射 B 475」「运控 S 1,194」），凑不够 7.4b 的 >=3 项 -> 判未知页 pause，整轮断在这。
+anim = "35 投射 B 475 运控 1,194".split()
+check("训练结果计数动画残缺帧→训练结果",
+      s._classify(items(anim, right_skills=False), None), "训练结果")
+# 反向：训练核心页底部也是同款属性条，但有「决定」按钮，不能被 7.4c 抢走
+core_like = "第7周 星期2 精力97/130 投射 B 475 运控 1,194 弹跳 防守 体能 意识 决定".split()
+check("带决定的训练核心→训练核心", s._classify(items(core_like), None), "训练核心")
 
 print(f"\n=== 通过 {PASS} / 失败 {FAIL} ===")
 sys.exit(1 if FAIL else 0)

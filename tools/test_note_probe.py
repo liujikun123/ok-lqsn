@@ -88,7 +88,11 @@ def make_stub():
     s.config = {"扭蛋目标关键词": "笔记,继承", "扭蛋最高价": 120,
                 "等待秒数": 0.01, "训练精力下限": 12}
     s._tuning = lambda: {"trip": {"probe_notes_first": True}, "audit": {"enabled": False}}
-    s._frame = lambda: None
+    # 点完右上角后画面会变（真机就是这样）：给一帧纯白，让 _frame_diff 直接超阈值。
+    # 原来返回 None，导致 _leave_top_right 认为「没退出去」又点了备用坐标 (0.943,0.065)，
+    # 测试里就变成两次点击 —— 那是 2026-11-24 10:01 加了备用坐标后测试没跟着更新。
+    s._frame = lambda: np.full_like(FRAME, 255)
+    s._texts = lambda f: []          # 桩里没有 OCR 引擎，取帧后的补点一律按空处理
     s._click_confirm = lambda items, frame: True
     s.sleep = lambda x: None
     s._find = lambda items, words, exact=True: None
@@ -181,7 +185,11 @@ s._btn_in_area = btn
 s._shop_button = lambda items, frame: None
 s._do_daily(DAILY, FRAME)
 check("周六先点「出行」探笔记", [c[0] for c in s.clicked][:1], ["出行"])
-check("当天已记账", s.trip_probe_done, "3-六")
+# 2026-11-24 改口径：点「出行」只是**发起**，不算探完 —— 只有真进了出行页才记账。
+# 旧断言「点完就记账」正是第七周周六漏探笔记的原因（点击被 FLUTTERVIEW 挡住，
+# 页面还在每日页，却已经记成探过了）。
+check("点完不立刻记账（等进了出行页再记）", s.trip_probe_done, None)
+check("重试计数 +1", s.trip_probe_retry, 1)
 check("置 trip_probe=True", s.trip_probe, True)
 
 s2 = make_stub()
@@ -207,8 +215,46 @@ s3.stamina = 8
 s3._read_week = lambda items: (3, "日")
 s3._do_daily(SUNDAY, FRAME)
 check("周日先点「出行」探笔记", [c[0] for c in s3.clicked][:1], ["出行"])
-check("周日已记账 3-日", s3.trip_probe_done, "3-日")
+check("周日同样等进页面才记账", s3.trip_probe_done, None)
 check("周日置 trip_probe=True", s3.trip_probe, True)
+
+print("\n== 8b. 点出行没生效（被遮挡）→ 重试，3 次才放弃 ==")
+# 2026-11-24 11:38 实况：第七周周六点「出行」时目标被 FLUTTERVIEW 盖住，
+# 置顶后仍然没点进去，页面还在每日页。旧代码已经记成「今天探过」→ 直接去训练，
+# 那一周的笔记检查就这么漏掉了。现在必须重试满 3 次才放弃今天。
+s4 = make_stub()
+s4._btn_in_area = btn
+s4._shop_button = lambda items, frame: None
+s4.trip_probe_done = None
+s4.trip_probe_retry = 0
+s4.trip_probe_retry_day = "3-六"
+s4._do_daily(DAILY, FRAME)          # 第 1 次点击（没点进去）
+check("第1次：再点出行", [c[0] for c in s4.clicked][:1], ["出行"])
+check("第1次：仍未记账", s4.trip_probe_done, None)
+s4._do_daily(DAILY, FRAME)          # 第 2 次（还没进去）
+check("第2次：继续重试", [c[0] for c in s4.clicked][-1], "出行")
+check("第2次：仍未记账", s4.trip_probe_done, None)
+s4._do_daily(DAILY, FRAME)          # 第 3 次
+check("第3次：还在重试", s4.trip_probe_retry, 3)
+s4.clicked.clear()
+s4._do_daily(DAILY, FRAME)          # 第 4 帧：达到上限 → 改走训练
+check("3 次失败后改点训练", [c[0] for c in s4.clicked][:1], ["训练"])
+check("放弃探笔记会明写原因", any("放弃探笔记" in x for x in s4.logs), True)
+
+print("\n== 8c. 真进了出行页 → 立刻记账、清重试计数 ==")
+s5 = make_stub()
+s5._btn_in_area = btn
+s5.trip_probe = True
+s5.trip_probe_retry = 2
+s5.trip_probe_done = None
+s5._day_key = lambda items: "3-六"
+TRIP = [it("第3周", 100, 42), it("星期六", 256, 42), it("步行街", 900, 770)]
+try:
+    s5._do_trip(TRIP, FRAME)
+except Exception:
+    pass                            # 出行页后续动作依赖桩，只验证记账
+check("进出行页后记账", s5.trip_probe_done, "3-六")
+check("进出行页后重试计数归零", s5.trip_probe_retry, 0)
 check("周日没去点休息", all("休息" not in c[0] for c in s3.clicked), True)
 
 s4 = make_stub()

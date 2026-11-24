@@ -29,6 +29,9 @@ import win32gui
 import win32process
 from PIL import ImageGrab
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import devkit  # noqa: E402  窗口/抓屏/OCR 共用件（tools/devkit.py）
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -59,7 +62,7 @@ BACK_WORDS = ("«", "<<", "‹", "返回")
 # 注意别把「适龄提示」写进来 —— 公告弹窗底部也有这四个字，会把公告页误判成忠告页
 BOOT_HINTS = ("健康游戏忠告", "抵制不良游戏", "检查更新", "游戏初始化", "当前版本号")
 # 弹窗右上角 × 的模板（深色粗体 X + 白描边，OCR 认不出来，只能靠模板）
-X_TEMPLATE = os.path.join(ROOT, "assets", "templates", "x_close.png")
+X_TEMPLATE = os.path.join(ROOT, "assets", "misc", "x_close.png")
 X_MIN_SCORE = 0.80
 
 
@@ -143,9 +146,9 @@ def bring_front(hwnd):
 # ────────────────────────── 截图 / OCR ──────────────────────────
 class Vision:
     def __init__(self):
-        from onnxocr.onnx_paddleocr import ONNXPaddleOcr
-
-        self.ocr = ONNXPaddleOcr(use_angle_cls=False, use_openvino=True)
+        # OCR 引擎和参数统一走 tools/devkit.py（必须 use_npu + use_openvino，
+        # 原来这里只传 openvino，和项目实跑用的不是同一个后端）
+        self.ocr = devkit.engine()
         self.x_tpl = cv2.imread(X_TEMPLATE) if os.path.exists(X_TEMPLATE) else None
 
     def grab(self, rect):
@@ -178,34 +181,14 @@ class Vision:
         return None
 
     def items(self, frame):
-        res = self.ocr.ocr(frame) or []
-        out = []
+        """OCR 结果 → 带像素框和相对坐标的行（解析逻辑在 devkit.ocr_rows 里只写一份）。"""
         h, w = frame.shape[:2]
-        for line in res[0] if res and isinstance(res[0], list) else res:
-            try:
-                box, (text, score) = line[0], line[1]
-            except Exception:
-                continue
-            text = (text or "").strip()
-            if not text:
-                continue
-            xs = [p[0] for p in box]
-            ys = [p[1] for p in box]
-            x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-            out.append(
-                {
-                    "t": text,
-                    "x": x0,
-                    "y": y0,
-                    "w": x1 - x0,
-                    "h": y1 - y0,
-                    "cx": (x0 + x1) / 2,
-                    "cy": (y0 + y1) / 2,
-                    "rx": (x0 + x1) / 2 / w,
-                    "ry": (y0 + y1) / 2 / h,
-                }
-            )
-        return out
+        return [
+            {"t": t, "x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+             "cx": (x1 + x2) / 2, "cy": (y1 + y2) / 2,
+             "rx": (x1 + x2) / 2 / w, "ry": (y1 + y2) / 2 / h}
+            for x1, y1, x2, y2, t, _conf in devkit.ocr_rows(frame)
+        ]
 
 
 def find(items, words, near=None, radius=None):

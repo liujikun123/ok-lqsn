@@ -59,11 +59,19 @@ class Stub:
     def click_relative(self, x, y): self.logs.append(("click", f"rel {x},{y}"))
     def _event_cards(self, frame, items): return []
     def sleep(self, sec): self.logs.append(("sleep", sec))
+    # 2026-11-24：未知页默认改「通用推进器」，这里补齐它依赖的最小接口。
+    # _frame 恒返回 None = 点完看不到画面变化，正好能测「推不动时的退让逻辑」。
+    def _frame(self): return None
+    def click(self, x, y): self.logs.append(("click", f"{x},{y}"))
+    def send_key(self, k): self.logs.append(("key", k))
+    def _match_template(self, frame, name, threshold=0.85): return None
 
 
 for m in ("_match_overlay", "_do_unknown", "_print_summary", "_is_loading_frame",
-          "_looks_transient", "_check_transition"):
+          "_looks_transient", "_check_transition", "_advance_generic", "_click_close_x",
+          "_color_buttons", "_text_on_button", "_danger_button", "_frame_diff"):
     setattr(Stub, m, getattr(AutoTask, m))
+Stub.ADVANCE_WORDS = AutoTask.ADVANCE_WORDS
 
 
 def items(*texts):
@@ -98,12 +106,27 @@ for texts, want in [
     hit = s._match_overlay(items(*texts))
     check(f"指纹 {texts[0]}", hit[0] if hit else None, want)
 
-print("--- 2. 未知页默认 pause ---")
+print("--- 2. 未知页：默认交给通用推进器，不再停机 ---")
 s = Stub()
 r = s._do_unknown(items("完全没见过的画面"), frame)
-check("没见过 → 暂停", r, None)
+check("没见过 → 不暂停（推进器接管）", r, True)
+check("有「推进器」日志", any(x[0] == "warn" and "推进器" in x[1] for x in s.logs), True)
+check("尝试过点击/按键", any(x[0] in ("click", "key") for x in s.logs), True)
+check("没有 error 停机", any(x[0] == "error" for x in s.logs), False)
+
+print("--- 2b. 显式配置 pause 仍然停机（排查用） ---")
+s = Stub()
+s.config = {"未知页面兜底": "暂停"}
+r = s._do_unknown(items("完全没见过的画面"), frame)
+check("配置暂停 → 停机", r, None)
 check("有 error 日志", any(x[0] == "error" for x in s.logs), True)
 check("存了截图", any("unknown" in x for x in s.shots), True)
+
+print("--- 2c. 推进器连续推不动会退让（有上限，不会无限刷） ---")
+s = Stub()
+res = [s._do_unknown(items("完全没见过的画面"), frame) for _ in range(8)]
+check("前几步继续跑", res[:5], [True] * 5)
+check("到上限后停机", res[-1], None)
 
 print("--- 3. 已知浮层走 next，不算未知 ---")
 s = Stub()
@@ -218,7 +241,9 @@ check("疑似过场有宽限日志", any("过场宽限" in str(m) for _, m in s.
 s2 = Stub()
 rs = [s2._do_unknown(dash, anim2) for _ in range(6)]
 check("前4步都等待", rs[:4], [True] * 4)
-check("第5步起不再等待", rs[4], None)
+# 2026-11-24：宽限用完后不再走 pause，而是交给通用推进器（有上限，推不动才停）
+check("第5步起不再等待、交给推进器", rs[4], True)
+check("第5步有推进器日志", any("推进器" in str(m) for _, m in s2.logs), True)
 check("超时应有警告", any("连续 4 步仍" in str(m) for _, m in s2.logs), True)
 
 print("--- 3.5 页面转移软约束（只警告不拦截）---")

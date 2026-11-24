@@ -8,6 +8,7 @@
 页面判定顺序很重要：越特殊、字数越独特的规则越靠前。
 历史上翻车两次都是「通用兜底」抢在「具体页面」前面。
 """
+import json
 import os
 import re
 import time
@@ -19,11 +20,19 @@ import cv2
 
 from src.core.cards import card_glow, find_cards
 from src.tasks.MyBaseTask import MyBaseTask
+from ok.feature.Box import Box, find_box_by_name, find_boxes_by_name
+from ok.util.color import find_color_rectangles
 
 # 主按钮候选，按优先级排列（越靠前越优先）
 CONFIRM = ["开始训练", "确认编队", "确定", "决定", "确认", "启程", "下一步", "继续", "开始", "进入"]
 SKIP = ["跳过", "点击屏幕继续"]
 STOP_WORDS = ["关闭", "取消", "返回"]
+
+# 按钮配色（框架 ok.util.color.find_color_rectangles 用 BGR 三通道区间）
+BTN_YELLOW = {"b": (0, 150), "g": (120, 255), "r": (170, 255)}
+BTN_BLUE = {"b": (120, 255), "g": (55, 210), "r": (0, 145)}
+# 通用推进器绝不点的「花钱」字样
+DANGER_TEXT = ("购买", "充值", "支付", "￥", "¥", "钻石", "礼包", "首充", "月卡")
 
 WEEKDAYS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7}
 
@@ -123,7 +132,11 @@ class AutoTask(MyBaseTask):
 
     # 底部出现「成排黄卡片」时，允许把误判纠正成事件页的页面集合。
     # 抽成常量便于回归测试断言（21:34 二选一事件页被判「行程结果」卡死）。
-    EVENT_CORRECT_PAGES = ("未知", "每日页", "训练结束", "剧情事件", "选项", "行程结果")
+    # 2026-11-24 09:01 实跑：把「训练结束」从这个白名单里拿掉 —— 收尾页底部本来就有
+    # 一排球员缩略卡（黄底），被 _event_cards 当成事件卡 → 判成剧情事件 →
+    # 点中「6181」那张球员卡，弹出「注册球员」属性面板（无前进按钮），
+    # 之后连点 12 步不动，第 1 轮就断在这里（训练评分 8521 已经拿到）。
+    EVENT_CORRECT_PAGES = ("未知", "每日页", "剧情事件", "选项", "行程结果")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -156,6 +169,12 @@ class AutoTask(MyBaseTask):
         # 运行期状态统一在这里初始化：CheckTask / StepTask 这类子类不走 run()，
         # 否则会 AttributeError（体检任务第一次跑就踩到了）。
         self.notes_done = False
+        # 视觉层（2026-11-24）：页面指纹库懒加载；通用推进器失败计数；
+        # 上一步页面（马尔可夫硬约束要用）
+        self._anchor_cache = None
+        self._anchor_hits = {}
+        self._last_page_hint = None
+        self._advance_fails = 0
         # 局内精力（每日页 a/b，上限约 130）：训练/休息决策的唯一依据
         self.stamina = None
         self.stamina_max = None
@@ -171,7 +190,13 @@ class AutoTask(MyBaseTask):
         #   有 → 直接出行；没有 → 退回每日页走训练。
         #   用「第N周-星期X」记今天已经探过，避免同一天反复进出。
         self.trip_probe = False          # 本次进出行页是「探笔记」，不是真要出行
-        self.trip_probe_done = None      # 已经探过的那天，例如 "6-7"
+        self.trip_probe_done = None      # **真的进过**出行页的那天，例如 "6-7"
+        # 2026-11-24 第七周周六漏探笔记的根因：旧代码在**点击之前**就写 done，
+        # 点「出行」被 FLUTTERVIEW 挡住时页面还在每日页，却被记成「今天探过了」，
+        # 下一帧直接走训练分支。现在 done 只在真正进入出行页时才写，
+        # 这里单独记「试了几次还没进去」，最多重试 3 次。
+        self.trip_probe_retry = 0        # 当天点了出行但没进页面的次数
+        self.trip_probe_retry_day = None # 上面那个计数属于哪一天
         self.trip_probe_disabled = False # 兼容旧状态；现在不再置 True（退回失败只放弃当天）
         self.trip_back_tries = 0         # 本次退出出行页试了几次
         # 探笔记的「两级右上角返回」还剩几层：2=扭蛋三选一页, 1=出行页, 0=无
@@ -449,20 +474,52 @@ class AutoTask(MyBaseTask):
         return None
 
     def _texts(self, frame):
+        """框架 OCR 结果 → 轻量文本视图。
+
+        框架 `self.ocr()` 返回的就是 `Box` 列表（name = 识别出的文字），这里只做一层
+        「下标 + 中心点」投影，让 100 多处 `it["t"] / it["cx"]` 不用同时改。
+        **匹配与点击已经全部走框架**（find_box_by_name / find_boxes_by_name / click_box），
+        这一层不再包含任何自己的算法 —— 2026-11-24 去重。
+        """
         boxes = self.ocr(frame=frame) or []
         return [{"b": b, "t": (b.name or "").strip(),
                  "cx": (b.x + b.width / 2), "cy": (b.y + b.height / 2)} for b in boxes]
 
     def _find(self, items, words, exact=False):
-        for it in items:
+        """按词找第一个命中的文字框（框架 find_box_by_name）。
+
+        exact=True  → 整串相等；
+        exact=False → 子串（转成正则交给框架，不再自己遍历）。
+        与老实现的一个差别：**词的先后顺序现在有优先级**（框架语义）——
+        `["取消", "关闭"]` 会优先返回「取消」，而不是屏幕上先出现的那个。
+        """
+        if not items:
+            return None
+        if isinstance(words, str):
+            words = [words]
+        boxes = [it["b"] for it in items if it.get("b") is not None]
+        if not boxes:      # 测试里手工构造的裸 dict（只有 t/cx/cy）
             for w in words:
-                if (it["t"] == w) if exact else (w in it["t"]):
-                    return it
-        return None
+                for it in items:
+                    if (it["t"] == w) if exact else (w in it["t"]):
+                        return it
+            return None
+        pats = list(words) if exact else [re.compile(re.escape(w)) for w in words]
+        hit = find_box_by_name(boxes, pats)
+        if hit is None:
+            return None
+        return next((it for it in items if it.get("b") is hit), None)
 
     def _all(self, items, pat):
-        rx = re.compile(pat)
-        return [it for it in items if rx.search(it["t"])]
+        """按正则找全部命中的文字框（框架 find_boxes_by_name）。"""
+        if not items:
+            return []
+        boxes = [it["b"] for it in items if it.get("b") is not None]
+        if not boxes:
+            rx = re.compile(pat)
+            return [it for it in items if rx.search(it["t"])]
+        hits = set(id(b) for b in find_boxes_by_name(boxes, [re.compile(pat)]))
+        return [it for it in items if id(it.get("b")) in hits]
 
     def _yellow_btn_center(self, frame, it):
         """在文字框周围找**真实的黄色按钮矩形**，返回其中心（找不到返回 None）。
@@ -471,6 +528,9 @@ class AutoTask(MyBaseTask):
         而按钮实体在 y 980~1052、中心 (1583,1016) —— 照着 OCR 坐标点会落在按钮上方空白处。
         这一页连点 15 次都没反应，最后靠「连续 15 步无变化」停机。
         所以凡是"黄底大字"的主按钮（确定/决定/开始训练…），一律以黄色矩形为准。
+
+        2026-11-24 去重：原来自己写 HSV 掩膜 + 闭运算 + 轮廓筛选，
+        改成框架 find_color_rectangles（同样的活，带填充率阈值），少一份重复实现。
         """
         if frame is None:
             return None
@@ -479,26 +539,19 @@ class AutoTask(MyBaseTask):
         x2 = min(int(it["cx"] + 0.30 * w), w)
         y1 = max(int(it["cy"] - 0.06 * h), 0)
         y2 = min(int(it["cy"] + 0.14 * h), h)
-        patch = frame[y1:y2, x1:x2]
-        if patch.size == 0:
+        if x2 - x1 < 20 or y2 - y1 < 16:
             return None
-        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        m = cv2.inRange(hsv, np.array((16, 110, 160)), np.array((42, 255, 255)))
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
-        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = None
-        for c in cnts:
-            bx, by, bw, bh = cv2.boundingRect(c)
-            if bw < 0.08 * w or bh < 0.025 * h:
-                continue
-            if not (2.5 <= bw / float(bh) <= 14):
-                continue
-            if best is None or bw * bh > best[0]:
-                best = (bw * bh, bx, by, bw, bh)
-        if not best:
+        try:
+            rects = find_color_rectangles(
+                frame, BTN_YELLOW,
+                min_width=int(0.08 * w), min_height=int(0.025 * h),
+                threshold=0.50, box=Box(x1, y1, x2 - x1, y2 - y1))
+        except Exception:
+            rects = []
+        if not rects:
             return None
-        _, bx, by, bw, bh = best
-        return (bx + x1 + bw / 2.0, by + y1 + bh / 2.0)
+        r = max(rects, key=lambda b: b.width * b.height)
+        return r.x + r.width / 2.0, r.y + r.height / 2.0
 
     # ---------- 焦点根治：所有点击/按键前强制确认游戏前台 ----------
 
@@ -511,7 +564,82 @@ class AutoTask(MyBaseTask):
         向日葵远程、切窗口看资料、输入法候选框都会抢焦点，所以必须每次点击前确认。
         """
         self._ensure_foreground()
+        x = args[0] if len(args) > 0 else kwargs.get("x")
+        y = args[1] if len(args) > 1 else kwargs.get("y")
+        if (isinstance(x, (int, float)) and isinstance(y, (int, float))
+                and not isinstance(x, bool) and self._blocked_at(x, y)):
+            # 2026-11-24 10:00 实跑踩坑：日志一直点右上角 ↩，画面 15 步零变化。
+            # 真相不是「弹窗退不出去」，而是 WorkBuddy 自己的覆盖窗口压住了游戏右上角，
+            # 鼠标事件被它截走（WindowFromPoint 打出来是 FLUTTERVIEW）。
+            # 判断「窗口在前台」骗过了所有人：前台确实是游戏，但坐标处最顶层的不是它。
+            self._click_topmost(x, y)
+            return
         return super().click(*args, **kwargs)
+
+    def _game_hwnd(self):
+        try:
+            import win32gui
+            return win32gui.FindWindow(None, "篮球少女：飞跃巅峰") or 0
+        except Exception:
+            return 0
+
+    def _blocked_at(self, cx, cy):
+        """目标点最顶层的窗口是不是游戏自己。False=没被挡，True=被别人盖住了。"""
+        h = self._game_hwnd()
+        if not h:
+            return False
+        try:
+            import win32gui
+            sx, sy = win32gui.ClientToScreen(h, (int(cx), int(cy)))
+            top = win32gui.WindowFromPoint((sx, sy))
+            if not top:
+                return False
+            root = top
+            while True:
+                parent = win32gui.GetParent(root)
+                if not parent:
+                    break
+                root = parent
+            return root != h
+        except Exception:
+            return False
+
+    def _click_topmost(self, cx, cy):
+        """被别的窗口盖住时的点击：临时把游戏置顶 → 原生鼠标事件 → 恢复。
+
+        只在这一种情况下动手（正常路径不走这里），避免每次点击都折腾窗口层级。
+        """
+        h = self._game_hwnd()
+        now = time.time()
+        if now - getattr(self, "_blocked_log_ts", 0.0) >= 3.0:
+            self._blocked_log_ts = now
+            try:
+                import win32gui
+                sx, sy = win32gui.ClientToScreen(h, (int(cx), int(cy)))
+                cover = win32gui.GetWindowText(win32gui.WindowFromPoint((sx, sy)))
+            except Exception:
+                cover = "?"
+            self.log_warning(f"目标点 ({int(cx)},{int(cy)}) 被「{cover}」挡住 → 临时置顶游戏再点")
+        try:
+            import win32api
+            import win32con
+            import win32gui
+            win32gui.SetWindowPos(h, win32con.HWND_TOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002)
+            time.sleep(0.12)
+            sx, sy = win32gui.ClientToScreen(h, (int(cx), int(cy)))
+            win32api.SetCursorPos((sx, sy))
+            time.sleep(0.05)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            time.sleep(0.12)
+            win32gui.SetWindowPos(h, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002)
+        except Exception as e:
+            self.log_warning(f"置顶点击失败，退回普通点击：{e}")
+            try:
+                super().click(cx, cy)
+            except Exception:
+                pass
 
     def send_key(self, *args, **kwargs):
         """键盘同理：PynputInteraction.send_key() 也检查 clickable()。"""
@@ -519,8 +647,14 @@ class AutoTask(MyBaseTask):
         return super().send_key(*args, **kwargs)
 
     def _click_item(self, it, why=""):
+        """点一个文字框：坐标计算交给框架 click_box（它内部会调我们的 click 覆盖层）。"""
         self.log_info(f"点击「{it['t']}」@({int(it['cx'])},{int(it['cy'])}) {why}")
-        self.click(it["cx"], it["cy"])
+        b = it.get("b")
+        if b is not None:
+            # after_sleep=0：节奏仍由下面的 sleep 显式控制（和改造前一致）
+            self.click_box(b, relative_x=0.5, relative_y=0.5, after_sleep=0)
+        else:
+            self.click(it["cx"], it["cy"])
 
     def _btn_center(self, frame, it, reach=0.28):
         """在文字附近找**按钮实体矩形**，返回它的中心；找不到返回 None。
@@ -734,7 +868,14 @@ class AutoTask(MyBaseTask):
         self.log_warning(f"{page}：发现 {len(slots)} 个空槽（还没选）@ {pos}")
         self._shot(frame, f"empty_slots_{page}")
 
-        if cfg.get("auto_fill_first", False) and self.slots_autofill < int(cfg.get("max_auto_fill") or 1):
+        # 自动补空槽：两个开关，默认都不开（玩家的原话是「有空槽就停下弹窗，不许代选」）。
+        #   auto_fill_first  = 三页通用（老开关）
+        #   auto_fill_equip  = 只对「器材选择」页（2026-11-24 新增）
+        #     器材是训练核心中场那 1~3 张支援卡，空一个槽 = 白扔一份加成（彩光 1.5 / 金光 1.0），
+        #     也是评分卡在 8000+ 上不去 9000 的原因之一。要冲分就把这个开关打开。
+        auto_ok = bool(cfg.get("auto_fill_first", False)) or (
+            page == "器材选择" and bool(cfg.get("auto_fill_equip", False)))
+        if auto_ok and self.slots_autofill < int(cfg.get("max_auto_fill") or 1):
             auto = self._find(items, ["自动选择", "自动填充"], exact=True)
             if auto:
                 self.slots_autofill += 1
@@ -745,12 +886,14 @@ class AutoTask(MyBaseTask):
 
         if cfg.get("on_empty", "暂停提示") == "暂停提示":
             self._shot(frame, f"pause_empty_{page}")
+            hint = ("\n\n（想让脚本自己补满器材槽：strategy.yaml → pick_slots.auto_fill_equip: true）"
+                    if page == "器材选择" else "")
             self._alert_popup(
                 "篮球少女：编队有空位，已暂停",
                 f"「{page}」还有 {len(slots)} 个空位（带黄色「+」的格子）没选。\n\n"
                 f"脚本不会替你自动选择，已停在这里等你配好编队。\n"
                 f"配好后重新运行即可继续。\n\n"
-                f"截图：screenshots/auto/pause_empty_{page}_*.png")
+                f"截图：screenshots/auto/pause_empty_{page}_*.png" + hint)
             self.log_error(f"{page} 还有 {len(slots)} 个空槽没选 —— 按你的要求不自动补，"
                            f"已暂停并在桌面弹出提示", notify=True)
             return "pause"
@@ -916,8 +1059,19 @@ class AutoTask(MyBaseTask):
         """
         if page in ("专注恢复", "体力恢复", "扭蛋选择", "扭蛋机", "商店"):
             return False
-        joined = " ".join(it["t"] for it in items)
-        return "购买" in joined and ("体力" in joined or "精力" in joined)
+        texts = [it["t"].strip() for it in items]
+        joined = " ".join(texts)
+        if "购买" not in joined or not ("体力" in joined or "精力" in joined):
+            return False
+        # 2026-11-24 修死循环：原来只看「购买 + 体力/精力」词共现。
+        # 商店买精力药水后弹的「购买并使用 精力药水」浮层（8~9 段字、没有取消键）
+        # 被判成体力不足弹窗 → 找不到「取消」就点左上角 → 连点 600+ 步空转。
+        # 真弹窗一定带「取消/暂不/以后再说/关闭/放弃」之一；没有就不是弹窗，
+        # 交给浮层表或通用推进器处理。
+        if any(("购买并" in t) or ("并使用" in t) for t in texts):
+            return False
+        return any(t in ("取消", "暂不", "以后再说", "关闭", "放弃", "算了")
+                   or ("取消" in t and len(t) <= 4) for t in texts)
 
     def _is_event_reply(self, items, frame):
         """8.2 事件二选一之后的「回应对话」页（2026-11-23 21:59 实跑）。
@@ -945,7 +1099,178 @@ class AutoTask(MyBaseTask):
         return any(len(re.sub(r"[^\u4e00-\u9fff]", "", it["t"])) >= 10
                    for it in body)
 
+    # ---------------- 页面判定：OCR 关键词 + 框架锚点 融合 ----------------
+
+    def _log_quiet(self, msg, warn=False):
+        """日志失败不影响流程（离线测试里 __new__ 出来的对象没有 logger）。"""
+        try:
+            (self.log_warning if warn else self.log_info)(msg)
+        except Exception:
+            pass
+
+    def _anchor_meta(self):
+        """读 assets/anchors.json（tools/build_anchors.py 生成）。
+
+        结构：{"pages": {页面: {anchors: [锚点名], need: 命中几个算这页}},
+               "anchors": {锚点名: {region: [rx,ry,rw,rh], proto: 原型文件}}}
+        region 是匹配范围（相对坐标）—— 限制在小块区域里找，又快又不会满屏乱配。
+        """
+        if getattr(self, "_anchor_cache", None) is not None:
+            return self._anchor_cache
+        cfg = self._tuning().get("anchors") or {}
+        self._anchor_enabled = bool(cfg.get("enabled", True))
+        self._anchor_thr = float(cfg.get("threshold", 0.8))
+        meta = {"pages": {}, "anchors": {}}
+        if self._anchor_enabled:
+            try:
+                root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                path = cfg.get("file") or "assets/anchors.json"
+                if not os.path.isabs(path):
+                    path = os.path.join(root, path)
+                with open(path, encoding="utf-8") as f:
+                    meta = json.load(f) or meta
+                self._log_quiet(f"[锚点] 载入 {len(meta.get('pages', {}))} 页 / "
+                                f"{len(meta.get('anchors', {}))} 个锚点")
+            except Exception as e:
+                self._log_quiet(f"[锚点] 载入失败，本次只用 OCR 判页：{e}", warn=True)
+        self._anchor_cache = meta
+        return meta
+
+    def _anchor_page(self, frame, only=None):
+        """用框架的模板匹配认页 —— 全程不读文字。
+
+        这是「不全靠 OCR」的落点：锚点是像素级裁片（按钮/标题的原始像素），
+        OCR 读花、读漏、读到繁体都不影响；命中即认定这一页。
+
+        only="训练核心" 时只匹配这一页的锚点（采样热路径用，省掉 8 页 × N 锚点的遍历）。
+        """
+        if frame is None:          # 没画面就没什么可匹配的（离线测试也走这条）
+            return None
+        meta = self._anchor_meta()
+        if not getattr(self, "_anchor_enabled", False):
+            return None
+        pages = meta.get("pages") or {}
+        if only:
+            pages = {k: v for k, v in pages.items() if k == only}
+        anchors = meta.get("anchors") or {}
+        thr = getattr(self, "_anchor_thr", 0.8)
+        for page, d in pages.items():
+            hit = 0
+            for name in d.get("anchors", []):
+                r = (anchors.get(name) or {}).get("region") or [0.0, 0.0, 1.0, 1.0]
+                try:
+                    boxes = self.find_feature(name, threshold=thr, x=r[0], y=r[1],
+                                              width=r[2], height=r[3], frame=frame)
+                except Exception as e:
+                    # 别再静默吞异常：2026-11-24 实跑就是这里把
+                    # 「assets/templates 里有不合规文件名 → 框架每次抛
+                    # TemplateFormatError」藏了 3 分钟，锚点 0 命中还以为匹配不准。
+                    # 同一类错误只报一次，避免刷屏。
+                    boxes = []
+                    if getattr(self, "_anchor_err_type", None) != type(e).__name__:
+                        self._anchor_err_type = type(e).__name__
+                        self._log_quiet(f"[锚点] {name} 匹配异常（本类错误只报一次）："
+                                        f"{type(e).__name__}: {e}", warn=True)
+                if boxes:
+                    hit += 1
+                    self._anchor_hits[name] = self._anchor_hits.get(name, 0) + 1
+            if hit >= int(d.get("need") or 1):
+                return page
+        return None
+
+    def _anchor_find(self, page, frame, names=None):
+        """在指定页的锚点里找一个命中的框，返回 (锚点名, Box) —— 用来定位按钮。
+
+        和 `_anchor_page` 的分工：
+          · `_anchor_page` 只回答「这是不是这页」（认页）；
+          · 这里要**具体位置**（点哪儿）。
+        训练核心的「决定」按钮按技能换版式（4 套锚点，位置差近 200px），
+        OCR 读不到时用它比经验坐标可靠得多 —— 这是「能用框架就用框架」的落点。
+        """
+        if frame is None:
+            return None, None
+        meta = self._anchor_meta()
+        if not getattr(self, "_anchor_enabled", False):
+            return None, None
+        d = (meta.get("pages") or {}).get(page) or {}
+        anchors = meta.get("anchors") or {}
+        thr = getattr(self, "_anchor_thr", 0.8)
+        for name in (names or d.get("anchors") or []):
+            r = (anchors.get(name) or {}).get("region") or [0.0, 0.0, 1.0, 1.0]
+            try:
+                boxes = self.find_feature(name, threshold=thr, x=r[0], y=r[1],
+                                          width=r[2], height=r[3], frame=frame)
+            except Exception:
+                boxes = []
+            if boxes:
+                return name, boxes[0]
+        return None, None
+
+    def _vis_bump(self, key):
+        """视觉层计数（摘要里用）：命中 / 补位（OCR 未知时接管）/ 冲突改判 / 硬否决。"""
+        st = getattr(self, "_vis_stats", None)
+        if st is None:
+            self._vis_stats = st = {"hit": 0, "fill": 0, "conflict": 0, "veto": 0}
+        st[key] = st.get(key, 0) + 1
+
+    def _transition_veto(self, prev, page):
+        """马尔可夫硬约束：上一步是 A 时判成 B，直接否决成「未知」。
+
+        2026-11-24 玩家追问「不是说做了马尔可夫链吗」，查下来的真相是：
+        只实现了 _check_transition 的**警告**，从不否决，等于没生效。
+        这里才是真正的约束 —— 训练核心不可能一步跳到大厅/商店，
+        局内也不可能冒出局外弹窗，判出来就直接否决，交给锚点/推进器重判。
+        """
+        if not prev or not page or page in ("未知",) or prev in ("未知",) or page == prev:
+            return False
+        return page in (PAGE_FORBIDDEN.get(prev) or ())
+
     def _classify(self, items, frame=None):
+        """最终页面判定 = OCR 关键词 + 框架锚点，再套一层转移硬约束。
+
+        三层（2026-11-24 重构，玩家：别再一个一个打补丁）：
+          1) _classify_ocr —— 原来那套关键词规则，保留不动，负责「说出这是什么页」
+          2) 框架锚点     —— FeatureSet 模板匹配（assets/anchors.json），像素级认页
+          3) 转移硬约束   —— 上一步到这一步不可能出现的页，直接否决成未知
+        """
+        ocr_page = self._classify_ocr(items, frame)
+        prev = getattr(self, "_last_page_hint", None)
+
+        if self._transition_veto(prev, ocr_page):
+            self.log_warning(f"[硬约束] {prev} → {ocr_page} 不可能出现，判定作废")
+            self._vis_bump("veto")
+            ocr_page = "未知"
+
+        anchor_page = self._anchor_page(frame) if frame is not None else None
+        if anchor_page and self._transition_veto(prev, anchor_page):
+            self.log_info(f"[硬约束] 锚点认出 {anchor_page}，但从 {prev} 过来不可能，忽略")
+            anchor_page = None
+
+        if anchor_page:
+            self._vis_bump("hit")
+        why = ""
+        if anchor_page and ocr_page == "未知":
+            page = anchor_page
+            self._vis_bump("fill")
+            why = f"OCR 没认出来，锚点认出「{anchor_page}」"
+        elif anchor_page and ocr_page and anchor_page != ocr_page:
+            # 锚点是像素证据、关键词只是共现，冲突时信锚点
+            page = anchor_page
+            self._vis_bump("conflict")
+            why = f"OCR 说「{ocr_page}」，锚点认出「{anchor_page}」→ 采用锚点"
+        else:
+            page = ocr_page or anchor_page or "未知"
+
+        if why:
+            key = (prev, page, ocr_page)
+            if getattr(self, "_classify_why_key", None) != key:
+                self._classify_why_key = key
+                self.log_info(f"[判页] {why}")
+        else:
+            self._classify_why_key = None
+        return page
+
+    def _classify_ocr(self, items, frame=None):
         """判定当前页面。顺序 = 优先级，别随意调换。"""
         texts = [it["t"] for it in items]
         joined = " ".join(texts)
@@ -1105,6 +1430,19 @@ class AutoTask(MyBaseTask):
         #     排除所有主按钮词：每日页(训练/商店)、选人页(筛选/下一步)、
         #     加强训练(确定)、剧情(跳过/继续) —— 它们属性名再多也不会误判。
         if (sum(1 for w in ATTR_WORDS if w in joined) >= 3
+                and not any(b in joined for b in (
+                    "跳过", "决定", "下一步", "确定", "确认", "训练", "比赛",
+                    "商店", "筛选", "自动选择", "选择", "继续", "休息", "出行",
+                    "前往", "野餐", "精力+"))):
+            return "训练结果"
+        # 7.4c 训练结果计数动画的残缺帧（2026-11-24 08:49 实跑第2周）：底栏属性条
+        #     只被 OCR 读到两项「投射 B 475」「运控 S 1,194」，凑不够 7.4b 的 ≥3 项，
+        #     于是判未知页 → pause 收工（本轮到这就断了）。结构特征很硬：
+        #     **属性名 + 单字母等级 + 3~4 位大数字（可带千分位）+ 屏幕上没有任何操作按钮**。
+        #     训练核心页底部也有同款属性条，但它一定有「决定」按钮 → 被下面的排除表挡住。
+        if (sum(1 for w in ATTR_WORDS if w in joined) >= 2
+                and re.search(r"(?<![A-Za-z])[SABCD][+]?(?![A-Za-z])", joined)
+                and re.search(r"\d{1,3}(?:,\d{3})+|\d{3,4}", joined)
                 and not any(b in joined for b in (
                     "跳过", "决定", "下一步", "确定", "确认", "训练", "比赛",
                     "商店", "筛选", "自动选择", "选择", "继续", "休息", "出行",
@@ -1340,8 +1678,19 @@ class AutoTask(MyBaseTask):
             return True
 
         stamina_min = int(self.config.get("训练精力下限") or 12)
+        goal = self._goal_cfg()
+        train_days = [int(x) for x in (goal.get("train_days") or [1, 2, 3, 4, 5, 6])]
+        rest_days = [int(x) for x in (goal.get("rest_days") or [7])]
+        hard_min = int(goal.get("stamina_hard_min") or 0)
+        week_no, wd = self._read_week(items)
+        must_train = wd in train_days
+        rest_only = wd in rest_days
+        # 训练日：门槛降到 stamina_hard_min（默认 1）—— 玩家的目标是「周一到周六都练」，
+        #   历史日志证明 12 点精力也能练完一次（旧门槛 40 曾把整个周六挡成出行）。
+        # 非训练日：保持原门槛，只在精力够的时候才练（避免周日乱练）。
+        need = min(stamina_min, hard_min) if must_train else stamina_min
         st = self.stamina if self.stamina is not None else 999
-        enough = st >= stamina_min
+        enough = st >= need
         train = self._btn_in_area(items, ["训练"], frame)
         rest = self._btn_in_area(items, ["休息"], frame)
         go = self._btn_in_area(items, ["出行"], frame)
@@ -1368,33 +1717,48 @@ class AutoTask(MyBaseTask):
         #   看有没有【笔记 / 继承】；没有就两级右上角退回，再按原规则训练/去公园。
         #   每天仍只探一次（trip_probe_done 记账），退回失败只放弃当天。
         day_key = self._day_key(items)
+        # 重试计数按天清零：昨天试了 3 次失败，不该让今天也直接放弃。
+        # getattr 兜底是为了让离线测试桩（绕过 __init__ 构造）也能跑。
+        if getattr(self, "trip_probe_retry_day", None) != day_key:
+            self.trip_probe_retry_day = day_key
+            self.trip_probe_retry = 0
         if go and self._can_probe_trip(day_key):
             self.trip_probe = True
-            self.trip_probe_done = day_key
+            # **不在这里写 trip_probe_done**：只有真的进了出行页才算探过
+            #（见 _do_trip 开头）。否则点击被覆盖窗口挡住时会误判成「探完了、没笔记」。
+            self.trip_probe_retry = getattr(self, "trip_probe_retry", 0) + 1
             self.trip_back_tries = 0
-            self._click_btn(go, f"[探出行-看有没有笔记 精力{self.stamina}/{self.stamina_max}]", frame)
+            self._click_btn(go, f"[探出行-看有没有笔记 试{self.trip_probe_retry}/3 "
+                                f"精力{self.stamina}/{self.stamina_max}]", frame)
             return True
 
-        if train and enough:
+        if train and enough and not rest_only:
             probed = (self.trip_probe_done == day_key)
             if probed:
                 self.log_info(f"[探笔记] 已回到每日页 → 当天照常训练（精力 {self.stamina}/{self.stamina_max}）")
             tag = "[探笔记后-训练" if probed else "[训练"
-            self._click_btn(train, f"{tag} 精力{self.stamina}/{self.stamina_max}]", frame)
+            self._click_btn(train, f"{tag} 精力{self.stamina}/{self.stamina_max} 星期{wd}"
+                                   f"{'（目标：周一到周六全练）' if must_train else ''}]", frame)
+            return True
+
+        # 星期几属于 rest_days（默认周日）：玩家的口径是「周日的休息 = 去公园回精力」，
+        #   所以有出行入口就直接去，绝不点「休息」——休息只推进一天、不回精力。
+        if rest_only and go:
+            self._click_btn(go, f"[星期{wd} 休息日-出行去公园补精力 精力{st}/{self.stamina_max}]", frame)
             return True
 
         # 精力不足：先看能不能去公园（唯一能明显回精力的地方）
         if go and not enough:
             if self.trip_probe_done == day_key:
                 self.log_info("[探笔记] 已回到每日页 → 今天没有训练，按原规则去公园补精力")
-            self._click_btn(go, f"[精力{self.stamina}<{stamina_min}-出行去公园补精力]", frame)
+            self._click_btn(go, f"[精力{self.stamina}<{need}-出行去公园补精力]", frame)
             return True
 
         if rest:
-            self._click_btn(rest, f"[休息 精力{self.stamina}<{stamina_min}，休息不补精力只推一天]", frame)
+            self._click_btn(rest, f"[休息 精力{self.stamina}<{need}，休息不补精力只推一天]", frame)
             return True
 
-        if train:  # 没别的路，先点训练（不足会弹专注恢复，那边有兜底）
+        if train and not rest_only:  # 没别的路，先点训练（不足会弹专注恢复，那边有兜底）
             self._click_btn(train, "[训练-精力可能不足]", frame)
             return True
 
@@ -1577,7 +1941,13 @@ class AutoTask(MyBaseTask):
         cands = [c for c in cands if 0.2 < c["cy"] / frame.shape[0] < 0.55]
         if not cands:
             self.log_info(f"三个扭蛋里没有「{kw}」，跳过不买")
-            return self._leave_top_right(items, frame, "[无目标扭蛋]")
+            # 2026-11-24 10:10 复盘：这里曾经被我改成「退不出去就强制买最便宜」——
+            # 是错的。真实原因是**点击被上层窗口截走**（WorkBuddy 覆盖层压住游戏右上角），
+            # 不是弹窗退不出去。玩家指出「右上角可以退出，昨天教过」并实测确认：
+            # 置顶游戏后点 ↩ 画面变化 26%，弹窗正常关闭。所以这里只负责退，不负责买。
+            if not self._leave_top_right(items, frame, "[无目标扭蛋]"):
+                self.log_warning("[扭蛋] 这次没退出去（多半是点击被挡），下一步重试；不买")
+            return True
 
         best = cands[0]
         price = None
@@ -1785,14 +2155,44 @@ class AutoTask(MyBaseTask):
         w, d = self._read_week(items)
         return f"{w}-{d}" if (w and d) else None
 
+    def _goal_cfg(self):
+        """玩家三条终局目标的配置（strategy.yaml → tuning.goal）。"""
+        return self._tuning().get("goal") or {}
+
     def _can_probe_trip(self, day_key):
         """今天还能不能为「看笔记」去点出行。"""
         if self.trip_probe_disabled or not day_key:
             return False
+        trip = self._tuning().get("trip") or {}
         # 工作台上的开关：关掉就回到「训练优先」的老顺序（有训练先训练，出行只在精力不够时）
-        if not bool((self._tuning().get("trip") or {}).get("probe_notes_first", True)):
+        if not bool(trip.get("probe_notes_first", True)):
             return False
-        return self.trip_probe_done != day_key
+        # 只有指定的星期才探（默认 6/7 = 周六周日）。
+        #   目标 ①「每个周六周日都检查有没有笔记」；目标 ②「周一到周六都训练」——
+        #   工作日去探笔记要多走 3~5 步，还有「退不回每日页就耽误一天」的风险，
+        #   等于拿训练日去换一次探路，不划算。
+        days = trip.get("probe_days")
+        if days:
+            try:
+                allow = [int(x) for x in days]
+            except Exception:
+                allow = None
+            if allow is not None and self.weekday is not None and self.weekday not in allow:
+                if self.trip_probe_done != day_key:
+                    self.trip_probe_done = day_key      # 记成今天不探，免得每帧重复判断
+                    self.log_info(f"星期{self.weekday} 不探笔记（只在 {allow} 探）→ 直接训练")
+                return False
+        if self.trip_probe_done == day_key:
+            return False
+        # 点了「出行」但还停在每日页 = 点击没生效（最常见是被 FLUTTERVIEW 盖住）。
+        # 不能当成探完，最多再试 3 次；3 次都不行才放弃今天（宁可少探，也别空转）。
+        if getattr(self, "trip_probe_retry", 0) >= 3:
+            if getattr(self, "_trip_giveup_logged", None) != day_key:
+                self._trip_giveup_logged = day_key
+                self.log_warning(f"[探笔记] 连续 {getattr(self, 'trip_probe_retry', 0)} 次"
+                                 f"点「出行」都没进页面 → 今天放弃探笔记，按原规则训练")
+            return False
+        return True
 
     def _want_shop(self, items):
         """今天要不要进商店看一眼。
@@ -1855,6 +2255,14 @@ class AutoTask(MyBaseTask):
         而同时存在「精力+30 且属性+」的选项 —— 那 49 点溢出是白扔的。
         现在统一走 `_reward_key`：先把精力按缺口截断，打平再看属性。
         """
+        # 真的进到出行页 → 本次探笔记才算数（这才是「探过」的定义，见 _do_daily）。
+        if self.trip_probe:
+            dk = self._day_key(items)
+            if dk and self.trip_probe_done != dk:
+                self.trip_probe_done = dk
+                self.trip_probe_retry = 0
+                self.log_info(f"[探笔记] 已进入出行页（{dk}）→ 本次探笔记计为有效")
+
         # 探笔记的退回流程：从扭蛋三选一退回出行页后，还要再点一次右上角才回每日页。
         if self.trip_probe_back > 0:
             self.trip_probe_back -= 1
@@ -2276,9 +2684,24 @@ class AutoTask(MyBaseTask):
         ESC / STOP_WORDS 在这两页都没用，所以不能走 _leave() 的 ESC 分支。
         """
         h, w = (frame.shape[:2] if frame is not None else (1080, 1920))
+        base = frame.copy() if frame is not None else None
         self.log_info(f"[探笔记] 点右上角返回箭头 (0.95,0.046) {why}")
         self.click(int(w * 0.95), int(h * 0.046))
-        return True
+        self.sleep(0.8)
+        f2 = self._frame()
+        if base is not None and f2 is not None and self._frame_diff(base, f2) >= 1.2:
+            return True
+        # 备用坐标：HUD 最右那颗浅蓝 ↩ 实测在图内 (0.943, 0.065)，0.046 偏高了十几像素
+        self.click(int(w * 0.943), int(h * 0.065))
+        self.sleep(0.8)
+        f3 = self._frame()
+        if base is not None and f3 is not None and self._frame_diff(base, f3) >= 1.2:
+            self.log_info("[探笔记] 备用坐标点中返回箭头，退出去了")
+            return True
+        # 2026-11-24 10:01 实跑：「请选择1个扭蛋」是强制弹窗 —— 无 X、无取消，
+        # 右上角 HUD 返回（含备用坐标）点下去画面一点不变。这种页退不出去，得让调用方换策略。
+        self.log_warning(f"[探笔记] 右上角返回无效（这一屏退不出去）{why}")
+        return False
 
     def _leave(self, items, frame):
         """退出当前页面：先找关闭/取消，再点右上角 X。"""
@@ -2341,27 +2764,23 @@ class AutoTask(MyBaseTask):
         return True
 
     def _match_template(self, frame, name, threshold=0.85):
-        """在 frame 里找 assets/templates/<name>（多尺度），返回相对坐标 (rx, ry)。"""
+        """在 frame 里找 assets/templates/<name>，返回相对坐标 (rx, ry)。
+
+        2026-11-24 去重：原来自己写 cv2.matchTemplate + 三档缩放循环，
+        框架的 find_one(template=...) 已经做了多尺度/灰度/边缘/掩码，直接用它。
+        这里保留一个薄壳，只是把「图片路径 → 相对坐标」这层业务约定包住。
+        """
         try:
             root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            tpl = cv2.imread(os.path.join(root, "assets", "templates", name))
+            tpl = cv2.imread(os.path.join(root, "assets", "misc", name))
             if tpl is None or frame is None:
                 return None
-            h, w = frame.shape[:2]
-            th, tw = tpl.shape[:2]
-            best = None
-            for s in (0.85, 1.0, 1.15):
-                t = cv2.resize(tpl, (max(8, int(tw * s)), max(8, int(th * s))))
-                if t.shape[0] >= h or t.shape[1] >= w:
-                    continue
-                res = cv2.matchTemplate(frame, t, cv2.TM_CCOEFF_NORMED)
-                _, mx, _, loc = cv2.minMaxLoc(res)
-                if best is None or mx > best[0]:
-                    best = (mx, loc[0] + t.shape[1] / 2.0, loc[1] + t.shape[0] / 2.0)
-            if not best or best[0] < threshold:
+            box = self.find_one(template=tpl, threshold=threshold, frame=frame)
+            if box is None:
                 return None
-            self.log_info(f"模板 {name} 命中 score={best[0]:.2f}")
-            return (best[1] / w, best[2] / h)
+            h, w = frame.shape[:2]
+            self.log_info(f"模板 {name} 命中 score={box.confidence:.2f}")
+            return (box.x + box.width / 2.0) / w, (box.y + box.height / 2.0) / h
         except Exception as e:
             self.log_warning(f"模板匹配失败 {name}: {e}")
             return None
@@ -2896,12 +3315,18 @@ class AutoTask(MyBaseTask):
         return True
 
     def _decide(self, items, frame):
-        """训练核心页的「决定」：**不判颜色**，OCR 读不到就按坐标点。
+        """训练核心页的「决定」：**不判颜色**，OCR 读不到就用锚点定位按钮。
 
         实测（22:33，第4周技能全 MAX）：这时的「决定」是白底按钮
         BGR≈(152,212,211)，被「只有黄色才点」的保护挡掉，结果在核心页空转 15 步。
         又实测（2026-11-23 05:19）：黄底白字的「决定」OCR 有时整块读不出来，
-        exact 匹配失败 → 页面判定和点击一起失灵。所以补一个坐标兜底。
+        exact 匹配失败 → 页面判定和点击一起失灵。
+
+        2026-11-24 11:20 实跑又出现 3 次「没读到决定」，说明这个兜底不是偶发。
+        原来兜底是死坐标 (0.926, 0.831)，但「决定」按钮**按技能换版式、位置不固定**
+        （见 anchors.json 里 训练核心_决定_1..4，四套区域的 y 差了近 200px），
+        死坐标只能碰运气。现在改成：先问框架「决定按钮的像素在哪」（模板匹配），
+        命中就点它自己的中心；锚点也没命中（画面被浮层盖住）才退回死坐标。
         """
         it = self._find(items, ["决定"], exact=True)
         if it:
@@ -2909,8 +3334,22 @@ class AutoTask(MyBaseTask):
             return True
         if self._click_confirm(items, frame):
             return True
-        # 右下角「决定」按钮实测位置（1080p：x≈0.926、y≈0.83）
-        self.log_warning("没读到「决定」文字，按固定坐标点右下角")
+        name, box = self._anchor_find("训练核心", frame)
+        if box is None:
+            # 这一步用的 frame 通常是「点技能胶囊之前」那一帧，按钮可能还在动画里
+            # （2026-11-24 11:23 实测 3 次读不到「决定」，就是卡在加成飘字的过渡帧）。
+            # 等半秒重新取一帧再匹配，比直接退回经验坐标可靠。
+            self.sleep(0.5)
+            f2 = self._frame()
+            if f2 is not None:
+                name, box = self._anchor_find("训练核心", f2)
+        if box is not None:
+            cx, cy = box.x + box.width / 2, box.y + box.height / 2
+            self.log_info(f"没读到「决定」文字 → 锚点 {name} 定位 ({int(cx)},{int(cy)})")
+            self.click(cx, cy)
+            return True
+        # 锚点也没命中（画面被浮层挡）：退回经验坐标（1080p：x≈0.926、y≈0.83）
+        self.log_warning("没读到「决定」文字、锚点也没命中，按经验坐标点右下角")
         self.click_relative(0.926, 0.831)
         return True
 
@@ -2948,7 +3387,11 @@ class AutoTask(MyBaseTask):
             return None
 
     def _do_training_core(self, items, frame):
-        """训练核心页：只点右上角带角标的技能 → 读队友 / 器材 / 失败率 → 打分 → 决定。
+        """训练核心页：默认选中项直接采，其余五项挨个点开读编队 → 打分 → 决定。
+
+        2026-11-24 起候选池是**全部六个技能**（不再只挑带角标的）：
+        角标只代表"今天这项有加成"，跟编队里站几个人无关，而得分主要看队友 + 器材。
+        只挑角标会让每场只剩 3 个候选，甚至只剩 1 个被迫练高失败率的项。
 
         每轮都从画面上重新认「主训人员」（每个技能都在场的名字），不写死名字。
         """
@@ -2968,88 +3411,78 @@ class AutoTask(MyBaseTask):
         # 所以当前高亮的那一项只读不点；实测深蓝胶囊就是选中态，用画面认，不写死。
         selected = self._selected_skill(frame, rows)
         if selected:
-            self.log_info(f"当前默认选中「{selected}」→ 这一项不点击，直接采默认帧")
+            self.log_info(f"当前默认选中「{selected}」→ 这一项全程不点击，直接采默认帧")
         else:
-            self.log_warning("没认出默认选中态 → 「投射」跳过点击且不参与排名（保守路径）")
+            self.log_warning("没认出默认选中态（深蓝高亮）→ 六项一律点开采样，靠排名选")
 
         cfg = self._tuning().get("core_score", {}) or {}
         audit_week, audit_day = self._read_week(items)   # 证据目录按「第N周星期X」分组
+        # 候选池 = **全部六个技能**，不再只看「有角标」的那些。
+        # 依据（2026-11-24 第三轮实跑 8272 分的复盘）：
+        #   · 205 次「没有角标，跳过」平均摊到每场近 3 项，一场只比较得到 3 个候选；
+        #   · 有一场只剩「投射 MAX 失败率 77%」一个候选（其余全被跳过），硬着头皮练了；
+        #   · 另一场只剩「体能 1.00 分」一个候选，而没角标的「意识」当时是 5 分那种。
+        # 角标只说明"今天这项有加成"，跟编队里站几个人**没有关系** —— 得分主要看队友与器材，
+        # 所以没角标也必须点开看一眼。代价：每场多 3 次点击 + 3 段采样 ≈ +5 秒；
+        # 一轮约 120 场 → 多 10 分钟，换掉"候选池太小被迫选差项"这个最大失分点。
+        # 顺序：有角标的排在前面 —— 万一点到一半页面被浮层/事件页切走，至少已经采到
+        # 今天有加成的那些，而不是把预算全花在没加成的项上。
         targets = []
         for r in rows:
             spot = self._badge_near(frame, r)
+            targets.append((r, spot))
             if spot:
-                targets.append((r, spot))
-                self.log_info(f"「{r['t']}」右上角有角标 @({int(spot[0])},{int(spot[1])})，点开检查")
+                self.log_info(f"「{r['t']}」右上角有角标 @({int(spot[0])},{int(spot[1])})，先采")
             else:
-                self.log_info(f"「{r['t']}」没有角标，跳过")
-        if not targets:
-            self.log_warning("六个技能都没有角标，不逐项检查，直接决定")
-            return self._decide(items, frame)
+                self.log_info(f"「{r['t']}」没有角标，也点开采（编队里可能站着人）")
+        targets.sort(key=lambda t: 0 if t[1] else 1)
+
+        # 器材基线：进页面这一帧先读一次。卡片是**淡入淡出**的（实测同一场训练里
+        # 4 个技能帧分别读到 2/1/0/0 张），而同一场带的器材是固定的 ——
+        # 所以拿进页面这一帧当基线，某个技能的采样帧没卡也不至于白丢器材分。
+        base_equips = []
+        try:
+            base_equips = [card_glow(frame, c) for c in find_cards(frame)]
+        except Exception as e:
+            self.log_info(f"器材基线检测失败（忽略）：{e}")
+        if base_equips:
+            self.log_info(f"器材基线（进页面帧）：{len(base_equips)} 张 {base_equips}")
 
         scored = []
-        for idx, (r, _spot) in enumerate(targets, 1):
-            name = r["t"]
-            # 「投射」是默认选中项时绝不能再点；若这局高亮的不是投射，说明默认项变了，
-            # 投射没有可靠数据来源，宁可不参与排名也不冒险点它（点了就会开训）。
-            if name == "投射" and selected != "投射":
-                self.log_warning(f"「投射」不是默认选中项（当前 {selected}）→ 跳过，不点击也不采样")
-                continue
-            no_click = (name == selected)
-            if no_click:
-                self.log_info(f"—— 默认选中「{name}」（{idx}/{len(targets)}）：不点击，直接采当前帧")
-            else:
-                self.log_info(f"—— 点开「{name}」（{idx}/{len(targets)}）看编队")
-                self._click_item(r, "[展开编队]")
-            # 选中态会一直保留，起手等 0.4s 就够（由 _sample_core 的 warmup 控制）
-            names, pct, level, equips = self._sample_core(r)
+        # ① 默认选中项**最先采，而且一次都不点**。
+        #    玩家 2026-11-24 11:55 澄清：「进入的时候默认就是投射的，不用点击直接就能采样，
+        #    如果这时候要去点击它，会直接变成选中」。也就是说这页一进来就已经展开着默认项的
+        #    编队，点击动作本身会把"游戏默认态"改成"手动选中"（会触发二次确认直接开训），
+        #    所以这里连"没读到就补点"都不做，采不到只重新取帧（_core_measure 内部处理）。
+        #    为什么必须排在最前面：按胶囊的 cy 从上往下逐个点开的话，一旦前面的技能先被点，
+        #    画面就变成那个技能的编队了，轮到这里再"采当前帧"采到的根本不是默认项
+        #    —— W2D4「带经理加成 + 器材」的投射掉出候选池，正是这个顺序问题。
+        #    另外默认项是从**全部技能行**（rows）里找的，不限于带角标的 targets：
+        #    它本来就已经摊开在画面上，是白捡的数据，有没有角标都该采。
+        preset_row = None
+        if selected:
+            preset_row = next((r for r in rows if r["t"] == selected), None)
+        if preset_row is not None:
+            self.log_info(f"默认选中「{selected}」→ 进页面就展开着它的编队，先采它，全程不点击")
+            rec = self._core_measure(preset_row, selected, "default", base_equips,
+                                     audit_week, audit_day, idx=0, shot=frame)
+            if rec is None:
+                return True
+            scored.append(rec)
 
-            # 页面守卫：采样途中页面可能已经变了（实测第 6 周点开「体能」时，
-            # 画面已经跳到「器材事件」，后面 3 步全在对着事件页点技能 + 点决定）。
-            # 一旦不是训练核心页就立刻交回主循环，别把后续技能也点一遍。
-            f_chk = self._frame()
-            if f_chk is not None:
-                now_page = self._classify(self._texts(f_chk), f_chk)
-                if now_page != "训练核心":
-                    self.log_warning(f"采样途中页面已变成「{now_page}」→ 放弃本次编队比较，交给主循环")
-                    return True
-
-            if not names and pct is None and level is None:
-                if no_click:
-                    self.log_warning(f"「{name}」默认帧没读到编队 → 不参与排名（不补点，避免误开训）")
-                    continue
-                # 2026-11-23 实测：「意识」这一档常点了没反应（选中的还是上一个技能），
-                # 因为它贴在最底下、离属性条太近。往上挪 26px 重点一次再读。
-                self.log_warning(f"「{name}」没读到编队（可能点偏了），往上挪 26px 重点一次")
-                self.click(r["cx"], r["cy"] - 26)
-                names, pct, level, equips = self._sample_core(r)
-            # 默认选中的那一项，证据就用刚进页面时的原始帧（数据也是从这一帧读的）
-            f2 = frame if no_click else self._frame()
-            if f2 is not None and self.config.get("保存截图"):
-                self._shot(f2, f"core_{idx}")
-            # 三项全空 = 这次采样整个失败了（取帧全 None / 画面还在渲染），
-            # 不能当成「0 队友 0 分」参与排名，否则会把本来最好的选项排到最后。
-            valid = not (level is None and pct is None and not names)
-            scored.append({"row": r, "pct": pct, "mates": 0, "level": level,
-                           "valid": valid, "names": set(names), "score": 0.0,
-                           "equips": equips})
-            # 采样证据（玩家 16:47 要人工检查）：每个角标技能一帧图 + OCR 原文 +
-            # 这次读到的队友/器材/失败率/等级；打分在下面算完后会再补写一份汇总。
-            f2_items = self._texts(f2) if f2 is not None else []
-            audit_txt = (
-                f"第{audit_week}周 星期{audit_day}  采样时刻 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"技能：{name}  有效采样：{valid}  "
-                f"采样方式：{'默认选中帧(未点击)' if no_click else '点开胶囊后采样'}\n"
-                f"队友({len(names)})：{names}\n"
-                f"器材({len(equips or [])})：{equips}\n"
-                f"失败率：{pct}%   等级：{level}\n"
-                f"—— 本帧 OCR 原文 ——\n"
-                + "\n".join(f"{it.get('cx'):.0f},{it.get('cy'):.0f}  {it['t']}"
-                            for it in (f2_items or []))
-            )
-            self._audit_save(audit_week, audit_day, f"core{idx}_{r['t']}", f2, audit_txt)
+        # ② 其余技能逐个点开（带角标的才值得花一次点击 + 若干帧 OCR）
+        rest = [(r, s) for (r, s) in targets if r is not preset_row]
+        if rest:
+            self.log_info(f"接下来点开 {len(rest)} 个带角标的技能：[{', '.join(r['t'] for r, _ in rest)}]")
+        for idx, (r, _spot) in enumerate(rest, 1):
+            rec = self._core_measure(r, r["t"], "click", base_equips,
+                                     audit_week, audit_day, idx=idx)
+            if rec is None:
+                return True
+            scored.append(rec)
 
         if not scored:
-            self.log_warning("带角标的技能都没读到编队，按当前默认项决定")
+            self.log_warning("所有候选都没读到编队，按当前默认项决定")
             return self._decide(items, frame)
 
         # 记下这一场器材最多有几张 —— 商店那边「器材暴击道具只有器材上站人才买」
@@ -3152,7 +3585,8 @@ class AutoTask(MyBaseTask):
             f"精力 {self.stamina}/{self.stamina_max}  金币 {getattr(self, 'gold', None)}\n\n"
             f"【每项原始读数与得分】\n" + "\n".join(detail_lines) + "\n\n"
             f"【编队排名】\n{rank_txt}\n\n"
-            f"【默认选中项】{selected or '未识别'}（该项未点击，直接采默认帧）\n"
+            f"【默认选中项】{selected or '未识别'}"
+            f"（{'先进页面直接采默认帧、全程未点击' if any(d['row']['t'] == selected for d in scored) else '未采到，未参与排名'}）\n"
             f"【规则覆盖】{'改练 ' + forced['row']['t'] + '（原第一 ' + scored[0]['row']['t'] + '）'
                          if forced and scored[0] is not forced else '无'}\n"
             f"【最终选择】{_sk}  得分 {best['score']:.2f}  失败率 {best.get('pct')}%\n"
@@ -3183,6 +3617,77 @@ class AutoTask(MyBaseTask):
         if name not in pool:
             pool.append(name)
             del pool[:-8]
+
+    def _core_measure(self, row, name, how, base_equips, audit_week, audit_day,
+                      idx=0, shot=None):
+        """采一个技能候选的编队并落一份证据，返回参与排名的记录。
+
+        how:
+          "default" —— 页面进来自带选中态（玩家 2026-11-24 11:55：游戏默认就选中「投射」，
+                       编队已经摊开，「不用点击直接就能采样」；「如果这时候要去点击它，
+                       会直接变成选中」）→ **一次都不点**，连"没读到就补点"也不做，
+                       只重新取帧。点了会把默认态变成手动选中并触发二次确认直接开训。
+          "click"   —— 其余技能：点开胶囊再采；没读到就上移 26px 补点一次。
+
+        返回 None 表示采样途中页面已经切走，调用方应放弃本次编队比较。
+        """
+        if how == "click":
+            self.log_info(f"—— 点开「{name}」（第 {idx} 项）看编队")
+            self._click_item(row, "[展开编队]")
+            # 选中态会一直保留，起手等 0.4s 就够（由 _sample_core 的 warmup 控制）
+            names, pct, level, equips = self._sample_core(row)
+        else:
+            # 默认帧就在眼前：起手几乎不用等，直接连拍（_sample_core 内部多帧投票）
+            names, pct, level, equips = self._sample_core(row, warmup=0.1)
+        if not names and pct is None and level is None:
+            if how == "click":
+                # 2026-11-23 实测：「意识」这一档常点了没反应（选中的还是上一个技能），
+                # 因为它贴在最底下、离属性条太近。往上挪 26px 重点一次再读。
+                self.log_warning(f"「{name}」没读到编队（可能点偏了），往上挪 26px 重点一次")
+                self.click(row["cx"], row["cy"] - 26)
+                names, pct, level, equips = self._sample_core(row)
+            else:
+                # 默认项不能补点（会开训），只能等画面渲完再重采一次
+                self.log_warning(f"「{name}」默认帧没读到编队 → 等一拍重采（仍然不点击）")
+                names, pct, level, equips = self._sample_core(row, warmup=0.6)
+
+        # 页面守卫：采样途中页面可能已经变了（实测第 6 周点开「体能」时，
+        # 画面已经跳到「器材事件」，后面 3 步全在对着事件页点技能 + 点决定）。
+        # 一旦不是训练核心页就立刻交回主循环，别把后续技能也点一遍。
+        f_chk = self._frame()
+        if f_chk is not None:
+            now_page = self._classify(self._texts(f_chk), f_chk)
+            if now_page != "训练核心":
+                self.log_warning(f"采样途中页面已变成「{now_page}」→ 放弃本次编队比较，交给主循环")
+                return None
+
+        # 三项全空 = 这次采样整个失败了（取帧全 None / 画面还在渲染），
+        # 不能当成「0 队友 0 分」参与排名，否则会把本来最好的选项排到最后。
+        valid = not (level is None and pct is None and not names)
+        # 默认选中的那一项，证据就用刚进页面时的原始帧（数据也是从这一帧读的）
+        f2 = shot if shot is not None else self._frame()
+        if f2 is not None and self.config.get("保存截图"):
+            self._shot(f2, f"core_{idx}")
+        rec = {"row": row, "pct": pct, "mates": 0, "level": level,
+               "valid": valid, "names": set(names), "score": 0.0,
+               "equips": equips or list(base_equips), "how": how}
+        # 采样证据（玩家 16:47 要人工检查）：每个技能一帧图 + OCR 原文 +
+        # 这次读到的队友/器材/失败率/等级；打分在下面算完后会再补写一份汇总。
+        f2_items = self._texts(f2) if f2 is not None else []
+        audit_txt = (
+            f"第{audit_week}周 星期{audit_day}  采样时刻 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"技能：{name}  有效采样：{valid}  "
+            f"采样方式：{'默认选中帧(未点击)' if how == 'default' else '点开胶囊后采样'}\n"
+            f"队友({len(names)})：{names}\n"
+            f"器材({len(equips or base_equips)})：{equips or base_equips}"
+            f"{'' if equips else '（本帧没读到，用进页面基线）'}\n"
+            f"失败率：{pct}%   等级：{level}\n"
+            f"—— 本帧 OCR 原文 ——\n"
+            + "\n".join(f"{it.get('cx'):.0f},{it.get('cy'):.0f}  {it['t']}"
+                        for it in (f2_items or []))
+        )
+        self._audit_save(audit_week, audit_day, f"core{idx}_{name}", f2, audit_txt)
+        return rec
 
     def _main_char_of_round(self, scored, cfg):
         """本轮主训人员是谁 —— 出现在**每个**技能里的那个名字。
@@ -3288,6 +3793,14 @@ class AutoTask(MyBaseTask):
                                      # 0 帧有效就是栽在这上面）。
                                      "表情升级"))
             looks_core = (not off_core) and (hits >= 1 or has_pct or has_lv or len(names) >= 2)
+            if not looks_core and not off_core:
+                # 框架锚点补位（2026-11-24）：点技能后常弹「倍率加成 / 心·技·体」浮层把
+                # 右列技能名和失败率整片盖住，文字判据全灭 → 这一帧白丢。但训练核心页
+                # 的「决定」按钮在浮层之下仍在，用框架模板匹配（4 套版式，任一命中即算）
+                # 做像素级确认，比"靠文字猜"稳。只在这一页的 4 个锚点上匹配，不做全页遍历。
+                if self._anchor_page(f, only="训练核心") == "训练核心":
+                    looks_core = True
+                    self._vis_bump("anchor_rescue")
             if not looks_core:
                 # 【2026-11-23 13:1x 实跑修正】点开技能后游戏先播一段「加成展示」动画
                 # （画面上只剩「倍率加成」「属性加成」「C」这类字，1~3 秒才消失）。
@@ -3401,10 +3914,13 @@ class AutoTask(MyBaseTask):
           ① 早先：只做乘法折扣 → 可能选到 40%/50% 的项；
           ② 后来：`fail_limit: 0` 硬性只选 0% → 太保守，把「收益明显更高、
              失败率 20%」的好课全排掉了；
-          ③ **现在（玩家原话）：「失败可以赌一把，收益如果很高，小于 30 都能去」**
-             → `fail_limit: 30`。30 以内不排除，交给期望收益（_score_core 里的
-             ×(1-p)）排序：收益高到 5 分的课，赌 25% 失败仍然赢过稳拿 1 分的小课。
-        全部技能都 >limit 时才退回原排名 —— 否则当天就彻底没得练了。
+          ③ 2026-11-23 中午：「失败可以赌一把，收益如果很高，小于 30 都能去」
+             → `fail_limit: 30`。30 以内不排除，交给期望收益排序。
+          ④ 2026-11-24 曾按「周一到周六都训练而且不失败」改成 `fail_limit: 0`；
+          ⑤ **玩家当天撤回：「不失败只是理想状态，不是严格禁止」→ 还原 `fail_limit: 30`**
+             （strict_fallback 回到 old）。0% 的课只是期望值更高，不是硬门槛；
+             高收益的 20~30% 课照样赌，这才是人工手打的选法。
+        全部技能都 >limit 时退回原排名 —— 否则当天就彻底没得练了。
         读不到失败率（pct=None）仍视为不安全（不能假定它 0%）。
         """
         lim = cfg.get("fail_limit")
@@ -3412,6 +3928,18 @@ class AutoTask(MyBaseTask):
             return scored
         safe = [d for d in scored if d["pct"] is not None and float(d["pct"]) <= float(lim)]
         if not safe:
+            # fail_limit=0 + strict_fallback=min_fail（2026-11-24 终局目标 ②「不失败」）：
+            #   一个 0% 的都没有时，不再「退回原排名随便赌」，改成只留**失败率最低**的那档。
+            #   老行为（strict_fallback: old）才退回原排名。
+            if float(lim) <= 0 and str(cfg.get("strict_fallback") or "min_fail") == "min_fail":
+                known = [d for d in scored if d["pct"] is not None]
+                if known:
+                    low = min(float(d["pct"]) for d in known)
+                    keep = [d for d in known if float(d["pct"]) == low]
+                    self.log_warning(
+                        f"今天没有 0% 的稳课（最低失败率 {low:g}%）→ 只保留最低风险项 "
+                        f"{[(d['row']['t'], d['pct']) for d in keep]}，不碰更高的")
+                    return keep
             self.log_warning(f"所有技能失败率都 >{lim}%，只能按原排名（今天没得选，硬着头皮练）")
             return scored
         if len(safe) < len(scored):
@@ -3852,6 +4380,28 @@ class AutoTask(MyBaseTask):
                                       & (bl - rr > 15) & (bl - gc > 10)).mean())
                 if purple_ratio > 0.5:
                     return True
+            # G. 训练结果「加成飘字」帧（2026-11-24 09:16 实跑）：教室立绘 + 两个「+15 意识」
+            #    黄角标 + 底部一句「运控+30，意识+30」，OCR 5 段、无任何按钮，
+            #    7.4b（≥3 属性词）/7.4c（要有等级字母）/E（≤4段）三条全接不住 → 判未知页 pause。
+            #    特征：文字少（3~8 段）、一句行动按钮词都没有、且含「属性名+数字」增幅。
+            #    正常功能页要么带「第N周/星期」，要么带训练/决定/下一步这类按钮词，碰不到这里。
+            if items is not None and 3 <= len(items) <= 8:
+                joined_g = " ".join(str(i.get("t", "")) for i in items)
+                bad = ("第", "星期", "训练", "比赛", "商店", "确定", "下一步",
+                       "跳过", "继续", "选择", "决定", "出行", "休息", "前往")
+                if not any(k in joined_g for k in bad) and \
+                        re.search(r"(?:%s)\s*[+＋]\s*\d+" % "|".join(ATTR_WORDS), joined_g):
+                    return True
+            # F. 蓝色剪影 LOADING 过场（2026-11-24 09:08 实跑，切剧本/切场景时出现）：
+            #    整屏蓝白 + 大字 LOADING，OCR 只读到「-」1 段。实测 std 39.4、mean 203.7、
+            #    白占比 0.355、hud_std 24.5、蓝色占比 0.417 —— C（hud_std<5）和
+            #    _looks_transient（白占比<0.25）两条都接不住，于是判未知页 pause。
+            #    特征很硬：**几乎没有文字 + 大片饱和蓝 + 亮底**，正常游戏页文字都远超 2 段。
+            if items is not None and len(items) <= 2 and 150.0 < float(gray.mean()) < 245.0:
+                bl, rr = frame[:, :, 0], frame[:, :, 2]
+                blue_ratio = float(((bl > 140) & (rr < 130) & (bl - rr > 50)).mean())
+                if blue_ratio > 0.30:
+                    return True
             # E. 训练结果动画帧：亮白卡片+光柱，OCR 只剩几句被读花的碎片。
             #    实测同一帧读成「病性加成」(1段)、「-」(1段)、
             #    「肩性加成/つ/·体」(3段)，所以上限放宽到 4 段。
@@ -3897,6 +4447,193 @@ class AutoTask(MyBaseTask):
             return float((gray > 225).mean()) < 0.25
         except Exception:
             return False
+
+    # 通用推进器认识的「往前走」字形词。出现这些就点，不需要知道这是哪一页。
+    ADVANCE_WORDS = ("点击屏幕继续", "点击继续", "确定", "确认", "继续", "下一步",
+                     "好的", "知道了", "返回", "跳过", "开始", "进入",
+                     "是", "否", "取消", "关闭", "以后再说")
+
+    def _color_buttons(self, frame, items=None):
+        """找「像按钮」的色块 —— 用框架的 find_color_rectangles，不读文字。
+
+        2026-11-24 去重：原来在 vision.py 里自己写 HSV 掩膜 + 轮廓筛选，
+        框架 ok.util.color.find_color_rectangles 就是干这个的（还带填充率阈值），
+        直接换成它，少维护一份 300 行的重复实现。
+        """
+        out = []
+        if frame is None:
+            return out
+        h, w = frame.shape[:2]
+        for kind, rng, bonus in (("yellow", BTN_YELLOW, 0.2), ("blue", BTN_BLUE, 0.0)):
+            try:
+                boxes = find_color_rectangles(
+                    frame, rng,
+                    min_width=int(w * 0.06), min_height=int(h * 0.028),
+                    max_width=int(w * 0.60), max_height=int(h * 0.10),
+                    threshold=0.62)
+            except Exception:
+                boxes = []
+            for b in boxes:
+                cx, cy = b.x + b.width / 2.0, b.y + b.height / 2.0
+                if cy < h * 0.10:                       # 顶部 HUD
+                    continue
+                if cx > w * 0.86 and cy < h * 0.24:     # 右上角充值/礼包
+                    continue
+                score = (0.6 * b.confidence
+                         + 0.3 * min((cy / h) / 0.85, 1.0)
+                         + 0.1 * (1.0 - min(abs(cx / w - 0.5) * 1.7, 1.0)))
+                out.append({"cx": cx, "cy": cy, "w": b.width, "h": b.height,
+                            "kind": kind, "score": round(score + bonus, 3), "text": ""})
+        out.sort(key=lambda d: -d["score"])
+        kept = []
+        for b in out:
+            if any(abs(b["cx"] - k["cx"]) < k["w"] * 0.6 and
+                   abs(b["cy"] - k["cy"]) < k["h"] * 0.8 for k in kept):
+                continue
+            kept.append(b)
+            if len(kept) >= 6:
+                break
+        for b in kept:
+            if items:
+                b["text"] = self._text_on_button(b, items)
+        return kept
+
+    @staticmethod
+    def _text_on_button(btn, items):
+        """这个按钮框里/附近有哪段 OCR 文字（只给日志和危险词判断用）。"""
+        for it in items or []:
+            if (abs(it["cx"] - btn["cx"]) <= btn["w"] * 0.8
+                    and abs(it["cy"] - btn["cy"]) <= btn["h"] * 0.9):
+                return it["t"]
+        return ""
+
+    def _danger_button(self, btn, items):
+        """按钮上/附近的文字是不是「花钱」动作。返回 (bool, 命中文字)。"""
+        for it in items or []:
+            if (abs(it["cx"] - btn["cx"]) <= btn["w"] * 0.8
+                    and abs(it["cy"] - btn["cy"]) <= btn["h"] * 0.9):
+                t = it["t"]
+                if any(w in t for w in DANGER_TEXT):
+                    return True, t
+                if "恢复" in t and any(ch.isdigit() for ch in t):
+                    return True, t
+        return False, ""
+
+    @staticmethod
+    def _frame_diff(a, b):
+        """两帧差多少（0~100 的「变化率」）。框架没有帧差接口，这里保留 6 行自写。
+
+        缩到 160x90 再比灰度均值差 —— 飘字/粒子这种小面积变化不会被误判成「页面变了」。
+        """
+        try:
+            if a is None or b is None:
+                return 0.0
+            if a.shape != b.shape:
+                b = cv2.resize(b, (a.shape[1], a.shape[0]))
+            ga = cv2.resize(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), (160, 90),
+                            interpolation=cv2.INTER_AREA)
+            gb = cv2.resize(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), (160, 90),
+                            interpolation=cv2.INTER_AREA)
+            return float(np.mean(cv2.absdiff(ga, gb)) / 255.0 * 100.0)
+        except Exception:
+            return 0.0
+
+    def _advance_generic(self, items, frame, page="未知"):
+        """通用推进器：不认识这页，也要自己走出去。
+
+        以前的兜底是 fallback=pause（停下等人工），每冒一个新事件就断一次。
+        改成：OCR 认识的安全按钮 → 视觉色块按钮 → ESC → 右上角 X → 屏幕中间，
+        每点一次都验证画面到底变没变，没变就换下一个候选。
+        连续 give_up_after 次全都推不动才停（有上限，不会无限刷）。
+
+        返回 True=继续跑；None=放弃（真的走不出去，需要人看）。
+        """
+        cfg = (self._tuning().get("unknown") or {}).get("advance") or {}
+        max_clicks = int(cfg.get("max_clicks") or 4)
+        wait = float(cfg.get("wait") or 0.8)
+        diff_thr = float(cfg.get("diff_thr") or 1.2)
+        give_up = int(cfg.get("give_up_after") or 6)
+        base = frame.copy() if frame is not None else None
+
+        cands = []
+        for it in items:
+            t = it["t"].strip()
+            if len(t) <= 8 and any(w in t for w in self.ADVANCE_WORDS):
+                cands.append({"cx": it["cx"], "cy": it["cy"], "w": 140, "h": 52,
+                              "kind": "ocr", "text": t, "score": 9.0})
+        # 色块找按钮：框架 ok.util.color.find_color_rectangles（黄色主按钮 / 蓝色次按钮）
+        for b in self._color_buttons(frame, items):
+            danger, why = self._danger_button(b, items)
+            if danger:
+                self.log_info(f"[推进] 跳过 {b['kind']}按钮@({int(b['cx'])},{int(b['cy'])})："
+                              f"附近文字「{why}」像花钱，不点")
+                continue
+            cands.append(b)
+        # 去重（同一个按钮被 OCR 和视觉各抓一次）
+        uniq = []
+        for c in cands:
+            if any(abs(c["cx"] - u["cx"]) < 45 and abs(c["cy"] - u["cy"]) < 45 for u in uniq):
+                continue
+            uniq.append(c)
+        uniq.sort(key=lambda c: -c.get("score", 0))
+
+        tried = 0
+        for c in uniq:
+            if tried >= max_clicks:
+                break
+            tried += 1
+            label = c.get("text") or f"{c['kind']}按钮"
+            self.click(c["cx"], c["cy"])
+            self.sleep(wait)
+            f2 = self._frame()
+            if f2 is None:
+                continue
+            d = self._frame_diff(base, f2)
+            if d >= diff_thr:
+                self.log_info(f"[推进] 点「{label}」→ 画面变化 {d:.1f}%，走出去了")
+                self._advance_fails = 0
+                return True
+            self.log_info(f"[推进] 点「{label}」画面没变（{d:.1f}%），换下一个候选")
+
+        # 逃生链：键盘 → 右上角 X → 屏幕中间。只等一次，别把每次点击都算进 max_clicks
+        escapes = [
+            ("ESC", lambda: self.send_key("esc")),
+            ("右上角X", lambda: self._click_close_x(frame)),
+            ("屏幕中间", lambda: self.click_relative(0.5, 0.5)),
+        ]
+        for name, act in escapes:
+            try:
+                act()
+            except Exception as e:
+                self.log_warning(f"[推进] {name} 失败：{e}")
+                continue
+            self.sleep(wait)
+            f2 = self._frame()
+            if f2 is None:
+                continue
+            d = self._frame_diff(base, f2)
+            if d >= diff_thr:
+                self.log_info(f"[推进] 逃生链「{name}」→ 画面变化 {d:.1f}%，走出去了")
+                self._advance_fails = 0
+                return True
+
+        n = getattr(self, "_advance_fails", 0) + 1
+        self._advance_fails = n
+        if n >= give_up:
+            p = self._shot(frame, f"stuck_{n}")
+            self.log_error(f"通用推进器连续 {n} 次都没能离开未知页，暂停等人工。"
+                           f"文字: {[i['t'] for i in items][:10]}｜截图: {p}", notify=True)
+            return None
+        self.log_warning(f"[推进] 这一屏所有候选都没推动（{n}/{give_up}），下一步重试")
+        return True
+
+    def _click_close_x(self, frame):
+        """点右上角的关闭 X：先模板匹配，认不到就用实测比例坐标。"""
+        pos = self._match_template(frame, "x_close.png")
+        if pos:
+            self.click_relative(pos[0], pos[1])
+            return
+        self.click_relative(0.929, 0.100)
 
     def _do_unknown(self, items, frame):
         joined = " ".join(i["t"] for i in items)
@@ -3963,7 +4700,7 @@ class AutoTask(MyBaseTask):
         # 老配置「未知页面兜底」= 暂停 仍优先（兼容）；否则用新配置 fallback
         old = str(self.config.get("未知页面兜底") or "")
         fallback = ("pause" if old == "暂停"
-                    else str(cfg.get("fallback") or "pause"))
+                    else str(cfg.get("fallback") or "auto"))
         self.unknown_count += 1
         self.unknown_texts.append(texts)
 
@@ -3972,6 +4709,13 @@ class AutoTask(MyBaseTask):
             self.log_error(f"没见过的页面（第 {self.unknown_count} 次）按配置暂停。"
                            f"文字: {texts}｜截图: {p}", notify=True)
             return None
+
+        # auto：通用推进器（视觉找按钮 → 点击 → 差分验证 → 逃生链）
+        # 2026-11-24 起这是默认行为：新页面不再停机，自己想办法走出去。
+        if fallback not in ("center",):
+            self.log_warning(f"未知页面（第 {self.unknown_count} 次）→ 通用推进器接管。"
+                             f"文字: {texts[:8]}")
+            return self._advance_generic(items, frame, page="未知")
 
         limit = int(cfg.get("max_center_clicks") or 10)
         if self.unknown_count <= limit:
@@ -4058,7 +4802,13 @@ class AutoTask(MyBaseTask):
         #   有 → 直接出行；没有 → 退回每日页走训练。
         #   用「第N周-星期X」记今天已经探过，避免同一天反复进出。
         self.trip_probe = False          # 本次进出行页是「探笔记」，不是真要出行
-        self.trip_probe_done = None      # 已经探过的那天，例如 "6-7"
+        self.trip_probe_done = None      # **真的进过**出行页的那天，例如 "6-7"
+        # 2026-11-24 第七周周六漏探笔记的根因：旧代码在**点击之前**就写 done，
+        # 点「出行」被 FLUTTERVIEW 挡住时页面还在每日页，却被记成「今天探过了」，
+        # 下一帧直接走训练分支。现在 done 只在真正进入出行页时才写，
+        # 这里单独记「试了几次还没进去」，最多重试 3 次。
+        self.trip_probe_retry = 0        # 当天点了出行但没进页面的次数
+        self.trip_probe_retry_day = None # 上面那个计数属于哪一天
         self.trip_probe_disabled = False # 兼容旧状态；现在不再置 True（退回失败只放弃当天）
         self.trip_back_tries = 0         # 本次退出出行页试了几次
         # 探笔记的「两级右上角返回」还剩几层：2=扭蛋三选一页, 1=出行页, 0=无
@@ -4153,6 +4903,77 @@ class AutoTask(MyBaseTask):
             # 运行记录收尾：无论正常/异常都写，工作台的「运行记录」页据此显示本次结果
             self._runlog_end(getattr(self, "_runlog_status", "正常"))
 
+    # ---------- 每轮最终得分留证（玩家 2026-11-24）----------
+    # 「训练评分 / 恭喜获得」页会带一个四位数评分（录制样本里是 中锋7108），
+    # 这是整轮训练唯一的总得分证据，页面一闪就过。只读不点：存图 + 存 OCR 原文，
+    # 供事后人工核对（玩家明确要「只要结果」的每轮得分）。
+    # 每次进页都记一条（上限 8 条/轮/页），因为数字可能在后一帧才读全。
+    def _capture_score(self, items, frame, page):
+        try:
+            rnd = int(getattr(self, "rounds_done", 0)) + 1
+            key = f"{rnd}_{page}"
+            buf = getattr(self, "_score_captured", None)
+            if buf is None:
+                self._score_captured = buf = {}
+            n = buf.get(key, 0)
+            if n >= 8:
+                return
+            buf[key] = n + 1
+            texts = [str(it.get("t") or "").strip() for it in items if it.get("t")]
+            nums = []
+            for t in texts:
+                for m in re.findall(r"\d{4,5}", t):
+                    try:
+                        nums.append(int(m))
+                    except Exception:
+                        pass
+            path = ""
+            tag = "rating" if page == "训练评分" else "gain"
+            try:
+                os.makedirs("logs/scores", exist_ok=True)
+                # 文件名带时刻，避免「重启后轮次又从 1 开始」把上一张同名图覆盖掉
+                path = (f"logs/scores/round{rnd}_{tag}_"
+                        f"{time.strftime('%H%M%S')}_{n + 1}.png")
+                if frame is not None:
+                    ok = cv2.imwrite(path, frame)
+                    if not ok or not os.path.exists(path) or os.path.getsize(path) < 1024:
+                        # cv2.imwrite 对非 ASCII 文件名不可靠，PIL 兜底（帧是 BGR）
+                        from PIL import Image
+                        Image.fromarray(np.asarray(frame)[:, :, ::-1]).save(path)
+            except Exception:
+                path = ""
+            self.log_info(f"★ 第 {rnd} 轮「{page}」页 OCR {len(texts)} 段"
+                          f"→ 四位数 {nums or '无'}（存图 {path or '失败'}）")
+            # 终局目标 ③：每轮最终评分要和 9000 比一比（日志里直接给差距，事后不用自己算）
+            if page == "训练评分" and nums:
+                try:
+                    target = int(self._goal_cfg().get("target_score") or 0)
+                except Exception:
+                    target = 0
+                got = max(nums)
+                self.final_score = got
+                if target:
+                    gap = got - target
+                    msg = (f"本轮最终评分 {got}｜目标 {target} → "
+                           + (f"达标 +{gap}" if gap >= 0 else f"差 {abs(gap)} 分"))
+                    if gap >= 0:
+                        self.log_info("🎯 " + msg)
+                    else:
+                        self.log_warning("⚠ " + msg)
+                    self.stat.setdefault("scores", []).append(got)
+            if nums:
+                try:
+                    import json
+                    with open("logs/scores.jsonl", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"round": rnd, "page": page, "nums": nums,
+                                            "texts": texts, "png": path,
+                                            "at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                                           ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # ---------- 运行记录（给工作台的「运行记录」页看）----------
     # 设计：append-only 的 jsonl，一次运行一个 run_id，事件分 start / train / end。
     #   为什么不在内存里攒一份给工作台：AutoTask 是工作台 spawn 的**独立进程**，
@@ -4240,6 +5061,7 @@ class AutoTask(MyBaseTask):
     RESUME_FIELDS = (
         "saw_training", "in_training", "phase", "weekday", "core_checked",
         "trip_picked", "trip_probe", "trip_probe_done",
+        "trip_probe_retry", "trip_probe_retry_day",
         "trip_back_tries", "shop_day", "shop_week", "shop_bought",
         "shop_has_stamina", "notes_done", "minigame_tries", "stock_idx",
         "stock_tries", "stock_picked", "stamina_refills", "stamina_misses",
@@ -4329,10 +5151,26 @@ class AutoTask(MyBaseTask):
             f"商店买 {len(buys)} 件：" + ("、".join(f"{n}({p})" for _, n, p in buys[:8]) or "无"),
             f"赌一把 {len(gamble)} 次：" + ("、".join(f"{k}@{p}%" for k, p in gamble[:8]) or "无"),
         ]
+        # 终局目标 ③：最终评分 vs 9000
+        scores = st.get("scores") or []
+        try:
+            target = int(self._goal_cfg().get("target_score") or 0)
+        except Exception:
+            target = 0
+        if scores:
+            hit = sum(1 for x in scores if x >= target) if target else 0
+            lines.append(f"最终评分 {scores}" + (f"｜目标 {target} → 达标 {hit}/{len(scores)} 轮" if target else ""))
+        else:
+            lines.append("最终评分：本轮没读到「训练评分」页（可能中途停了）")
         if self.known_overlay_hits:
             lines.append("已知浮层（累计）：" + "、".join(
                 f"{k}×{v}" for k, v in self.known_overlay_hits.items()))
         lines.append(f"未知页 {len(self.unknown_texts)} 次")
+        st = getattr(self, "_vis_stats", None) or {}
+        if st:
+            lines.append(f"锚点层：命中 {st.get('hit', 0)} 次、补位 {st.get('fill', 0)} 次、"
+                         f"冲突改判 {st.get('conflict', 0)} 次、硬约束否决 {st.get('veto', 0)} 次"
+                         f"、采样救回 {st.get('anchor_rescue', 0)} 帧")
         trans = getattr(self, "transition_warns", []) or []
         if trans:
             pairs = {}
@@ -4411,6 +5249,7 @@ class AutoTask(MyBaseTask):
             "note_probe": 0,    # 真点进步行街探笔记的次数（含没命中的）
             "sample_fail": 0,   # 训练技能采样失败数
             "stamina_drink": 0, # 喝精力药次数
+            "scores": [],       # 每轮最终评分（训练评分页那个 8000/9000 的数）
         }
 
     @staticmethod
@@ -4422,6 +5261,8 @@ class AutoTask(MyBaseTask):
             dst[k].extend(src.get(k) or [])
         for k in ("note", "note_probe", "sample_fail", "stamina_drink"):
             dst[k] = dst.get(k, 0) + (src.get(k) or 0)
+        if src.get("scores"):
+            dst.setdefault("scores", []).extend(src["scores"])
 
     def _rollover_stat(self):
         """一轮结束：本轮 stat 并入累计，再把本轮清零。
@@ -4448,6 +5289,8 @@ class AutoTask(MyBaseTask):
         self.trip_picked = False
         self.trip_probe = False
         self.trip_probe_done = None
+        self.trip_probe_retry = 0
+        self.trip_probe_retry_day = None
         self.trip_back_tries = 0
         self.unknown_count = 0
         self.minigame_tries = 0
@@ -4503,6 +5346,8 @@ class AutoTask(MyBaseTask):
                 blank = 0
             # 先判页面，再读资源：_read_stamina 要用页面上下文 hint 区分
             # 局内精力/局外专注（上限会变，不能再只靠数字指纹）。
+            # _last_page_hint 给马尔可夫硬约束用：上一步是哪页，决定这一步哪些页不可能。
+            self._last_page_hint = last_page
             page = self._classify(items, frame)
             self._read_stamina(items, frame, page=page)
             self._read_gold(items, frame)          # 顶栏金币，用于买东西时留 120 给笔记
@@ -4541,6 +5386,8 @@ class AutoTask(MyBaseTask):
             repeat = repeat + 1 if key == last_key else 0
             last_key = key
             same_count = same_count + 1 if page == last_page else 0
+            if same_count == 0:
+                self._stuck_tried = False   # 换页了就重置「卡死救过没」
             week, day = self._read_week(items)
             where = f"第{week}周 星期{day}" if week else ""
             self.log_info(f"--- 第 {step} 步 | 页面：{page} {where} | 精力 {self.stamina}/{self.stamina_max} "
@@ -4634,8 +5481,10 @@ class AutoTask(MyBaseTask):
             elif page == "行为卡":
                 self._do_action_card(items, frame)
             elif page == "训练评分":
+                self._capture_score(items, frame, page)
                 self._do_next("训练评分")(items, frame)
             elif page == "恭喜获得":
+                self._capture_score(items, frame, page)
                 self._do_next("恭喜获得")(items, frame)
             elif page == "训练结束":
                 # 这一屏有「前往主界面 / 编队 / 记录笔记 / 下一步」四个按钮。
@@ -4645,6 +5494,14 @@ class AutoTask(MyBaseTask):
                       or self._find(items, ["记录笔记"]))
                 if it:
                     self._click_item(it, "[训练结束-回主界面]")
+                elif any("注册球员" in str(i.get("t") or "") for i in items):
+                    # 2026-11-24 09:01 实跑：这里叠了一张「注册球员」球员卡（闪堂电 分卫
+                    # 评分6181），把「前往主界面/下一步/记录笔记」全挡住，点屏幕中间没用。
+                    # 实测唯一出口是面板右上角 X。09:07 手动校准：X 在图内 (1513,95)，
+                    # 窗口左边框 8px / 标题栏 31px → 客户区 (1505,64) → rel (0.941,0.071)。
+                    # （第一次写成 0.929,0.100 差了 26px，点了 16 步没反应，别再调低。）
+                    self.log_info("[训练结束] 注册球员卡片挡住按钮 → 点右上角 X 关闭")
+                    self.click_relative(0.941, 0.071)
                 else:
                     self.log_warning(f"训练结束页没有可点按钮，文字: {[i['t'] for i in items][:10]}")
                     self.click_relative(0.5, 0.5)
@@ -4772,6 +5629,17 @@ class AutoTask(MyBaseTask):
                                  f"强制把游戏窗口拉到前台再试（点击可能被丢弃）")
                 self._force_visible()
             if same_count >= 15:
+                # 先别急着停：让通用推进器（OCR 按钮 → 色块按钮 → ESC/右上X/中间，
+                # 每次都验证画面变化）试一轮。已知页也可能因为弹窗叠层而推不动，
+                # 这一层是「别一遇到没见过的叠层就断掉整轮」的兜底。
+                if not getattr(self, "_stuck_tried", False):
+                    self._stuck_tried = True
+                    self.log_warning(f"页面「{page}」连续 {same_count} 步没变化 → "
+                                     f"先交给通用推进器试一次")
+                    if self._advance_generic(items, frame, page) is not None:
+                        same_count = 0
+                        self.sleep(wait)
+                        continue
                 self.log_error(f"页面「{page}」连续 {same_count} 步没变化，停下看看", notify=True)
                 self._shot(frame, f"stuck_{step}")
                 break

@@ -13,6 +13,11 @@ _*.log
 *.log
 _*.png
 
+# ── 手工备份 / 运行时缓存（改配置前随手 cp 的，不入库）────────
+*.bak
+*.bak_*
+assets/ocr_cache.json
+
 # ── 框架本地状态（窗口句柄/设备选择，换机器就得变，不入库）────
 configs/devices.json
 

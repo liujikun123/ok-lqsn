@@ -1,32 +1,347 @@
 {
-    "images": [
-        {
-            "id": 1,
-            "file_name": "images/0.png",
-            "width": 3840,
-            "height": 2160
-        }
-    ],
-    "annotations": [
-        {
-            "id": 1,
-            "image_id": 1,
-            "category_id": 1,
-            "bbox": [
-                127,
-                66,
-                58,
-                45
-            ],
-            "area": 2610,
-            "iscrowd": 0
-        }
-    ],
-    "categories": [
-        {
-            "id": 1,
-            "name": "this_is_a_place_holder",
-            "supercategory": ""
-        }
-    ]
+  "info": {
+    "description": "bsg-auto 页面锚点（OCR 自动生成）"
+  },
+  "images": [
+    {
+      "id": 1,
+      "file_name": "images/anchor_001.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 2,
+      "file_name": "images/anchor_002.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 3,
+      "file_name": "images/anchor_003.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 4,
+      "file_name": "images/anchor_004.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 5,
+      "file_name": "images/anchor_005.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 6,
+      "file_name": "images/anchor_006.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 7,
+      "file_name": "images/anchor_007.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 8,
+      "file_name": "images/anchor_008.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 9,
+      "file_name": "images/anchor_009.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 10,
+      "file_name": "images/anchor_010.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 11,
+      "file_name": "images/anchor_011.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 12,
+      "file_name": "images/anchor_012.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 13,
+      "file_name": "images/anchor_013.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "id": 14,
+      "file_name": "images/anchor_014.png",
+      "width": 1600,
+      "height": 900
+    }
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 1,
+      "bbox": [
+        85,
+        637,
+        215,
+        39
+      ],
+      "area": 8385,
+      "iscrowd": 0
+    },
+    {
+      "id": 2,
+      "image_id": 2,
+      "category_id": 2,
+      "bbox": [
+        125,
+        35,
+        150,
+        51
+      ],
+      "area": 7650,
+      "iscrowd": 0
+    },
+    {
+      "id": 3,
+      "image_id": 3,
+      "category_id": 3,
+      "bbox": [
+        122,
+        28,
+        156,
+        61
+      ],
+      "area": 9516,
+      "iscrowd": 0
+    },
+    {
+      "id": 4,
+      "image_id": 4,
+      "category_id": 4,
+      "bbox": [
+        374,
+        823,
+        67,
+        44
+      ],
+      "area": 2948,
+      "iscrowd": 0
+    },
+    {
+      "id": 5,
+      "image_id": 5,
+      "category_id": 5,
+      "bbox": [
+        935,
+        827,
+        60,
+        37
+      ],
+      "area": 2220,
+      "iscrowd": 0
+    },
+    {
+      "id": 6,
+      "image_id": 6,
+      "category_id": 6,
+      "bbox": [
+        682,
+        141,
+        233,
+        74
+      ],
+      "area": 17242,
+      "iscrowd": 0
+    },
+    {
+      "id": 7,
+      "image_id": 7,
+      "category_id": 7,
+      "bbox": [
+        1462,
+        374,
+        113,
+        84
+      ],
+      "area": 9492,
+      "iscrowd": 0
+    },
+    {
+      "id": 8,
+      "image_id": 8,
+      "category_id": 8,
+      "bbox": [
+        1433,
+        595,
+        109,
+        76
+      ],
+      "area": 8284,
+      "iscrowd": 0
+    },
+    {
+      "id": 9,
+      "image_id": 9,
+      "category_id": 9,
+      "bbox": [
+        1465,
+        378,
+        108,
+        78
+      ],
+      "area": 8424,
+      "iscrowd": 0
+    },
+    {
+      "id": 10,
+      "image_id": 10,
+      "category_id": 10,
+      "bbox": [
+        1465,
+        378,
+        110,
+        78
+      ],
+      "area": 8580,
+      "iscrowd": 0
+    },
+    {
+      "id": 11,
+      "image_id": 11,
+      "category_id": 11,
+      "bbox": [
+        182,
+        85,
+        176,
+        103
+      ],
+      "area": 18128,
+      "iscrowd": 0
+    },
+    {
+      "id": 12,
+      "image_id": 12,
+      "category_id": 12,
+      "bbox": [
+        1455,
+        114,
+        70,
+        66
+      ],
+      "area": 4620,
+      "iscrowd": 0
+    },
+    {
+      "id": 13,
+      "image_id": 13,
+      "category_id": 13,
+      "bbox": [
+        890,
+        118,
+        426,
+        136
+      ],
+      "area": 57936,
+      "iscrowd": 0
+    },
+    {
+      "id": 14,
+      "image_id": 14,
+      "category_id": 14,
+      "bbox": [
+        673,
+        786,
+        170,
+        46
+      ],
+      "area": 7820,
+      "iscrowd": 0
+    }
+  ],
+  "categories": [
+    {
+      "id": 1,
+      "name": "选择队友_历史阵容",
+      "supercategory": "选择队友"
+    },
+    {
+      "id": 2,
+      "name": "笔记选择_标题",
+      "supercategory": "笔记选择"
+    },
+    {
+      "id": 3,
+      "name": "器材选择_标题",
+      "supercategory": "器材选择"
+    },
+    {
+      "id": 4,
+      "name": "大厅_剧情",
+      "supercategory": "大厅"
+    },
+    {
+      "id": 5,
+      "name": "大厅_角色",
+      "supercategory": "大厅"
+    },
+    {
+      "id": 6,
+      "name": "恭喜获得_标题",
+      "supercategory": "恭喜获得"
+    },
+    {
+      "id": 7,
+      "name": "训练核心_决定",
+      "supercategory": "训练核心"
+    },
+    {
+      "id": 8,
+      "name": "训练核心_决定_1",
+      "supercategory": "训练核心"
+    },
+    {
+      "id": 9,
+      "name": "训练核心_决定_2",
+      "supercategory": "训练核心"
+    },
+    {
+      "id": 10,
+      "name": "训练核心_决定_3",
+      "supercategory": "训练核心"
+    },
+    {
+      "id": 11,
+      "name": "商店_标题",
+      "supercategory": "商店"
+    },
+    {
+      "id": 12,
+      "name": "商店_关闭",
+      "supercategory": "商店"
+    },
+    {
+      "id": 13,
+      "name": "训练评分_标题",
+      "supercategory": "训练评分"
+    },
+    {
+      "id": 14,
+      "name": "训练评分_继续",
+      "supercategory": "训练评分"
+    }
+  ]
 }
