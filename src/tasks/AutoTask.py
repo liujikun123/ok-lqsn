@@ -3657,6 +3657,10 @@ class AutoTask(MyBaseTask):
         #   也有可能不出现，所以不是固定的。」
         # 所以「这一项场上摆了几张」是**真实差异**，必须按项算 —— 别再像上一版那样
         # 取整场统一值（那会把真实差异抹平）。
+        # 【2026-11-26 再纠正】但**档位（普/金/彩）不能按项比**：玩家说明那是
+        # 「局内熟练度提升后随机触发的暴击效果」，会随时间闪；5 个训练项是依次采的，
+        # 后采的项熟练度更高、更容易拍到金/彩，按档位计分 = 让采样顺序决定排名。
+        # 所以张数进排名、档位只观察（见 _score_item 里的 use_in_score）。
         # last_equip_count 只记整场最多张数，供商店「器材暴击只有器材上站人才买」判断。
         seen_eq = max([len(d.get("equips") or []) for d in scored] or [0])
         if seen_eq:
@@ -3668,8 +3672,11 @@ class AutoTask(MyBaseTask):
         n_gold = sum(1 for d in scored for e in (d.get("equips") or []) if e == "金")
         n_plain = sum(1 for d in scored for e in (d.get("equips") or []) if e == "普")
         if n_color or n_gold:
-            self.log_info(f"器材品质：金 {n_gold} 张（每张 1.0）/ 彩 {n_color} 张（每张 1.5）"
-                          f" / 普 {n_plain} 张（每张 0.5）")
+            use_tier = bool((cfg.get("equipment_tier") or {}).get("use_in_score", False))
+            self.log_info(f"器材暴击（局内熟练度触发，瞬时状态）：金 {n_gold} 张 / 彩 {n_color} 张"
+                          f" / 未暴击 {n_plain} 张"
+                          + ("→ 按档位计分" if use_tier else "→ 不参与排名，只记录"))
+
 
         usable = [d for d in scored if d["valid"]]
         if usable:
@@ -4293,16 +4300,18 @@ class AutoTask(MyBaseTask):
 
         现在参与计分的信号有四个：
           1. 场上出场队友数（含经理、含主训本人）  ← 每个 +teammate 分
-          2. 器材卡数量 × 光效档位（彩 1.5 / 金 1.0 / 普 0.5）
+          2. 器材卡**张数** × equipment（0.5/张）
              ⚠️ 器材是**按训练项**变的（玩家 2026-11-26：「开局先选好五个，训练过程中
-                可能分布在各个不同的训练项里，也可能不出现」），所以它进排名是合理的。
-                但读数本身不稳（卡片淡入淡出），这是已知噪声。
+                可能分布在各个不同的训练项里，也可能不出现」），所以张数进排名是合理的。
+             ⚠️ 金 / 彩 光效**不进排名**（玩家 2026-11-26 定论）：那是「局内熟练度
+                提升后随机触发的暴击效果」，是随时间闪的事件，不是器材固有品质。
+                按档位分会让「最后采的那个训练项」白占便宜（熟练度最高），见下方注释。
           3. 失败率（失败 = 白扔体力）→ 整包乘法打折
           4. 训练项等级 Lv.1/Lv.2/MAX ← 只记录，**不计分**（玩家口径）
 
         器材**不走 OCR**（玩家 2026-11-26 点明「器材上面没有文字」）：
         卡面是插画/图标，没有任何可读文字，识别靠 src/core/cards.py 的颜色掩膜 + 轮廓
-        + 光晕色，只能得到「几张 + 什么品质」，读不出「是哪件器材」。
+        + 光晕色，只能得到「几张 + 此刻是否在暴击（普/金/彩）」，读不出「是哪件器材」。
         """
         # 队友计分：普通队友 teammate（默认 1.0），球队经理单独 manager_weight（默认 2.0）。
         # 【2026-11-26 玩家纠正】经理**不是常驻**：实测 1124 次读数里出现 25.1%，
@@ -4314,13 +4323,25 @@ class AutoTask(MyBaseTask):
         mgr_names = set(cfg.get("manager_names") or [])
         base = sum(mgr_w if m in mgr_names else teammate_w for m in mates)
 
-        # 器材：训练项页中场摆着的 1~3 张支援卡，按外框光效计分（图像识别，不 OCR）。
-        #   玩家原口径：「队友 +1、器材 0.5、金光 1、彩光 1.5」
-        #   注意读数不稳（淡入淡出 + 偶发误检），所以调用方统一成场级一组再传进来。
+        # 器材：训练项页中场摆着的 1~5 张支援卡。
+        #   玩家 2026-11-26 定论：「随着训练，在局内器材的熟练度会提升，
+        #   就会有几率变成金色和彩色的暴击效果。」
+        #   → 金 / 彩 不是器材固有品质，是**局内熟练度触发的随机暴击光效**，
+        #     同一件器材会随时间在 普 / 金 / 彩 之间来回闪。
+        #   所以默认 **按张数计分**（equipment_tier.use_in_score=false）：
+        #     ① 暴击是随机事件，单帧拍到哪一档只是抽样，不代表这项值多少分；
+        #     ② 5 个训练项是依次采的，熟练度一路上涨，按档位计分等于给
+        #        「最后采的那项」白送 0.5~1.0 分 —— 这是测量顺序造成的假优势。
+        #   档位仍然读、仍然打日志，用来观察本局熟练度涨到哪了；只是不进排名。
+        #   想把档位计分打开：strategy.yaml → equipment_tier.use_in_score: true。
         if equips:
             tbl = cfg.get("equipment_tier") or {}
-            for g in equips:
-                base += float(tbl.get(g, cfg.get("equipment", 0.5)))
+            base_card = float(cfg.get("equipment", 0.5))
+            if bool(tbl.get("use_in_score", False)):
+                for g in equips:
+                    base += float(tbl.get(g, base_card))
+            else:
+                base += len(equips) * base_card
 
         lv_table = cfg.get("level_bonus") or {}
         key = "MAX" if (level or "").upper().startswith("MAX") else ""
