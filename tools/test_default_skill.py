@@ -207,14 +207,22 @@ def sample_order(st):
     return [n for k, n in st.trace if k == "sample"]
 
 
-print("\n== 2. 默认选中=投射：第一个采、全程不点 ==")
+print("\n== 2. 默认选中=投射：第一个采、读它时不点 ==")
 st = run_flow(make_frame("投射"))
 clicked = [c[0] for c in st.clicks]
-check("投射一次都没被点（含收尾）", "投射" in clicked, False)
+# 2026-11-26：采完之后又去点开了别的训练项，画面展开的已经不是投射，
+# 所以收尾要把投射点回来才能点「决定」—— 这一次点击是必要的，不算误点。
+# （这条以前写的是「含收尾也一次都不点」，那是还没有「切到最优项」逻辑时的行为。）
+check("投射只在收尾切最优项时被点一次", clicked.count("投射"), 1)
+check("那一次点击的原因是切最优项",
+      [c for c in st.clicks if c[0] == "投射" and str(c[1]).startswith("[最优训练项")] != [], True)
 check("第一个动作就是采投射", st.trace[0], ("sample", "投射"))
 check("投射只采一次", sample_order(st).count("投射"), 1)
 check("6 个训练项全采到", len(sample_order(st)), 6)
-check("其它带角标技能照常点开", len([c for c in clicked if c != "坐标点击"]), 5)
+# 展开点击 5 次（投射是默认展开的，不点）+ 收尾切项 1 次 = 6
+expand_clicks = [c for c in st.clicks if c[0] != "坐标点击"
+                 and not str(c[1]).startswith("[最优训练项")]
+check("其它 5 项各点开一次（投射不点）", len(expand_clicks), 5)
 check("写出 DECIDE", "DECIDE" in [t for t, _ in st.audits], True)
 dec = find_audit(st, "DECIDE")
 check("DECIDE 标注默认选中项", "【默认选中项】投射" in dec, True)
@@ -227,29 +235,32 @@ check("证据标注未点击", "默认选中帧(未点击)" in core0[0][1], True
 check("收尾点了决定", st.decided, ["决定"])
 check("记了一条训练", len(st.runlog), 1)
 
-print("\n== 3. 认不出高亮 → 所有带角标的训练项都点开读数（不特殊对待投射）==")
+print("\n== 3. 认不出高亮：仍按写死的默认项「投射」处理 ==")
+# 2026-11-26 起默认项写死 DEFAULT_ITEM="投射"，不再依赖画面高亮，
+# 所以「认不出」和「认出投射」走同一条路：先采投射、其余点开、收尾切回投射。
 st2 = run_flow(make_frame(None))
 clicked2 = [c[0] for c in st2.clicks]
-check("投射也会被点开", "投射" in clicked2, True)
-# 认不出高亮时收尾仍会点一次「最优训练项」（合理：无法假定它已选中），这里只数读数点击
-sample_clicks2 = [c for c in st2.clicks if not str(c[1]).startswith("[最优训练项")]
-check("六个训练项都读数", len(sample_clicks2), 6)
+check("投射最后会被点开（切最优项）", "投射" in clicked2, True)
+check("六个训练项都读到数", len(sample_order(st2)), 6)
 dec2 = find_audit(st2, "DECIDE")
-check("DECIDE 标注未识别", "【默认选中项】未识别" in dec2, True)
+check("DECIDE 仍标注默认选中投射（写死，不靠画面）", "【默认选中项】投射" in dec2, True)
 check("投射参与排名", "投射 4.00分" in dec2, True)
 check("仍然写出 DECIDE", "【最终选择】" in dec2, True)
 
-print("\n== 4. 默认项是弹跳：弹跳第一个采且不点，其余 5 个（含投射）点开 ==")
+print("\n== 4. 默认项写死「投射」：画面高亮在弹跳也按投射处理 ==")
+# 玩家 2026-11-26 定案：不再用颜色识别猜默认项，直接写死 DEFAULT_ITEM="投射"。
+# 起因是颜色判据偶尔把默认项认成「体能」，导致去点投射 → 反而把默认态改掉、触发二次确认开训。
+# 所以「画面高亮在弹跳」这个场景现在已经不该改变任何行为。
 st3 = run_flow(make_frame("弹跳"))
 clicked3 = [c[0] for c in st3.clicks]
-check("投射照常点开", "投射" in clicked3, True)
-check("弹跳（高亮）也不点击", "弹跳" in clicked3, False)
-check("第一个动作就是采弹跳", st3.trace[0], ("sample", "弹跳"))
+check("投射照常点开（它不再是默认项）", "投射" in clicked3, True)
+check("弹跳也要点开（写死的默认不是它）", "弹跳" in clicked3, True)
+check("第一个动作仍是采投射", st3.trace[0], ("sample", "投射"))
 # 收尾还会点一次「最优训练项」，那不是读数点击，排除掉再数
 sample_clicks3 = [c for c in st3.clicks if not str(c[1]).startswith("[最优训练项")]
 check("其余 5 个训练项点开", len([c for c in sample_clicks3 if c != "坐标点击"]), 5)
 dec3 = find_audit(st3, "DECIDE")
-check("DECIDE 标注默认选中弹跳", "【默认选中项】弹跳" in dec3, True)
+check("DECIDE 标注默认选中投射", "【默认选中项】投射" in dec3, True)
 
 print("\n== 5. 六项都没角标 = 残帧 → 先重取 3 次，仍没有才决定 ==")
 # 玩家 2026-11-24 12:55：「角标代表有人，没角标的一定没有人」→ 没角标的项队友恒为 0。
@@ -261,13 +272,14 @@ check("一次读数都没有", sample_order(st4), [])
 check("重取了 3 次帧", st4.frames, 3)
 check("兜底直接点决定", st4.decided, ["决定"])
 
-print("\n== 6. 默认项读数失败：只重取帧、不补点 ==")
+print("\n== 6. 默认项读数失败：只重取帧、不补点；仍 0 帧就停机 ==")
+# 玩家 2026-11-26：「为什么采样 0 帧这么多还继续？应该停下来」
+# → 读数失败即暂停（read_fail_stop），不再「一股脑流过去」。
 st5 = run_flow(make_frame("投射"), empty_skill="投射")
 check("投射始终没被点", "投射" in [c[0] for c in st5.clicks], False)
 check("投射重采了一次（共 2 次读数）", sample_order(st5).count("投射"), 2)
-dec5 = find_audit(st5, "DECIDE")
-check("DECIDE 说明默认项没采到", "未采到，未参与排名" in dec5, True)
-check("仍选出其它技能", "【最终选择】" in dec5, True)
+check("仍 0 帧 → 没有继续决策（停机等人看画面）", st5.decided, [])
+check("停机时有报错记录", len(getattr(st5, "errors", [])) > 0, True)
 
 print("\n== 7. 只采有角标的：默认项没角标就是没人，不采也不点 ==")
 st6 = run_flow(make_frame("投射"), badges={"弹跳", "意识"})

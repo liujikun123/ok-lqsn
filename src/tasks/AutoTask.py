@@ -3665,9 +3665,11 @@ class AutoTask(MyBaseTask):
                             for d in scored)
         self.log_info(f"本场器材分布：{eq_txt}（整场最多 {seen_eq} 张）")
         n_color = sum(1 for d in scored for e in (d.get("equips") or []) if e == "彩")
-        if n_color:
-            self.log_info(f"其中彩卡（彩虹光晕）{n_color} 张 → 每张按 1.5 计；"
-                          f"其余按普 0.5 计（金框判据未校准，暂不给金）")
+        n_gold = sum(1 for d in scored for e in (d.get("equips") or []) if e == "金")
+        n_plain = sum(1 for d in scored for e in (d.get("equips") or []) if e == "普")
+        if n_color or n_gold:
+            self.log_info(f"器材品质：金 {n_gold} 张（每张 1.0）/ 彩 {n_color} 张（每张 1.5）"
+                          f" / 普 {n_plain} 张（每张 0.5）")
 
         usable = [d for d in scored if d["valid"]]
         if usable:
@@ -3927,8 +3929,8 @@ class AutoTask(MyBaseTask):
             f"队友({len(names)})：{names}\n"
             f"器材({len(equips or base_equips)})：{equips or base_equips}"
             f"{'' if equips else '（本帧没读到，用进页面基线）'}"
-            f"（图像识别，按训练项各自计分；品质只敢区分「彩 / 非彩」，"
-            f"这里的「普」是**未校准的暂定值**，金框判据待玩家给出）\n"
+            f"（图像识别，按训练项各自计分；品质按框线最外沿饱和度分三档："
+            f"普=浅黄细框 / 金=浓橙粗框 / 彩=彩虹光晕，判据见 docs/04 #73）\n"
             f"失败率：{pct}%   等级：{level}\n"
             f"—— 本帧 OCR 原文 ——\n"
             + "\n".join(f"{it.get('cx'):.0f},{it.get('cy'):.0f}  {it['t']}"
