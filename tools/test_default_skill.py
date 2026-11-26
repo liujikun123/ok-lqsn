@@ -89,6 +89,7 @@ class CoreStub(AutoTask):
         self.stat = {"train": {}, "gamble": [], "sample_fail": 0}
         self.stamina, self.stamina_max, self.gold = 84, 130, 120
         self.item_checked = False
+        self.read_fail_stop = False     # _do_training_core 会读它（读数失败即停机开关）
         self.badges = badges            # False = 六个训练项都没角标
         self.badge_seq = badge_seq or []  # 模拟逐帧变化：第 i 次重取帧后的角标配置
         self.frames = 0                 # 取帧次数（验证"坏帧重取"用）
@@ -104,6 +105,11 @@ class CoreStub(AutoTask):
 
     def log_warning(self, *a, **kw):
         pass
+
+    def log_error(self, msg, *a, **kw):
+        # 2026-11-26：_read_fail_stop_now 会走 log_error（框架 logger），桩里接住即可
+        self.errors = getattr(self, "errors", [])
+        self.errors.append(str(msg))
 
     def sleep(self, *a, **kw):
         pass
@@ -215,8 +221,8 @@ check("DECIDE 标注默认选中项", "【默认选中项】投射" in dec, True
 check("DECIDE 说明未点击", "先进页面直接采默认帧、全程未点击" in dec, True)
 check("DECIDE 里投射参与排名", "投射 4.00分" in dec, True)
 check("投射最终被选中", "【最终选择】投射" in dec, True)
-core0 = [(t, x) for t, x in st.audits if t.startswith("core0_")]
-check("投射证据落在 core0", len(core0), 1)
+core0 = [(t, x) for t, x in st.audits if t.startswith("item0_")]   # 2026-11-26：审计文件名 core→item
+check("投射证据落在 item0", len(core0), 1)
 check("证据标注未点击", "默认选中帧(未点击)" in core0[0][1], True)
 check("收尾点了决定", st.decided, ["决定"])
 check("记了一条训练", len(st.runlog), 1)

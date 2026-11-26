@@ -1929,14 +1929,24 @@ class AutoTask(MyBaseTask):
                              f"[探笔记] 步行街扭蛋三选一\n"
                              f"OCR：{[i['t'] for i in items]}\n"
                              f"命中【笔记/继承】：{hits or '无'}\n")
-            if not hits or self.notes_done:
+            # 2026-11-26 修：以前这里写 `if not hits or self.notes_done:`，两种情况共用
+            # 同一句「没有笔记」的日志。而主循环曾经只要画面上出现「笔记继承」四个字就把
+            # notes_done 置 True（那四个字本来就印在扭蛋选项上），于是一出现笔记就被判成
+            # 「本轮已拿过」而退回 —— 11-24 11:20:59、11-25 14:36:42 两次机会全放掉了，
+            # 日志还骗人写「没有「笔记/继承」」。现在拆成两条，日志各说各的实话。
+            if not hits:
                 opts = [i["t"] for i in items if 0.2 < i["cy"] / frame.shape[0] < 0.55][:6]
                 self.log_info(f"[探笔记] 扭蛋三选一没有「笔记/继承」→ 两级右上角退回，回每日页走训练"
                               f"｜选项 {opts}")
                 self.trip_probe_back = 1
                 return self._leave_top_right(items, frame, "[退第1层 扭蛋页→出行页]")
-            self.stat["note"] += 1
-            self.log_info(f"[探笔记] 命中 {hits} → 选笔记扭蛋（本轮笔记次数 {self.stat['note']}）")
+            if self.notes_done:
+                self.log_warning(f"[探笔记] 扭蛋里有 {hits}，但本轮已经拿过笔记 → 不买，退回走训练")
+                self.trip_probe_back = 1
+                return self._leave_top_right(items, frame, "[本轮已拿过笔记]")
+            # 计数改到「真正买成功」那一刻（末尾 notes_done=True 处），
+            # 否则摘要里的「拿到笔记 N 次」其实是「命中 N 次」，会虚高。
+            self.log_info(f"[探笔记] 命中 {hits} → 准备选笔记扭蛋")
             self.trip_probe_back = 0   # 走正常购买流程，不用退回
 
         if self.notes_done:
@@ -1975,6 +1985,8 @@ class AutoTask(MyBaseTask):
             return True
         self._click_confirm(self._texts(f2), f2)
         self.notes_done = True
+        self.stat["note"] += 1
+        self.log_info(f"[探笔记] 已买下「{best['t']}」（本轮第 {self.stat['note']} 次拿到笔记）")
         return True
 
     def _do_egg_machine(self, items, frame):
@@ -3342,7 +3354,16 @@ class AutoTask(MyBaseTask):
 
         2026-11-23 实测坐标（1920x1080，训练项页）：球队经理(364,443)、真崎(555,448)、
         百目鬼(684,441)、希雅(888,455)，都落在 y≈0.41 这一行。
-        「球队经理」是场边常驻角色，不是队友，必须排除，否则每个训练项都白送 1 分。
+
+        【2026-11-26 玩家纠正】「球队经理也不是每个训练都在的，也是有概率出现的。
+        跟普通的人一样，只是他的权重会比较大。」——旧注释写「经理是场边常驻、必须排除」，
+        是错的。1124 次读数实盘复核：
+          · 经理出现 283 次 = 25.1%，和普通支援（百目鬼 28.5% / 真崎 27.9% /
+            佐久间 27.4% / 闪堂 28.6%）同一量级，**不是常驻**；
+          · 同一天的多训练项里，235/298（79%）是「有的项有经理、有的没有」；
+          · 只有主训本人 希雅 是 100% 出场（每项都在，对排名只是常数偏移）。
+        所以经理按「读到名字才算」处理：命中 manager_names 才按 manager_weight 计分，
+        没读到就不加分，绝不假定它在场。
         """
         h, w = frame.shape[:2]
         out = []
@@ -3558,6 +3579,14 @@ class AutoTask(MyBaseTask):
             self.log_info(f"器材基线（进页面帧）：{len(base_equips)} 张 {base_equips}")
 
         scored = []
+        # 【2026-11-26 19:0x 修「投射练了 12 次」】cur_expand = 此刻画面上**展开着详情**的那一项。
+        # 进页面时展开的是默认项「投射」；之后每点开一个就换成那个。
+        # 「决定」练的是当前展开项，不是排名第一项 —— 这两者只有在「排名第一 = 当前展开」
+        # 时才一致。旧代码只判断 `_sk == selected`（写死的「投射」），于是：
+        #   排名第一是投射 → 跳过点击 → 但画面展开的是最后点过的「意识」→ 决定 = 练意识，
+        #   而统计里记的却是投射。实跑铁证：这一轮 35 次训练，投射被记 12 次，
+        #   它的等级从头到尾都是 LV.2（一次都没升），意识却从 LV.1 跳到 LV.3 —— 练的全是意识。
+        cur_expand = selected
         # ① 默认选中项**最先采，而且一次都不点**。
         #    玩家 2026-11-24 11:55：「进入的时候默认就是投射的，不用点击直接就能读数，
         #    如果这时候要去点击它，会直接变成选中」。也就是说这页一进来就已经展开着默认项的
@@ -3608,6 +3637,9 @@ class AutoTask(MyBaseTask):
             if rec is None:
                 return True
             scored.append(rec)
+            # 【2026-11-26 19:0x】点开谁，画面就展开谁的详情，「决定」永远练**当前展开**的那一项。
+            # 必须逐个记下来，否则最后一步会选错（见下方 cur_expand 的注释）。
+            cur_expand = r["t"]
         # 读数失败已经请求停机（_read_fail_stop_now 会把 read_fail_stop 置 True）：
         # 不要再排名、不要再点决定，直接把控制权交回主循环去 break。
         if self.read_fail_stop:
@@ -3620,11 +3652,22 @@ class AutoTask(MyBaseTask):
             self.log_warning("所有候选都没读到训练项详情，按当前默认项决定")
             return self._decide(items, frame)
 
-        # 记下这一场器材最多有几张 —— 商店那边「器材暴击道具只有器材上站人才买」
-        # 要用它（wiki 原话）。商店页看不到器材，只能靠训练项页这一眼。
+        # ===== 器材：**按训练项**计分（玩家 2026-11-26 纠正）=====
+        # 「器材是开局先选好五个，训练过程中这些器材可能分布在各个不同的训练项里，
+        #   也有可能不出现，所以不是固定的。」
+        # 所以「这一项场上摆了几张」是**真实差异**，必须按项算 —— 别再像上一版那样
+        # 取整场统一值（那会把真实差异抹平）。
+        # last_equip_count 只记整场最多张数，供商店「器材暴击只有器材上站人才买」判断。
         seen_eq = max([len(d.get("equips") or []) for d in scored] or [0])
         if seen_eq:
             self.last_equip_count = seen_eq
+        eq_txt = " / ".join(f"{d['row']['t']}{len(d.get('equips') or [])}张"
+                            for d in scored)
+        self.log_info(f"本场器材分布：{eq_txt}（整场最多 {seen_eq} 张）")
+        n_color = sum(1 for d in scored for e in (d.get("equips") or []) if e == "彩")
+        if n_color:
+            self.log_info(f"其中彩卡（彩虹光晕）{n_color} 张 → 每张按 1.5 计；"
+                          f"其余按普 0.5 计（金框判据未校准，暂不给金）")
 
         usable = [d for d in scored if d["valid"]]
         if usable:
@@ -3736,16 +3779,28 @@ class AutoTask(MyBaseTask):
         # 运行记录：记下这次选课的最终得分与当时的体力，工作台按轮次列出来
         self._runlog_train(_sk, best["score"], best["pct"], best["mates"],
                            best.get("equips"))
-        if _sk == selected:
-            # 本来就是默认选中项，再点一次会被游戏当成确认开训，跳过直接点「决定」
-            self.log_info(f"「{_sk}」本来就是默认选中项 → 不再点它，避免二次确认开训")
+        if _sk == cur_expand:
+            # 画面展开的就是它 → 再点一次会被游戏当成确认开训，跳过直接点「决定」
+            self.log_info(f"当前展开的就是「{_sk}」→ 不再点它，直接点「决定」")
         else:
+            # 画面展开的是别的项 → 必须先把最优项点开（切换选择是安全的，不会开训），
+            # 否则「决定」会练成当前展开的那一项（旧代码就栽在这里）
+            self.log_info(f"当前展开的是「{cur_expand}」，最优是「{_sk}」→ 先切到「{_sk}」再决定")
             self._click_item(best["row"], f"[最优训练项 {_sk} 得分{best['score']:.1f}]")
         self.sleep(1.0)
         f3 = self._frame()
         if f3 is None:
             return True
-        return self._decide(self._texts(f3), f3)
+        # 【2026-11-26 取证】点「决定」之前把画面连同文字落一份审计：
+        # 训练项页上「展开着详情」的那一项 = 这一课真正会练到的项。
+        # 有了它就能直接对照「排名第一」和「实际会练」是否一致 ——
+        # 投射 6 次第一、等级却一直是 LV.1，就是靠这份证据定性的。
+        _t3 = self._texts(f3)
+        self.log_info(f"[决定前] 目标「{_sk}」｜当前画面文字：{[i['t'] for i in _t3][:14]}")
+        self._audit_save(audit_week, audit_day, f"before_{_sk}", f3,
+                         f"[决定前] 目标={_sk}  当前展开={cur_expand}\n"
+                         f"OCR：{[i['t'] for i in _t3]}\n")
+        return self._decide(_t3, f3)
 
     def _remember_main_char(self, name):
         """把认出来的主角名补进粘贴词过滤池（去重，最多留 8 个）。"""
@@ -3871,7 +3926,9 @@ class AutoTask(MyBaseTask):
             f"读数方式：{'默认选中帧(未点击)' if how == 'default' else '点开胶囊后读数'}\n"
             f"队友({len(names)})：{names}\n"
             f"器材({len(equips or base_equips)})：{equips or base_equips}"
-            f"{'' if equips else '（本帧没读到，用进页面基线）'}\n"
+            f"{'' if equips else '（本帧没读到，用进页面基线）'}"
+            f"（图像识别，按训练项各自计分；品质只敢区分「彩 / 非彩」，"
+            f"这里的「普」是**未校准的暂定值**，金框判据待玩家给出）\n"
             f"失败率：{pct}%   等级：{level}\n"
             f"—— 本帧 OCR 原文 ——\n"
             + "\n".join(f"{it.get('cx'):.0f},{it.get('cy'):.0f}  {it['t']}"
@@ -3881,7 +3938,7 @@ class AutoTask(MyBaseTask):
         return rec
 
     def _main_char_of_round(self, scored, cfg):
-        """本轮主训人员是谁 —— 出现在**每个**训练项里的那个名字。
+        """本轮主训人员是谁 —— 每项都在场的那个名字（实测只有主训本人满足）。
 
         玩家 2026-11-23 两条要求：
           1.「每轮训练你要知道主训人员是谁，不能写死名字」
@@ -3889,11 +3946,19 @@ class AutoTask(MyBaseTask):
           2.「经理也是算作队友的」
              所以判出来**只记录、不剔除**；恒在场 = 对每个训练项都 +1，排名不受影响。
 
+        【2026-11-26 玩家纠正】经理**不是常驻**（实测 25.1%，按项概率出现），
+        所以「满场」的候选只可能是主训本人；这里不再假设「主训 + 常驻经理」两个候选。
+        实测 1124 次读数：希雅 100% 出场、其余名字 25~29%，判据稳定。
+
         判不出来（只采到一个训练项、或 OCR 漏读）就返回 None，不猜。
-        多个候选（主训 + 常驻经理都满场）时取出现帧数最多的那个。
+        多个候选都满场时取出现帧数最多的那个。
         """
         if len(scored) < 2:
             return None
+        # resident_ratio 保持 1.0（必须每个训练项都读到）：判宽了会把 3 字的支援
+        # （百目鬼/佐久间）误认成主训，而 _remember_main_char 会把它加进
+        # known_main_chars 当成「粘连词前缀」→ 这个名字以后会被永久剔掉。
+        # 认不出只是少打一条日志，评不了分，宁可认不出。
         ratio = float(cfg.get("resident_ratio", 1.0) or 1.0)
         cnt = {}
         for d in scored:
@@ -4225,22 +4290,30 @@ class AutoTask(MyBaseTask):
 
         现在参与计分的信号有四个：
           1. 场上出场队友数（含经理、含主训本人）  ← 每个 +teammate 分
-          2. 器材卡数量 × 光效档位（金 1.0 / 彩 1.5 / 普通 0.5）
+          2. 器材卡数量 × 光效档位（彩 1.5 / 金 1.0 / 普 0.5）
+             ⚠️ 器材是**按训练项**变的（玩家 2026-11-26：「开局先选好五个，训练过程中
+                可能分布在各个不同的训练项里，也可能不出现」），所以它进排名是合理的。
+                但读数本身不稳（卡片淡入淡出），这是已知噪声。
           3. 失败率（失败 = 白扔体力）→ 整包乘法打折
           4. 训练项等级 Lv.1/Lv.2/MAX ← 只记录，**不计分**（玩家口径）
+
+        器材**不走 OCR**（玩家 2026-11-26 点明「器材上面没有文字」）：
+        卡面是插画/图标，没有任何可读文字，识别靠 src/core/cards.py 的颜色掩膜 + 轮廓
+        + 光晕色，只能得到「几张 + 什么品质」，读不出「是哪件器材」。
         """
-        # 队友计分：普通队友 teammate（默认 1.0），球队经理单独 manager_weight（默认 1.5）。
-        # 玩家 2026-11-23 22:14：「经理的权重调为1.5」。经理场边常驻、每个训练项都在场，
-        # 名字命中 manager_names 就按这个权重算；老配置没配经理名时退化为「全员同权」，行为不变。
+        # 队友计分：普通队友 teammate（默认 1.0），球队经理单独 manager_weight（默认 2.0）。
+        # 【2026-11-26 玩家纠正】经理**不是常驻**：实测 1124 次读数里出现 25.1%，
+        # 和普通支援同量级；只是它给的加成更值钱，所以权重更高。
+        # 因此这里严格按「名字读到才算」—— 没读到的项不加经理分，不假定它在场。
+        # 老配置没配经理名时退化为「全员同权」，行为不变。
         teammate_w = float(cfg.get("teammate", 1.0))
         mgr_w = float(cfg.get("manager_weight", teammate_w))
         mgr_names = set(cfg.get("manager_names") or [])
         base = sum(mgr_w if m in mgr_names else teammate_w for m in mates)
 
-        # 器材：训练项页中场摆着的 1~3 张支援卡，按外框光效计分。
+        # 器材：训练项页中场摆着的 1~3 张支援卡，按外框光效计分（图像识别，不 OCR）。
         #   玩家原口径：「队友 +1、器材 0.5、金光 1、彩光 1.5」
-        #   （2026-11-23 早先误判成「器材读不到」，实机截图证明选之前就画在场上，
-        #     检测用 src/core/cards.py，离线 70 帧稳定：单张卡 x≈620、框色判定正常。）
+        #   注意读数不稳（淡入淡出 + 偶发误检），所以调用方统一成场级一组再传进来。
         if equips:
             tbl = cfg.get("equipment_tier") or {}
             for g in equips:
@@ -5628,9 +5701,12 @@ class AutoTask(MyBaseTask):
             self.log_info(f"--- 第 {step} 步 | 页面：{page} {where} | 精力 {self.stamina}/{self.stamina_max} "
                           f"| 局外专注 {self.out_focus}/{self.out_focus_max} | 文字 {len(items)} 段")
 
-            if "笔记继承" in " ".join(i["t"] for i in items) and not self.notes_done:
-                self.log_info("检测到「笔记继承」，标记本次已完成")
-                self.notes_done = True
+            # 2026-11-26 删掉这里原来的预置位：
+            #   `if "笔记继承" in 画面全文: notes_done = True`
+            # 「笔记继承」这四个字本来就印在步行街扭蛋的选项上，只要它出现，主循环就先
+            # 把「本轮已拿过笔记」置真，等轮到 _do_egg_machine 去买时又看到 notes_done
+            # 而退回 —— 等于永远买不到。11-24、11-25 各出现过一次，两次都被这么放掉。
+            # 是否真的拿到，只由真正买成功的那一刻决定（见 _do_egg_machine 末尾）。
 
             # 局外体力不足弹窗：绝不点「购买」，直接取消
             joined = " ".join(i["t"] for i in items)

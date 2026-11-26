@@ -1,5 +1,10 @@
 """训练项页「器材/支援卡片」识别。
 
+⚠️ 这里是**纯图像识别，不走 OCR**（玩家 2026-11-26 点明：「器材上面没有文字」）：
+   卡面是插画/图标（球、护腕、人物…），玩家看到的「像个字」其实是图标形状，
+   没有任何可读文本。所以只能靠「边框颜色 + 轮廓尺寸」找卡，靠「光晕暖/冷色」判品质。
+   读得出：几张、普通/彩 → 读不出：是哪件器材（要认具体器材得做图标模板匹配，暂不做）。
+
 页面事实（重新核对于 2026-11-24，1600x900 实机帧 + 1080p 历史帧）：
 - 训练项页右侧是 6 个训练项条目；选中项高亮，上方显示「失败率 N%」。
 - 画面中间偏下横排 1~3 张卡片，每张 = 这次训练带的支援单位（器材或人物）。
@@ -24,15 +29,65 @@ import cv2
 import numpy as np
 
 # 卡片所在横条（画面比例）。
-# 三张横排时最右一张右沿到 x≈0.62（1600 宽下 999px），所以右边界放到 0.63；
-# 左侧收到 0.17 避开球队大卡与左侧面板，下边界 0.84 避开底部属性条。
-ROI = (0.17, 0.40, 0.63, 0.84)
+# 三张横排时最右一张右沿到 x≈0.52（1600 宽下 831px）；最多可能有 5 张
+# （玩家 2026-11-26：「器材是开局先选好五个」），5 张时右沿约 0.63，
+# 所以右边界放到 0.66。左侧 0.17 避开球队大卡与左侧面板，下边界 0.84 避开底部属性条。
+ROI = (0.17, 0.40, 0.66, 0.84)
 
 # 尺寸（相对全帧宽/高）。1600x900 实测：宽 137~170、高 138~166。
 CARD_W = (0.055, 0.140)
 CARD_H = (0.085, 0.240)
 CARD_RATIO = (0.70, 1.95)      # 高/宽
 MIN_AREA_RATIO = 0.0055        # 面积下限（相对整帧像素数）
+MAX_CARDS = 5                  # 一局最多 5 张（玩家 2026-11-26：开局先选五个）。
+                               # 上限只用来防误检，不再是 3。
+# 轮廓致密度 = 轮廓面积 / 外接矩形面积。
+# 真实的卡是**实心矩形**：实测 0.88~0.94；带彩虹光晕的彩卡因为光晕把外接框撑大，
+# 会掉到 0.69~0.71（不能按 0.88 卡，否则把彩卡全滤掉）。
+# 而「+33 / +36」这种火焰伤害数字（会被掩膜当成色块，尺寸也刚好落在卡片区间）
+# 只有 0.55~0.62。取 0.66 落在两个空档之间。
+# 之前它们被判成「彩卡」，是「彩」虚高的主因。
+MIN_EXTENT = 0.66
+
+# ===== 品质三档（普 / 金 / 彩）校准状态 =====
+#
+# 【2026-11-26 玩家第二次纠正】「普应该还是最多的，金次之，彩最少，这个规律啊。」
+#
+# 一句话结论：**「彩」能确证，「金」和「普」目前分不开**。
+#
+# 卡片结构（放大 7 倍逐像素剖面对出来的，别再猜）：
+#     bbox 边界 ── 品质光晕（彩卡是青蓝紫粉，非彩卡是亮黄）
+#     内缩 3%  ── **所有卡共用**的亮黄细内框  ← 旧代码读的是这一圈，所以全判「金」
+#     内缩 10% ── 卡面插画（球鞋 / 哑铃 / 篮球…）
+#
+# 光晕那一层用「bbox 外 2~6px」采样，实测：
+#     彩卡    暖色占比 0.12 / 0.57，多色相桶 3~4 个
+#     非彩卡  暖色占比 0.90~1.00，多色相桶 1~2 个
+#   → 彩能干净切开（阈值 0.80 落在 0.57 与 0.90 之间）。
+#
+# 但「金」和「普」的外圈都是暖黄、饱和度是**单峰**（分位 103/119/122/129/131），
+# 没有第二簇 —— 纯靠颜色分不出来。玩家说「普最多、金次之」，
+# 而旧判据给的是「金 274 / 普 0 / 彩 10」，几乎全金，显然把普吞了。
+#
+# 所以：校准之前**只输出能确证的彩，其余一律按普（0.5）计**。
+# 宁可低估，也不像上一版那样把每张卡按 1.0 算、让器材分整体虚高一倍。
+# 等玩家给出金框的判据（颜色？光晕厚度？星芒？）后，把它填进 GOLD_RULE 并置 True。
+QUALITY_CALIBRATED = False
+
+# 校准时填这里：光晕层要满足什么才算「金」。目前为空 = 不产出金。
+GOLD_RULE = None
+
+# 采样位置：**卡框内侧**，按卡片短边取「内缩 1.5%、厚 3.0%」的一圈。
+#   132px 的卡 → 内缩 2px、厚 4px，即 bbox 内 2~6px 那一圈。
+# 为什么不取 bbox 外侧：实测 13 张判「彩」里 7 张是假的 —— 室外球场的蓝地板、
+#   绿草地会把「暖色占比」拉到 0.00，金卡也被判成彩。框内那一圈才有品质色。
+QUALITY_RING = (0.015, 0.030)
+QUALITY_HUE_BIG = 0.08          # 某个色相桶占总像素 ≥8% 才算「一种颜色」（仅日志用）
+# 「彩」的判据：框线上**青/蓝/紫**（H 78~165）像素的占比。
+# 用「暖色占比」不行 —— 白色底卡（「藥」字卡）暖色只有 0.71、绿黄色卡 0.91，
+# 都会挤到阈值附近。改用「彩虹色相」占比，两边拉得极开（实测，人工核对过）：
+#   彩卡   0.77 / 0.78 / 0.82     非彩卡  0.00 ~ 0.06
+QUALITY_RAINBOW = 0.30
 
 
 def _gold_mask(roi):
@@ -98,6 +153,8 @@ def find_cards(frame):
             continue
         if not (CARD_RATIO[0] < hh / max(ww, 1) < CARD_RATIO[1]):
             continue
+        if cv2.contourArea(c) / max(1, ww * hh) < MIN_EXTENT:
+            continue        # 不是实心矩形卡（火焰伤害数字、飘字特效）
         card = {"x": x + x1, "y": y + y1, "w": ww, "h": hh, "cx": x + x1 + ww / 2}
         # 双掩膜会给出两个略有偏差的框（金框紧、彩色框带光晕），合并成一个。
         for i, other in enumerate(out):
@@ -108,6 +165,8 @@ def find_cards(frame):
         else:
             out.append(card)
     out.sort(key=lambda d: d["x"])
+    if len(out) > MAX_CARDS:
+        out = out[:MAX_CARDS]
     return out
 
 
@@ -117,89 +176,86 @@ def describe(frame):
     return len(cards), [int(c["x"]) for c in cards]
 
 
-def _nonwarm_ratio(frame, card, gap, rad, inner):
-    """卡片某一圈里「非暖色高亮像素」的占比。0 = 纯橙黄，1 = 全是紫青粉。
+def _quality_ring(frame, card):
+    """读「品质框」那一圈：bbox 往内缩 QUALITY_RING 的一圈（框线本身）。
 
-    inner=True  → 取卡片框**内侧** gap 像素的一圈（读边框本身）
-    inner=False → 取卡片框**外侧** gap~rad 像素的一圈（读框外的光晕）
+    为什么不取框外：卡在室外球场时，框外是蓝地板/绿草地，会把暖色占比拉到 0.00，
+    金黄色卡也被判成彩（实测 13 张判彩里 7 张是这么来的）。框内那一圈才是品质色。
 
-    外侧那圈会排除画面下方 30%：卡片下面压着蓝色的属性条底板，
-    它的高饱和度会把「非暖色」占比整体抬上去，导致所有卡都判成彩。
+    为什么不取更里面：再往里 10% 是**所有卡共用**的亮黄细内框和卡面插画，
+    读到那里每张卡都是「高饱和暖色」→ 全判金，这正是 2026-11-26 那次翻车的原因。
     """
     x, y, w, h = int(card["x"]), int(card["y"]), int(card["w"]), int(card["h"])
-    H, W = frame.shape[:2]
-    if inner:
-        # 往框里缩 gap 像素，取框线那一圈
-        x0, y0 = max(0, x + gap), max(0, y + gap)
-        x1, y1 = min(W, x + w - gap), min(H, y + h - gap)
-        pat = frame[y0:y1, x0:x1]
-        if pat.size == 0:
-            return None
-        t = max(3, int(min(pat.shape[0], pat.shape[1]) * 0.10))
-        ring = np.zeros(pat.shape[:2], bool)
-        ring[:t, :] = ring[-t:, :] = True
-        ring[:, :t] = ring[:, -t:] = True
-    else:
-        x0, y0 = max(0, x - rad), max(0, y - rad)
-        x1, y1 = min(W, x + w + rad), min(H, y + h + rad)
-        pat = frame[y0:y1, x0:x1]
-        if pat.size == 0:
-            return None
-        hh, ww = pat.shape[:2]
-        yy, xx = np.mgrid[0:hh, 0:ww]
-        cx0, cy0 = x - x0, y - y0
-        outside = ~((xx >= cx0 - gap) & (xx < cx0 + w + gap) &
-                    (yy >= cy0 - gap) & (yy < cy0 + h + gap))
-        ring = outside
-        ring[int(hh * 0.70):, :] = False        # 去掉被属性条污染的底部
-    if ring.sum() < 60:
+    short = min(w, h)
+    gap = max(2, int(round(short * QUALITY_RING[0])))
+    th = max(3, int(round(short * QUALITY_RING[1])))
+    x0, y0 = x + gap, y + gap
+    x1, y1 = x + w - gap, y + h - gap
+    if x1 - x0 < 2 * th + 4 or y1 - y0 < 2 * th + 4:
         return None
+    pat = frame[max(0, y0):y1, max(0, x0):x1]
+    if pat.size == 0:
+        return None
+    ring = np.zeros(pat.shape[:2], bool)
+    ring[:th, :] = ring[-th:, :] = True
+    ring[:, :th] = ring[:, -th:] = True
     hsv = cv2.cvtColor(pat, cv2.COLOR_BGR2HSV)
     hue = hsv[:, :, 0].astype(int)
-    sat, val = hsv[:, :, 1], hsv[:, :, 2]
-    sel = ring & (sat > 95) & (val > 160)
+    sat, val = hsv[:, :, 1].astype(int), hsv[:, :, 2].astype(int)
+    sel = ring & (sat > 80) & (val > 90)
     if sel.sum() < 40:
         return None
     hs = hue[sel]
-    warm = ((hs >= 8) & (hs <= 48)) | (hs >= 172)   # 橙黄 + 红
-    return float((~warm).mean())
+    cnt = {}
+    for v in (hs // 11):
+        cnt[int(v)] = cnt.get(int(v), 0) + 1
+    nbig = sum(1 for v in cnt.values() if v / len(hs) >= QUALITY_HUE_BIG)
+    warm = float((((hs >= 8) & (hs <= 48)) | (hs >= 172)).mean())
+    rainbow = float(((hs >= 78) & (hs <= 165)).mean())     # 青 / 蓝 / 紫
+    return {"nbig": nbig, "warm": round(warm, 3), "rainbow": round(rainbow, 3),
+            "sat": int(np.median(sat[sel])), "val": int(np.median(val[sel])), "n": int(len(hs))}
+
+
+def card_quality(frame, card):
+    """品质读数：{"q": 普/金/彩/无, "ring": 光晕特征, "confident": 是否确证}
+
+    confident=False 时它只是「暂按普计」，日志里要能看出来 ——
+    不要把它当成「已确认是普卡」再去对账。
+    """
+    ring = None if (frame is None or card is None) else _quality_ring(frame, card)
+    if ring is None:
+        return {"q": "无", "ring": None, "confident": False}
+    # 彩：框线上青/蓝/紫像素够多（彩虹光晕）。实测彩 0.77~0.82、非彩 ≤0.06。
+    if ring["rainbow"] >= QUALITY_RAINBOW:
+        return {"q": "彩", "ring": ring, "confident": True}
+    if QUALITY_CALIBRATED and callable(GOLD_RULE):
+        try:
+            if GOLD_RULE(ring):
+                return {"q": "金", "ring": ring, "confident": True}
+        except Exception:
+            pass
+    return {"q": "普", "ring": ring, "confident": False}
 
 
 def card_glow(frame, card):
-    """卡片品质：彩虹/多色光晕 → "彩"；平涂黄框 → "普"；读不到 → "无"。
+    """卡片品质：彩 / 金 / 普（读不到 → "无"）。
 
-    【2026-11-24 玩家纠正】「这些器材本身就是黄底的，你是不是没有和冒金光区分」——
-    说得对。旧实现只取卡片框**内侧**那一圈（3.5%）判「有没有彩色」，于是：
-      · 任何一张平涂黄框的普通卡，内圈全是橙黄 → 判「金」；
-      · 而「金」在计分表里值 1.0，是普通卡（0.5）的两倍。
-    结果就是**每一张普通卡都被当金光卡算分**，器材分整体虚高一倍，
-    排名也跟着失真（四张普通卡和白拿一张 MAX 卡算出来差不多）。
+    【2026-11-26 玩家两次纠正】
+      第一次：「除了普通边框和彩边框，应该还有一个金边框，这个不稀有的呀。」
+      第二次：「普应该还是最多的，金次之，彩最少，这个规律啊。」
 
-    现在两头都看：
-      内圈（框线本身）+ 外圈（框外光晕），**任一处出现非暖色**才算「彩」。
-    实测样本（人工看图标注，共 15 张卡）：
-      普通黄框  内圈 0.00 / 外圈 0.00~0.04
-      彩虹 MAX  内圈或外圈 0.45~0.67
-    阈值 0.30 落在空档中间，两侧都留了很大余量。
+    第一次我改成看「框线饱和度/亮度 ≥150/≥215」，结果 287 张里 274 张判成金、
+    0 张判成普 —— 等于没有区分度，还让器材分从 0.5/张 涨到 1.0/张，整体虚高一倍。
+    第二次纠正后重做了采样位置，才看清是**两层框**：外圈品质光晕 + 内圈共用亮黄细框，
+    旧读法读的是内圈，当然全是金。
 
-    为什么对 095607 那张彩卡要额外看内圈：find_cards 会把光晕一起框进来
-    （框比普通卡大 60px），这时外圈已经在光晕之外，只剩地板，只有内圈还是紫粉。
+    现在（校准前）只敢输出能确证的一档：
 
-    关于「金」这一档：目前**没有任何一帧实机素材**能证明游戏里存在
-    「介于普通黄框和彩虹 MAX 之间的金色光晕」品质。既然没有样本，
-    就不硬造判据 —— 一律按「普」（0.5）计，宁可少算也不虚高。
-    计分表里 "金": 1.0 保留着，哪天真拍到金光帧，补一条判据即可。
+      彩   光晕暖色占比 <0.80 或出现 ≥3 种色相   ← 实测 0.12 / 0.57 vs 非彩 0.90~1.00，切得干净
+      普   其余（**暂按普计**，不是「已确认是普」）
+      金   仅当 QUALITY_CALIBRATED=True 且 GOLD_RULE 命中（等玩家给判据）
+
+    也就是说：品质这一维目前**只贡献「彩 vs 非彩」的信息**，金/普的差别被主动忽略，
+    因为实测外圈饱和度是单峰（分位 103/119/122/129/131），没有第二个簇可切。
     """
-    if frame is None or card is None:
-        return "无"
-    x, y, w, h = int(card["x"]), int(card["y"]), int(card["w"]), int(card["h"])
-    if w <= 0 or h <= 0:
-        return "无"
-    gap = max(2, int(min(w, h) * 0.03))
-    rad = max(10, int(min(w, h) * 0.09))
-    vals = [v for v in (_nonwarm_ratio(frame, card, gap, rad, inner=True),
-                        _nonwarm_ratio(frame, card, gap, rad, inner=False))
-            if v is not None]
-    if not vals:
-        return "无"                      # 白/灰边框，读不到饱和像素
-    return "彩" if max(vals) >= 0.30 else "普"
+    return card_quality(frame, card)["q"]
