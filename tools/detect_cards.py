@@ -1,4 +1,4 @@
-"""离线统计「训练核心」页的卡片数量：用卡片下方的青色熟练度条定位"""
+"""离线统计「训练项页」页的卡片数量：用卡片下方的青色熟练度条定位"""
 import json, os, sys
 import numpy as np
 from PIL import Image

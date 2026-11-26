@@ -34,7 +34,7 @@ class Box:
 
 def items(texts, w=1920, right_skills=True):
     """模拟 _texts 输出：给每个词一个 x 坐标。
-    right_skills=True（默认）——技能名放右侧，模拟训练核心页的技能列；
+    right_skills=True（默认）——训练项名放右侧，模拟训练项页的训练项列；
     right_skills=False ——属性名放中间，模拟底部属性条（开训/成长动画）。
     """
     out = []
@@ -72,9 +72,9 @@ for case in REAL_CASES:
     got = s._classify(items(text.split(), right_skills=right), None)
     check(f"真实OCR→{want}", got, want)
 
-# 14:20 卡死那张：顶部 OCR 成「训练核心」+「额外队友」+「筛选」，
-# 必须判「选择队友」而不是训练核心/训练结果（否则又会对着屏幕中央空转）。
-stuck = ("训练核心 训练流 筛选 OFF 额外队友 分卫 100 大前 110 控卫 LV 中锋 100 "
+# 14:20 卡死那张：顶部 OCR 成「训练项页」+「额外队友」+「筛选」，
+# 必须判「选择队友」而不是训练项页/训练结果（否则又会对着屏幕中央空转）。
+stuck = ("训练项页 训练流 筛选 OFF 额外队友 分卫 100 大前 110 控卫 LV 中锋 100 "
          "SSR希雅 编队 历史玩家阵容 投射E+146 体能D 169 弹跳C+334 下一步 防守 C+ 312 运控D 153 意识D 183")
 check("卡死页(额外队友)→选择队友", s._classify(items(stuck.split()), None), "选择队友")
 
@@ -134,16 +134,16 @@ reply_coords = {"还是别让她勉强了，受伤的话可得不偿失啊。": 
 _reply_items = _items_at(reply_words, reply_coords)
 check("事件回应对话→剧情事件", s._classify(_reply_items, _fake_frame), "剧情事件")
 check("事件回应特征命中", s._is_event_reply(_reply_items, _fake_frame), True)
-# 反向：中部有多段文字的功能页（每日页/训练核心）不算回应对话
+# 反向：中部有多段文字的功能页（每日页/训练项页）不算回应对话
 busy_words = "第7周 星期四 92/130 120 训练 休息 商店 投射 弹跳 体能 防守 运控 意识".split()
 busy_coords = {t: (200 + i * 60, 500 + (i % 3) * 40) for i, t in enumerate(busy_words)}
 check("多段正文不算事件回应", s._is_event_reply(_items_at(busy_words, busy_coords), _fake_frame), False)
 
-# ---------------------------------------------------------------- 2. 训练核心（技能名干净，右侧≥4）
-# 真实运行时 OCR 把技能胶囊读成干净的「投射」「弹跳」（日志 27855 行实证）
-print("--- 2. 训练核心（右侧技能胶囊）---")
-core = "训练核心 第7周 星期2 精力 97/130 筛选 OFF 投射 弹跳 防守 体能 运控 意识 编队 历史 玩家阵容 下一步 决定 失败率".split()
-check("右侧6技能→训练核心", s._classify(items(core), None), "训练核心")
+# ---------------------------------------------------------------- 2. 训练项页（训练项名干净，右侧≥4）
+# 真实运行时 OCR 把训练项条目读成干净的「投射」「弹跳」（日志 27855 行实证）
+print("--- 2. 训练项页（右侧训练项条目）---")
+core = "训练项页 第7周 星期2 精力 97/130 筛选 OFF 投射 弹跳 防守 体能 运控 意识 编队 历史 玩家阵容 下一步 决定 失败率".split()
+check("右侧6技能→训练项页", s._classify(items(core), None), "训练项页")
 
 # ---------------------------------------------------------------- 3. 属性成长面板（日志里1104次"未知"的主要来源）
 # 这些是 ok-script.log 里真实被判成「未知」的文字，应该判「训练结果」
@@ -184,9 +184,9 @@ print("--- 5. 反向用例：不互相误判 ---")
 # 真·训练后的属性面板：有「心·技·体」+ 六属性，但没有「筛选」开关、没有「下一步」
 pure_attr = "心·技·体 倍率加成 投射 A+831 弹跳 S 防守 B 运控 A 意识 C 体能 B".split()
 check("纯属性面板→训练结果(非选人)", s._classify(items(pure_attr), None), "训练结果")
-# 真·训练核心：右侧六技能 + 决定 + 失败率，无属性面板标题词
+# 真·训练项页：右侧六技能 + 决定 + 失败率，无属性面板标题词
 pure_core = "第7周 星期2 精力97/130 投射 弹跳 防守 体能 运控 意识 决定 失败率0%".split()
-check("纯训练核心→训练核心(非结果)", s._classify(items(pure_core), None), "训练核心")
+check("纯训练项页→训练项页(非结果)", s._classify(items(pure_core), None), "训练项页")
 # 17:30 实跑：「附加赛目标」弹窗盖住每日页，顶栏被遮读不出，但底部训练/休息/商店还在
 extra_banner = "附加赛目标 商店 休息 训练".split()
 check("附加赛目标弹窗盖每日页→每日页", s._classify(items(extra_banner), None), "每日页")
@@ -220,9 +220,9 @@ check("只有补充没有购买→不算弹窗",
 anim = "35 投射 B 475 运控 1,194".split()
 check("训练结果计数动画残缺帧→训练结果",
       s._classify(items(anim, right_skills=False), None), "训练结果")
-# 反向：训练核心页底部也是同款属性条，但有「决定」按钮，不能被 7.4c 抢走
+# 反向：训练项页底部也是同款属性条，但有「决定」按钮，不能被 7.4c 抢走
 core_like = "第7周 星期2 精力97/130 投射 B 475 运控 1,194 弹跳 防守 体能 意识 决定".split()
-check("带决定的训练核心→训练核心", s._classify(items(core_like), None), "训练核心")
+check("带决定的训练项页→训练项页", s._classify(items(core_like), None), "训练项页")
 
 print(f"\n=== 通过 {PASS} / 失败 {FAIL} ===")
 sys.exit(1 if FAIL else 0)

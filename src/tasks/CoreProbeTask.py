@@ -1,6 +1,6 @@
-"""训练核心页体检：把带角标的技能挨个点开，存图 + 报告编队。
+"""训练项页体检：把带角标的技能挨个点开，存图 + 报告编队。
 
-目的：把「每个技能选项里有几个队友 / 几个器材 / 什么光效」这件事在真机上一次性看清。
+目的：把「每个训练项选项里有几个队友 / 几个器材 / 什么光效」这件事在真机上一次性看清。
 **不点「决定」**，不会真的开训。
 
 玩家 2026-11-22 确认：
@@ -25,7 +25,7 @@ class CoreProbeTask(AutoTask):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.name = "训练核心体检 / CoreProbe"
+        self.name = "训练项页体检 / CoreProbe"
         self.description = "把带角标的技能逐个点开并截图，报告队友/器材/光效（不点决定）"
         self.default_config.update({
             "保存截图": True,
@@ -62,9 +62,9 @@ class CoreProbeTask(AutoTask):
         items = self._texts(frame)
         page = self._classify(items)
         self.log_info(f"页面判定：{page}", notify=True)
-        if page != "训练核心":
-            self.log_error(f"当前不是训练核心页（判定为「{page}」）。"
-                           f"请先手动进到训练核心页再运行。屏幕文字：{[i['t'] for i in items][:25]}",
+        if page != "训练项页":
+            self.log_error(f"当前不是训练项页（判定为「{page}」）。"
+                           f"请先手动进到训练项页再运行。屏幕文字：{[i['t'] for i in items][:25]}",
                            notify=True)
             return False
 
@@ -72,7 +72,7 @@ class CoreProbeTask(AutoTask):
         rows = [it for it in items if it["t"] in self.SKILLS and it["cx"] / w > 0.70]
         rows.sort(key=lambda x: x["cy"])
         if not rows:
-            self.log_error("没找到右侧技能胶囊，请把截图发我", notify=True)
+            self.log_error("没找到右侧训练项条目，请把截图发我", notify=True)
             return False
 
         marked = []

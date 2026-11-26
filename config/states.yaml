@@ -79,12 +79,12 @@ states:
 
   # ---------- 训练 ----------
   training_core:
-    name: 训练核心
+    name: 训练项页
     any_of: [失败率, 决定]
     all_of: [Lv]           # 胶囊上有 Lv.N
     verified: partial
     note: |
-      只点右上角带「橙色圆底白小人」角标的技能胶囊。
+      只点右上角带「橙色圆底白小人」角标的训练项条目。
       队友 = 球场上站着的角色名标签（主力「希雅」不算）；
       器材 = 画面中间那排卡片；金光/彩光 = 卡片外框光效。
       打分在 strategy.yaml 的 tuning.core_score。
@@ -112,7 +112,7 @@ states:
       - {label: 跳过, kind: text, target: daily_hub}
 
   enhance_train:
-    name: 加强训练
+    name: 经理增益
     any_of: [请选择一种加强训练, 加强训练成功]
     verified: partial
     actions:
@@ -230,7 +230,7 @@ features:
     region: [0.08, 0.55, 0.92, 0.95]     # x1,y1,x2,y2
     method: yellow_ratio > 0.30, 同排 >= 2 块
   skill_badge:
-    desc: 技能胶囊右上角的橙色圆底白小人
+    desc: 训练项条目右上角的橙色圆底白小人
     search: 相对胶囊文字框「右 40~190px、上 110~25px」
     method: 橙色掩膜 + 轮廓，16~52px 近圆块
   gear_card:

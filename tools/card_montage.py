@@ -8,7 +8,7 @@ for e in d["events"]:
     s = " ".join(t[0] for t in e.get("texts", []))
     if ("失败率" in s or "决定" in s) and e["img"] not in seen:
         seen.add(e["img"]); cores.append(e)
-print("训练核心不同帧数", len(cores))
+print("训练项页不同帧数", len(cores))
 sel = cores[::max(1, len(cores)//12)][:12]
 os.makedirs("demo/montage", exist_ok=True)
 crops = []

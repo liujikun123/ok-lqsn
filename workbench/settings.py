@@ -412,6 +412,10 @@ WRITE: dict[str, Callable[[Any], Any]] = {
     "slot_empty": lambda v: "继续" if v == "忽略" else "暂停提示",
     "slot_autofill": lambda v: v == "自动补满",
     "nonzero": lambda v: bool(v),
+    # 2026-11-26：经理增益（原「加强训练」三选一）
+    "enhance_mode": lambda v: "max_bonus" if v == "最高加成" else "first",
+    # 同一个语义，json 里存中文（老键沿用中文值，别写成 max_bonus）
+    "enhance_mode_cn": lambda v: "最高加成" if v == "最高加成" else "第一个",
 }
 
 READ: dict[str, Callable[[Any], Any]] = {
@@ -421,6 +425,8 @@ READ: dict[str, Callable[[Any], Any]] = {
     "slot_empty": lambda v: v,
     "slot_autofill": lambda v: v,
     "nonzero": lambda v: v,
+    "enhance_mode": lambda v: "最高加成" if v == "max_bonus" else "第一个",
+    "enhance_mode_cn": lambda v: v,
 }
 
 
@@ -606,6 +612,22 @@ SPEC: list[tuple[str, list[Setting]]] = [
             default=True,
             help="每天有训练时，先进出行页看有没有笔记：有就出行，没有就回来训练。\n"
                  "每天只探一次；出行页退不出去会自动永久关掉这条路。",
+        ),
+        Setting(
+            "enhance_mode", "经理增益选哪个", "choice",
+            [Target("yaml", "tuning.enhance.strategy", "enhance_mode"),
+             Target("json", "经理增益策略", "enhance_mode_cn")],
+            default="最高加成", choices=["最高加成", "第一个"],
+            help="点开训练项后游戏弹「请选择一种加强训练」三选一时怎么选：\n"
+                 "最高加成 = 挑 +NN 最大的（+102）；第一个 = 每次都点最左边那张。",
+        ),
+        Setting(
+            "read_fail_stop", "读数失败就停下", "switch",
+            [Target("json", "读数失败即暂停")],
+            default=True,
+            help="训练项详情没弹出 / 6 帧里 0 帧读到（队友·器材·失败率·等级）时：\n"
+                 "开 = 截图 + 桌面弹窗 + 停机，等人看画面；\n"
+                 "关 = 把这一项从排名剔掉，按默认项继续（旧行为，会白扔一次训练）。",
         ),
     ]),
 ]

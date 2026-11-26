@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """角标识别真实素材回归：新算法（全图搜 + 纵向就近） vs 旧算法（OCR 框 ROI）。
 
-基准（ground truth）= 全图橙色小圆里、落在技能胶囊列（x > 0.62w）的那些。
+基准（ground truth）= 全图橙色小圆里、落在训练项条目列（x > 0.62w）的那些。
 不用人工标注，因为角标是唯一性很强的图形（35x35 橙色圆 + 白色小人）。
 
 旧算法留在这里只作对照，用来证明这次改造确实补上了漏检。
@@ -17,7 +17,7 @@ SKILLS = AutoTask.SKILLS
 
 
 def truth_blobs(frame):
-    """基准：技能列区域里的橙色小圆。
+    """基准：训练项列区域里的橙色小圆。
 
     纵向必须落在胶囊列（0.15h~0.80h）—— 顶部标题栏也有橙色元素
     （实测 y=38/48），不加纵约束会把基准数虚高 2 个。
@@ -87,7 +87,7 @@ for p in sample:
         continue
     rows = rows_of(img)
     if not rows:
-        print(f"[SKIP] {p.split('/')[-1]} 没读到技能行（可能不是标准版式）")
+        print(f"[SKIP] {p.split('/')[-1]} 没读到训练项行（可能不是标准版式）")
         continue
     blobs = inst._badge_blobs(img)
     truth = truth_count(img)

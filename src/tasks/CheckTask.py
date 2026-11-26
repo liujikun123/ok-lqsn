@@ -44,9 +44,9 @@ class CheckTask(AutoTask):
             for n in names:
                 banned = "【已排除，不会去】" if self._excluded_place(n["t"]) else ""
                 self.log_info(f"出行地点「{n['t']}」{banned}")
-        elif page == "训练核心":
+        elif page == "训练项页":
             rows = [it for it in items if it["t"] in self.SKILLS]
-            self.log_info(f"技能列：{[(r['t'], int(r['cy'])) for r in rows]}")
+            self.log_info(f"训练项列：{[(r['t'], int(r['cy'])) for r in rows]}")
 
         cards = self._event_cards(frame, items)
         if cards:

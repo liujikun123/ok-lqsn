@@ -107,7 +107,7 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 | 工具 | 参数 | 用途 |
 |---|---|---|
 | `list_skills` | — | 列出框架自带的 AI 技能 |
-| `get_skill` | `skill_id` | 读某个技能的全文（**开工前先读 `develop`**） |
+| `get_skill` | `skill_id` | 读某个训练项的全文（**开工前先读 `develop`**） |
 | `list_tasks` | — | 列出已注册任务及其 `task_id` |
 | `reload_tasks` | `task_ids?` | 热重载任务模块，改完代码必做 |
 | `run_task` | `file_path` | 按**任务文件路径**跑一次 |
@@ -245,7 +245,7 @@ examples/mcp_observe.py   官方给的 MCP 观测示例（可对照改 tools/mcp
 | `setup-project` | 新项目初始化 |
 
 框架对「按钮和小组件」的官方建议是：**模板匹配 / 颜色 / 几何形状，别用 OCR**。
-这一条对我们后面要修「编队采样」和「技能角标」很关键（见 `06-下一步.md` 的 P0-2）。
+这一条对我们后面要修「训练项读数」和「技能角标」很关键（见 `06-下一步.md` 的 P0-2）。
 
 ---
 

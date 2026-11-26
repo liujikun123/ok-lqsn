@@ -79,7 +79,7 @@ class RecordTask(BaseTask):
         self.description = "录制你手动操作的全过程（画面+文字+点击），按 F12 结束"
         self.default_config = {
             "录制秒数": 0,      # 0 = 一直录到按 F12
-            "采样间隔": 0.8,    # 画面自己变化时，最快多久存一张
+            "读数间隔": 0.8,    # 画面自己变化时，最快多久存一张
         }
         self.clicks = []
         self._stop = False
@@ -139,7 +139,7 @@ class RecordTask(BaseTask):
         os.makedirs(frames_dir, exist_ok=True)
 
         seconds = float(self.config.get("录制秒数") or 0) or float(os.getenv("OK_RECORD_SECONDS", 0) or 0)
-        interval = float(self.config.get("采样间隔") or 0.8)
+        interval = float(self.config.get("读数间隔") or 0.8)
         deadline = time.time() + seconds if seconds > 0 else None
 
         events = []

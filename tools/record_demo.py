@@ -166,7 +166,7 @@ a{{color:#4ea1ff;text-decoration:none}}
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="只截一张图验证")
-    ap.add_argument("--interval", type=float, default=0.8, help="非点击时的采样间隔秒")
+    ap.add_argument("--interval", type=float, default=0.8, help="非点击时的读数间隔秒")
     args = ap.parse_args()
 
     win = find_game_window()

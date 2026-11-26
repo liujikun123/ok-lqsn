@@ -5,7 +5,7 @@
   manager_names: [球队经理]
   manager_weight: 1.5    球队经理单独权重
 
-_score_core 是纯函数（不碰 self），用 __new__ 直接调即可，不打游戏。
+_score_item 是纯函数（不碰 self），用 __new__ 直接调即可，不打游戏。
 """
 import os
 import sys
@@ -33,7 +33,7 @@ def check(name, got, want):
 
 
 s = AutoTask.__new__(AutoTask)
-score = lambda mates, cfg=CFG, **kw: s._score_core(
+score = lambda mates, cfg=CFG, **kw: s._score_item(
     mates, kw.get("level", ""), kw.get("pct", 0), cfg, kw.get("equips"))
 
 print("== 配置本身 ==")

@@ -32,7 +32,7 @@ class Stub:
         self.saw_training = True
         self.in_training = False
         self.weekday = 3
-        self.core_checked = False
+        self.item_checked = False
         self.trip_picked = False
         self.trip_probe = False
         self.trip_probe_done = "3-3"

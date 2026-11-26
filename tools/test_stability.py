@@ -98,7 +98,7 @@ for texts, want in [
     # 15:17 实跑：训练结算 Bonus 华丽动画，按钮还没出现，等它播完
     (("Bonus:", "594%", "投射A616/1784", "运控A 612143"), "训练结算动画"),
     (("Bonus：", "体能 +143"), "训练结算动画"),
-    # 加强训练页：有「心·技·体」但有「确定」按钮，被 exclude 排除，不算属性浮层
+    # 经理增益页：有「心·技·体」但有「确定」按钮，被 exclude 排除，不算属性浮层
     (("请选择一种加强训练", "心·技·体", "+85", "确定"), None),
     (("心·技·体", "确定", "65%"), None),
     (("完全没见过的画面",), None),
@@ -256,15 +256,15 @@ check("有警告日志", any(k == "warn" and "存疑" in m for k, m in s.logs), 
 check("没有点击动作(不拦截)", [x for x in s.logs if x[0] == "click"], [])
 # 合法跳转不报
 s2 = Stub()
-check("每日页→训练核心 正常", s2._check_transition("每日页", "训练核心"), False)
+check("每日页→训练项页 正常", s2._check_transition("每日页", "训练项页"), False)
 check("选择队友→确认编队 正常", s2._check_transition("选择队友", "确认编队"), False)
 check("无 prev 不报", s2._check_transition(None, "每日页"), False)
 # 过场帧（未知）不报
 check("未知→任何页 不报", s2._check_transition("未知", "每日页"), False)
 check("任何页→未知 不报", s2._check_transition("选择队友", "未知"), False)
-# 训练核心→大厅 也存疑（不该跳过结算）；但训练核心→训练结果正常
-check("训练核心→大厅 存疑", s2._check_transition("训练核心", "大厅"), True)
-check("训练核心→训练结果 正常", s2._check_transition("训练核心", "训练结果"), False)
+# 训练项页→大厅 也存疑（不该跳过结算）；但训练项页→训练结果正常
+check("训练项页→大厅 存疑", s2._check_transition("训练项页", "大厅"), True)
+check("训练项页→训练结果 正常", s2._check_transition("训练项页", "训练结果"), False)
 
 print("--- 4. 收工摘要 ---")
 s = Stub()

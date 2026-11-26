@@ -1,7 +1,7 @@
-"""训练核心页连拍扫查：把「点开技能」前后每一帧都存下来。
+"""训练项页连拍扫查：把「点开训练项」前后每一帧都存下来。
 
 为什么要连拍：
-    2026-11-23 05:14 实测发现，点技能胶囊后画面会先播一段很短的动作演示 +
+    2026-11-23 05:14 实测发现，点训练项条目后画面会先播一段很短的动作演示 +
     加成浮层（左侧「倍率加成 / 属性加成 / 表情一致 / 额外队友」四张卡），
     1~2 秒后浮层就收回，只剩选中态。StepTask 那种「点完等 0.6 秒取一帧」
     的做法正好落在浮层消失之后，所以之前一直以为这页「没有卡片」。
@@ -22,7 +22,7 @@ class CoreSweepTask(AutoTask):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.name = "训练核心连拍 / CoreSweep"
+        self.name = "训练项页连拍 / CoreSweep"
         self.description = "逐个点开右侧技能并连拍，记录浮层出现全过程（不点决定）"
         self.default_config.update({
             "连拍帧数": 14,
@@ -53,8 +53,8 @@ class CoreSweepTask(AutoTask):
         items = self._texts(frame)
         page = self._classify(items)
         self.log_info(f"页面判定：{page}", notify=True)
-        if page != "训练核心":
-            self.log_error(f"当前不是训练核心页（判定为「{page}」）：{[i['t'] for i in items][:20]}",
+        if page != "训练项页":
+            self.log_error(f"当前不是训练项页（判定为「{page}」）：{[i['t'] for i in items][:20]}",
                            notify=True)
             return False
 
@@ -62,12 +62,12 @@ class CoreSweepTask(AutoTask):
         rows = [it for it in items if it["t"] in self.SKILLS and it["cx"] / w > 0.70]
         rows.sort(key=lambda x: x["cy"])
         if not rows:
-            self.log_error("没找到右侧技能胶囊", notify=True)
+            self.log_error("没找到右侧训练项条目", notify=True)
             return False
 
         order = {"投射": 0, "弹跳": 1, "运控": 2, "体能": 3, "防守": 4, "意识": 5}
         rows.sort(key=lambda x: order.get(x["t"], 9))
-        self.log_info(f"待扫技能：{[r['t'] for r in rows]}")
+        self.log_info(f"待扫训练项：{[r['t'] for r in rows]}")
 
         n = int(self.config.get("连拍帧数") or 14)
         gap = float(self.config.get("连拍间隔") or 0.2)

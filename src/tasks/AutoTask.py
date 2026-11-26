@@ -55,12 +55,12 @@ PAGE_PHASE = {
     "结算": PHASE_SETTLING, "目标达成": PHASE_SETTLING,
     "行程结果": PHASE_SETTLING, "点击继续": PHASE_SETTLING,
     # 局内主流程 → TRAINING
-    "每日页": PHASE_TRAINING, "训练核心": PHASE_TRAINING,
+    "每日页": PHASE_TRAINING, "训练项页": PHASE_TRAINING,
     "选择队友": PHASE_TRAINING, "笔记选择": PHASE_TRAINING,
     "器材选择": PHASE_TRAINING, "确认编队": PHASE_TRAINING,
     "开始训练确认": PHASE_TRAINING, "训练结果": PHASE_TRAINING,
     "训练确认": PHASE_TRAINING, "行为卡": PHASE_TRAINING,
-    "笔记学习": PHASE_TRAINING, "加强训练": PHASE_TRAINING,
+    "笔记学习": PHASE_TRAINING, "经理增益": PHASE_TRAINING,
     "训练提议": PHASE_TRAINING, "扭蛋选择": PHASE_TRAINING,
     "扭蛋机": PHASE_TRAINING, "出行": PHASE_TRAINING,
     "公园子页": PHASE_TRAINING, "赛前准备": PHASE_TRAINING,
@@ -82,7 +82,7 @@ PAGE_FORBIDDEN = {
     "器材选择":   ("每日页", "大厅", "商店"),
     "确认编队":   ("每日页", "大厅", "商店"),
     "开始训练确认": ("每日页", "大厅", "商店"),
-    "训练核心":   ("大厅", "商店"),   # 训练核心不该直接跳大厅/商店
+    "训练项页":   ("大厅", "商店"),   # 训练项页不该直接跳大厅/商店
     "行为卡":     ("每日页", "大厅", "商店"),
 }
 
@@ -141,14 +141,18 @@ class AutoTask(MyBaseTask):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.name = "自动训练 / Auto"
-        self.description = "自动跑一轮完整训练：训练 → 事件 → 加强训练 → 比赛 → 训练结束 → 回大厅"
+        self.description = "自动跑一轮完整训练：训练 → 事件 → 经理增益 → 比赛 → 训练结束 → 回大厅"
         self.icon = Icon.SYNC
         self.default_config.update({
             "最大步数": 1500,
             "等待秒数": 1.3,
             "扭蛋目标关键词": "笔记,继承",   # 步行街扭蛋三选一里「笔记 / 继承」都算
             "扭蛋最高价": 120,
-            "加强训练策略": "最高加成",
+            "经理增益策略": "最高加成",
+            # 训练项读数失败（点开训练项后「训练项详情」没弹出来 / 0 帧有效）怎么办。
+            # 玩家 2026-11-26 原话：「为什么读数 0 帧这么多还继续？应该停下来」——
+            # 蒙着按默认项继续 = 白扔一次训练，而且事后看不出来。默认：停。
+            "读数失败即暂停": True,
             "商店自动购买": True,
             # ↑ 打开不等于乱买：只买 0 元红包 + 精力低于阈值时的精力药，
             #   具体见 _do_shop 与 strategy.yaml 的 tuning.shop。
@@ -183,7 +187,9 @@ class AutoTask(MyBaseTask):
         self.out_focus = None
         self.out_focus_max = None
         self.weekday = None
-        self.core_checked = False
+        self.item_checked = False
+        self.read_fail_stop = False    # 训练项读数失败 → 主循环停机（玩家 2026-11-26）
+        self._item_interrupt = None      # 读数被经理增益/剧情/遮罩打断时的页面名
         self.trip_picked = False
         # 「出行先探笔记，笔记 > 训练」（玩家 2026-11-23）：
         #   每日页同时有「训练」和「出行」时，先进出行页看地点标签里有没有笔记。
@@ -401,7 +407,7 @@ class AutoTask(MyBaseTask):
             self.log_warning(f"前置窗口失败: {e}")
 
     SHOT_TAGS = {"选择队友": "pick", "笔记选择": "note", "器材选择": "equip",
-                 "训练核心": "core", "每日页": "day", "商店": "shop"}
+                 "训练项页": "core", "每日页": "day", "商店": "shop"}
 
     def _shot(self, frame, tag):
         try:
@@ -420,10 +426,10 @@ class AutoTask(MyBaseTask):
             return None
 
     def _audit_path(self, week, day, tag):
-        """采样证据目录：logs/audit/<run_id>/W<周>D<星期>/<时刻>_<tag>.png。
+        """读数证据目录：logs/audit/<run_id>/W<周>D<星期>/<时刻>_<tag>.png。
 
-        玩家 2026-11-23 16:47 要求「重跑一周，把每天采样的截图和判定结果都保留，
-        人工检查」。所以每次训练核心页逐项采样都落一份：截图 + 那帧的 OCR 原文 +
+        玩家 2026-11-23 16:47 要求「重跑一周，把每天读数的截图和判定结果都保留，
+        人工检查」。所以每次训练项页逐项读数都落一份：截图 + 那帧的 OCR 原文 +
         识别出的队友/器材/失败率/等级 + 打分，按「周 / 星期」分目录，绝不覆盖。
         """
         try:
@@ -433,8 +439,8 @@ class AutoTask(MyBaseTask):
             d = day if day is not None else 0
             d = os.path.join("logs", "audit", str(run), f"W{w}D{d}")
             os.makedirs(d, exist_ok=True)
-            # 技能名是中文，cv2/文件名不吃非 ASCII → 先转英文缩写，
-            # 否则 core1_投射 变成 core1___，人工分不清是哪个技能。
+            # 训练项名是中文，cv2/文件名不吃非 ASCII → 先转英文缩写，
+            # 否则 core1_投射 变成 core1___，人工分不清是哪个训练项。
             zh2en = {"投射": "Shoot", "弹跳": "Jump", "防守": "Def",
                      "体能": "Phys", "运控": "Dribble", "意识": "IQ"}
             tag = str(tag)
@@ -447,7 +453,7 @@ class AutoTask(MyBaseTask):
             return None
 
     def _audit_save(self, week, day, tag, frame, text):
-        """存一帧采样证据：同名 .png + .txt（OCR 原文 + 判定）。失败不影响主流程。"""
+        """存一帧读数证据：同名 .png + .txt（OCR 原文 + 判定）。失败不影响主流程。"""
         audit_cfg = self._tuning().get("audit") or {}
         if audit_cfg.get("enabled") is False:
             return None
@@ -871,7 +877,7 @@ class AutoTask(MyBaseTask):
         # 自动补空槽：两个开关，默认都不开（玩家的原话是「有空槽就停下弹窗，不许代选」）。
         #   auto_fill_first  = 三页通用（老开关）
         #   auto_fill_equip  = 只对「器材选择」页（2026-11-24 新增）
-        #     器材是训练核心中场那 1~3 张支援卡，空一个槽 = 白扔一份加成（彩光 1.5 / 金光 1.0），
+        #     器材是训练项页中场那 1~3 张支援卡，空一个槽 = 白扔一份加成（彩光 1.5 / 金光 1.0），
         #     也是评分卡在 8000+ 上不去 9000 的原因之一。要冲分就把这个开关打开。
         auto_ok = bool(cfg.get("auto_fill_first", False)) or (
             page == "器材选择" and bool(cfg.get("auto_fill_equip", False)))
@@ -891,7 +897,7 @@ class AutoTask(MyBaseTask):
             self._alert_popup(
                 "篮球少女：编队有空位，已暂停",
                 f"「{page}」还有 {len(slots)} 个空位（带黄色「+」的格子）没选。\n\n"
-                f"脚本不会替你自动选择，已停在这里等你配好编队。\n"
+                f"脚本不会替你自动选择，已停在这里等你配好队伍。\n"
                 f"配好后重新运行即可继续。\n\n"
                 f"截图：screenshots/auto/pause_empty_{page}_*.png" + hint)
             self.log_error(f"{page} 还有 {len(slots)} 个空槽没选 —— 按你的要求不自动补，"
@@ -980,7 +986,7 @@ class AutoTask(MyBaseTask):
         """右侧 2/3 区域里「带黄色等级牌的成员卡」数量 —— 纯图像，不看 OCR。
 
         选人页（选择队友 / 额外队友）特征是右侧竖排 4 张卡，每张卡顶部有
-        一小块黄色「LV110」等级牌；训练核心页右侧是技能胶囊（不是卡 + 等级牌），
+        一小块黄色「LV110」等级牌；训练项页右侧是训练项条目（不是卡 + 等级牌），
         训练结果页右侧基本空白。用这个把「选人页」和「属性面板/结果页」分开，
         补 OCR 只靠「额外队友」四字容易误判的短板（2026-11-23 14:20 实测）。
 
@@ -1092,8 +1098,8 @@ class AutoTask(MyBaseTask):
             return False
         h = frame.shape[0]
         body = [it for it in items if 0.20 < it["cy"] / h < 0.80]
-        # 剧情对话页正文只有一两句台词；真每日页/训练核心页中部还有一堆按钮、
-        # 属性条、技能标签，段数远多于此。离线扫 222 张验证过这个区分。
+        # 剧情对话页正文只有一两句台词；真每日页/训练项页中部还有一堆按钮、
+        # 属性条、训练项标签，段数远多于此。离线扫 222 张验证过这个区分。
         if not (1 <= len(body) <= 2):
             return False
         return any(len(re.sub(r"[^\u4e00-\u9fff]", "", it["t"])) >= 10
@@ -1142,7 +1148,7 @@ class AutoTask(MyBaseTask):
         这是「不全靠 OCR」的落点：锚点是像素级裁片（按钮/标题的原始像素），
         OCR 读花、读漏、读到繁体都不影响；命中即认定这一页。
 
-        only="训练核心" 时只匹配这一页的锚点（采样热路径用，省掉 8 页 × N 锚点的遍历）。
+        only="训练项页" 时只匹配这一页的锚点（读数热路径用，省掉 8 页 × N 锚点的遍历）。
         """
         if frame is None:          # 没画面就没什么可匹配的（离线测试也走这条）
             return None
@@ -1184,7 +1190,7 @@ class AutoTask(MyBaseTask):
         和 `_anchor_page` 的分工：
           · `_anchor_page` 只回答「这是不是这页」（认页）；
           · 这里要**具体位置**（点哪儿）。
-        训练核心的「决定」按钮按技能换版式（4 套锚点，位置差近 200px），
+        训练项页的「决定」按钮按训练项换版式（4 套锚点，位置差近 200px），
         OCR 读不到时用它比经验坐标可靠得多 —— 这是「能用框架就用框架」的落点。
         """
         if frame is None:
@@ -1218,7 +1224,7 @@ class AutoTask(MyBaseTask):
 
         2026-11-24 玩家追问「不是说做了马尔可夫链吗」，查下来的真相是：
         只实现了 _check_transition 的**警告**，从不否决，等于没生效。
-        这里才是真正的约束 —— 训练核心不可能一步跳到大厅/商店，
+        这里才是真正的约束 —— 训练项页不可能一步跳到大厅/商店，
         局内也不可能冒出局外弹窗，判出来就直接否决，交给锚点/推进器重判。
         """
         if not prev or not page or page in ("未知",) or prev in ("未知",) or page == prev:
@@ -1303,8 +1309,8 @@ class AutoTask(MyBaseTask):
                 or "股票走势" in joined or has("涨跌幅", "最新价") \
                 or (has("稳健型", "激进型", "平衡型") and has("确定", "放弃")):
             return "炒股小游戏"
-        # 1.5 公园子页：底部也挂着六项技能面板（投射/弹跳/…），
-        #     不先拦就会在下面被「右侧竖排技能 ≥4」认成训练核心 →
+        # 1.5 公园子页：底部也挂着六项训练项面板（投射/弹跳/…），
+        #     不先拦就会在下面被「右侧竖排训练项 ≥4」认成训练项页 →
         #     于是对着公园页猛点「决定」坐标，卡死 15 步（2026-11-23 06:11 实测）。
         if "在公园干点什么好呢" in joined:
             return "公园子页"
@@ -1317,8 +1323,8 @@ class AutoTask(MyBaseTask):
         # 1.6 剧情提议「加练」对话（2026-11-23 10:28 实测）
         #     画面是训练馆 + 一段正文 + 两个黄按钮「稍等一下 / 那就开始吧」，
         #     底部还挂着队伍属性面板（投射/弹跳/… 六项），于是被下面
-        #     「右侧技能 ≥4」当成训练核心 → 对着不存在的技能胶囊猛点，
-        #     采样 0/5 帧、整轮作废。必须在训练核心之前拦下来。
+        #     「右侧训练项 ≥4」当成训练项页 → 对着不存在的训练项条目猛点，
+        #     读数 0/5 帧、整轮作废。必须在训练项页之前拦下来。
         if ("那就开始吧" in joined and "稍等一下" in joined) or "提议再" in joined                 or ("加练" in joined and ("那就开始吧" in joined or "稍等一下" in joined)):
             return "训练提议"
         # 2. 比赛整条链
@@ -1365,7 +1371,7 @@ class AutoTask(MyBaseTask):
         if has("超级扭蛋机", "转动扭蛋"):
             return "扭蛋机"
         if has("请选择一种加强训练", "加强训练成功"):
-            return "加强训练"
+            return "经理增益"
         if "上新时间" in joined:
             return "商店"
         # 5.9 开训前的选人三连已统一提到第 5 条之前（契合度冲突）；此处只留确认编队。
@@ -1373,12 +1379,12 @@ class AutoTask(MyBaseTask):
             return "确认编队"
         if "开始训练" in joined:
             return "开始训练确认"
-        # 6. 训练结果（有独特词，先判；否则会被下面的「核心页」按技能名抢走）
+        # 6. 训练结果（有独特词，先判；否则会被下面的「训练项页」按训练项名抢走）
         if has("属性提升了", "精力降低", "触发训练后事件", "器材+", "新境界"):
             return "训练结果"
-        # 6.9 独占词快车道：这些页面底部也挂着六项技能（投射/弹跳/…），
-        #     若掉到下面 7.2「右侧技能 ≥4」就会被误判成训练核心，对着不存在的
-        #     技能胶囊猛点空转。它们的标题词是唯一的，必须先拦。
+        # 6.9 独占词快车道：这些页面底部也挂着六项训练项（投射/弹跳/…），
+        #     若掉到下面 7.2「右侧训练项 ≥4」就会被误判成训练项页，对着不存在的
+        #     训练项条目猛点空转。它们的标题词是唯一的，必须先拦。
         #     素材来自 logs/ok-script.log 真实「未知页面」记录（1104 次里的大头）。
         if has("本周总结", "球队评分"):
             return "本周总结"
@@ -1396,16 +1402,16 @@ class AutoTask(MyBaseTask):
                          and has("下一步", "编队", "额外队友")))
         if is_attr_panel(joined) and not pick_page:
             return "训练结果"
-        # 7. 训练核心：**右侧竖排**技能胶囊 ≥4 个才算。
+        # 7. 训练项页：**右侧竖排**训练项条目 ≥4 个才算。
         #    不能依赖「决定」二字 —— 它是黄底白字，OCR 时有时无。
-        #    也不能只看「屏幕上出现 ≥4 个技能名」—— 公园/出行页底部挂着一整块
-        #    队伍属性面板（投射 B 447/1784 …），会把它误判成训练核心，
+        #    也不能只看「屏幕上出现 ≥4 个训练项名」—— 公园/出行页底部挂着一整块
+        #    队伍属性面板（投射 B 447/1784 …），会把它误判成训练项页，
         #    然后对着公园页猛点「决定」坐标空转到卡死（2026-11-23 06:11 实测）。
         w = frame.shape[1] if frame is not None else 1920
         right_skills = {it["t"].replace(" ", "") for it in items
                         if it["cx"] > w * 0.72 and it["t"].replace(" ", "") in self.SKILLS}
         if len(right_skills) >= 4 or (exact("决定") and has("失败率")):
-            return "训练核心"
+            return "训练项页"
         # 7.35 开训动画（只有「训练开始」一行字）
         if "训练开始" in joined:
             return "训练结果"
@@ -1428,7 +1434,7 @@ class AutoTask(MyBaseTask):
         #     都读不到「心·技·体」，但都有**多个属性名 + 没有任何可点按钮**，
         #     而且游戏自己会播完。与其逐帧补关键词，用这个结构特征一次覆盖。
         #     排除所有主按钮词：每日页(训练/商店)、选人页(筛选/下一步)、
-        #     加强训练(确定)、剧情(跳过/继续) —— 它们属性名再多也不会误判。
+        #     经理增益(确定)、剧情(跳过/继续) —— 它们属性名再多也不会误判。
         if (sum(1 for w in ATTR_WORDS if w in joined) >= 3
                 and not any(b in joined for b in (
                     "跳过", "决定", "下一步", "确定", "确认", "训练", "比赛",
@@ -1439,7 +1445,7 @@ class AutoTask(MyBaseTask):
         #     只被 OCR 读到两项「投射 B 475」「运控 S 1,194」，凑不够 7.4b 的 ≥3 项，
         #     于是判未知页 → pause 收工（本轮到这就断了）。结构特征很硬：
         #     **属性名 + 单字母等级 + 3~4 位大数字（可带千分位）+ 屏幕上没有任何操作按钮**。
-        #     训练核心页底部也有同款属性条，但它一定有「决定」按钮 → 被下面的排除表挡住。
+        #     训练项页底部也有同款属性条，但它一定有「决定」按钮 → 被下面的排除表挡住。
         if (sum(1 for w in ATTR_WORDS if w in joined) >= 2
                 and re.search(r"(?<![A-Za-z])[SABCD][+]?(?![A-Za-z])", joined)
                 and re.search(r"\d{1,3}(?:,\d{3})+|\d{3,4}", joined)
@@ -1980,18 +1986,23 @@ class AutoTask(MyBaseTask):
         return self._leave_top_right(items, frame, "[扭蛋机无可抓]")
 
     def _do_enhance(self, items, frame):
-        """加强训练三选一：优先最高加成。"""
+        """经理增益三选一：优先最高加成。"""
         if self._click_confirm(items, frame):
             return True
         cands = self._all(items, r"\+\s*\d{2,}")
         cands = [c for c in cands if 0.2 < c["cy"] / frame.shape[0] < 0.8]
         best = None
-        strategy = (self._tuning().get("enhance") or {}).get("strategy", "max_bonus")
+        strategy = (self._tuning().get("enhance") or {}).get("strategy")
+        if not strategy:
+            # yaml 没写就退回任务配置里的中文值（2026-11-26：这个键以前是摆设，
+            # 改了没反应；工作台「经理增益选哪个」会把两边一起写）
+            v = self.config.get("经理增益策略")
+            strategy = "first" if v == "第一个" else "max_bonus"
         if cands:
             # max_bonus=取加成最大；first=取第一个（配置化，改 yaml 就能换）
             best = (max(cands, key=lambda c: _num(c["t"]) or 0)
                     if strategy == "max_bonus" else cands[0])
-            self.log_info(f"加强训练（{strategy}）候选项: {[c['t'] for c in cands]}")
+            self.log_info(f"经理增益（{strategy}）候选项: {[c['t'] for c in cands]}")
         if best is None:
             self.log_warning("没识别到加成数值，兜底点第一个选项")
             card = self._all(items, r"训练|强化")
@@ -2245,7 +2256,7 @@ class AutoTask(MyBaseTask):
         return ""
 
     def _do_trip(self, items, frame):
-        """周末出行：笔记 > 技能 > 未溢出的精力 > 属性 > 零用钱，游戏厅排除。
+        """周末出行：笔记 > 训练项 > 未溢出的精力 > 属性 > 零用钱，游戏厅排除。
 
         精力来源只有事件和公园（玩家 2026-11-23 明确），所以：
           * 精力没满 → 公园里挑能真正吃进精力条的档位；
@@ -3179,7 +3190,7 @@ class AutoTask(MyBaseTask):
         return base
 
     def _orange_spots(self, frame):
-        """右侧技能列上的黄色小圆标：找橙色像素团的中心。"""
+        """右侧训练项列上的黄色小圆标：找橙色像素团的中心。"""
         h, w = frame.shape[:2]
         x1, x2 = int(w * 0.86), int(w * 0.995)
         y1, y2 = int(h * 0.05), int(h * 0.95)
@@ -3221,15 +3232,19 @@ class AutoTask(MyBaseTask):
         return None
 
     SKILLS = ["投射", "弹跳", "防守", "体能", "运控", "意识"]
-    # 被训练的「主力」，他自己不算队友（录制 122 张训练核心帧里 119 张都有她）
+    # 【2026-11-26 玩家定版】进训练项页时游戏默认选中的永远是「投射」，详情已经展开。
+    # 以前靠「深蓝高亮」猜，11-26 10:54 那轮猜成了「体能」，于是把投射当普通项去点开 ——
+    # 点默认项 = 确认开训，直接撞剧情、这次训练作废。现在写死，不猜。
+    DEFAULT_ITEM = "投射"
+    # 被训练的「主力」，他自己不算队友（录制 122 张训练项页帧里 119 张都有她）
     # 只用于识别**粘连词**（「百希雅」=百目鬼+希雅，含主力名且超 2 字 → 判为拼接产物）。
     # 2026-11-23 起不再用它从队友里剔人：主训每局会换，靠 _resident_names 自动判。
     MAIN_CHAR = "希雅"
     # 场上角色的口径（玩家 2026-11-23 定稿）：
-    #   「经理也是算作队友的」，而且训练核心页根本没有「替补 / 解说」这类标签，
+    #   「经理也是算作队友的」，而且训练项页根本没有「替补 / 解说」这类标签，
     #   所以**场上站着的都算队友**（含经理、含主训本人），不做任何名字级剔除。
-    #   恒在场的角色对每个技能都是 +1，不影响排名；剔掉反而会因为某帧 OCR
-    #   漏读而让那个技能少算一分。只保留通用护栏（技能名 / 粘连词 / 加成浮层词）。
+    #   恒在场的角色对每个训练项都是 +1，不影响排名；剔掉反而会因为某帧 OCR
+    #   漏读而让那个训练项少算一分。只保留通用护栏（训练项名 / 粘连词 / 加成浮层词）。
     # 出现在球场上但明显不是人名的词：加成浮层条目 + 出行地点名
     MATE_STOP_WORDS = ("加成", "队友", "表情", "倍率", "一致", "额外", "组合", "概率",
                        "上限", "游戏厅", "公园", "餐厅", "步行街", "散步", "野餐", "划船")
@@ -3248,7 +3263,7 @@ class AutoTask(MyBaseTask):
              面积/宽高比双重不过 → 判「没有」。
 
         改成先全图扫一遍橙色小圆、再按纵向就近归属（见 `_badge_near`），
-        完全不看 OCR 框的横向位置。575 张真实训练核心帧实测：
+        完全不看 OCR 框的横向位置。575 张真实训练项页帧实测：
         **每帧 1~6 个角标，0 张是「全无」**（1个:3 帧 / 2个:55 / 3个:198 /
         4个:259 / 5个:58 / 6个:2，均值 3.5）。
         也就是说「六项全无角标」在真实对局里不存在 —— 出现即坏帧。
@@ -3275,7 +3290,7 @@ class AutoTask(MyBaseTask):
         return out
 
     def _badge_near(self, frame, row, blobs=None):
-        """技能行对应的橙色小人角标圆心；没有就返回 None。
+        """训练项行对应的橙色小人角标圆心；没有就返回 None。
 
         单行便捷接口（证据脚本 / CoreProbe 用）。批量判定请用 `_badges_for_rows`，
         它做了一对一分配，避免两行抢同一个角标。
@@ -3283,17 +3298,17 @@ class AutoTask(MyBaseTask):
         return self._badges_for_rows(frame, [row], blobs).get(0)
 
     def _badges_for_rows(self, frame, rows, blobs=None):
-        """给每个技能行分配角标，**一对一**（一个角标只能用一次）。返回 {行下标: 圆心}。
+        """给每个训练项行分配角标，**一对一**（一个角标只能用一次）。返回 {行下标: 圆心}。
 
         匹配方式（2026-11-24 改）：只看纵向，不看 OCR 框的横向位置。
-          · 横向只要落在技能胶囊列（`x > 0.62w`）即可 —— 角标贴在胶囊右上角外侧；
-          · 纵向按 `|角标y - 技能行cy|` 从小到大贪心分配，每个角标、每一行各用一次。
+          · 横向只要落在训练项条目列（`x > 0.62w`）即可 —— 角标贴在胶囊右上角外侧；
+          · 纵向按 `|角标y - 训练项行cy|` 从小到大贪心分配，每个角标、每一行各用一次。
 
-        为什么要一对一：技能行间距实测约 108px，半距 54px。若阈值宽于半距，相邻两行
+        为什么要一对一：训练项行间距实测约 108px，半距 54px。若阈值宽于半距，相邻两行
         会同时「认领」同一个角标 → 本来没人的那项被判成有人，白采一轮还拉低排名。
         贪心分配把这类抢用直接消掉。
 
-        阈值依据（1600x900 实测）：角标 y 比对应技能行中心高 43~45px（=0.048h），
+        阈值依据（1600x900 实测）：角标 y 比对应训练项行中心高 43~45px（=0.048h），
         取 0.055h（≈49.5px）刚好覆盖，又明显小于半距 54px。
         """
         if blobs is None:
@@ -3325,9 +3340,9 @@ class AutoTask(MyBaseTask):
     def _court_names(self, items, frame):
         """球场上站着的角色名（队友 + 主力），名字是 2~5 个字的小标签。
 
-        2026-11-23 实测坐标（1920x1080，核心页）：球队经理(364,443)、真崎(555,448)、
+        2026-11-23 实测坐标（1920x1080，训练项页）：球队经理(364,443)、真崎(555,448)、
         百目鬼(684,441)、希雅(888,455)，都落在 y≈0.41 这一行。
-        「球队经理」是场边常驻角色，不是队友，必须排除，否则每个技能都白送 1 分。
+        「球队经理」是场边常驻角色，不是队友，必须排除，否则每个训练项都白送 1 分。
         """
         h, w = frame.shape[:2]
         out = []
@@ -3348,7 +3363,7 @@ class AutoTask(MyBaseTask):
         「百希雅」（=百目鬼+希雅）、「晞雅鬼」。它们含主力名字希雅又超过 2 个字，
         一律判为拼接产物 —— 否则每帧都能凭空多算一个队友。
 
-        加成浮层也要防：05:29 实测点开技能时偶尔会弹出左侧那四张加成卡，
+        加成浮层也要防：05:29 实测点开训练项时偶尔会弹出左侧那四张加成卡，
         OCR 把「属性加成」「表情一致」当成了站在场上的队友，白送 2 分，
         直接把错的选项顶到第一。所以这类词一律不认。
         """
@@ -3366,16 +3381,16 @@ class AutoTask(MyBaseTask):
         return True
 
     def _decide(self, items, frame):
-        """训练核心页的「决定」：**不判颜色**，OCR 读不到就用锚点定位按钮。
+        """训练项页的「决定」：**不判颜色**，OCR 读不到就用锚点定位按钮。
 
-        实测（22:33，第4周技能全 MAX）：这时的「决定」是白底按钮
-        BGR≈(152,212,211)，被「只有黄色才点」的保护挡掉，结果在核心页空转 15 步。
+        实测（22:33，第4周训练项全 MAX）：这时的「决定」是白底按钮
+        BGR≈(152,212,211)，被「只有黄色才点」的保护挡掉，结果在训练项页空转 15 步。
         又实测（2026-11-23 05:19）：黄底白字的「决定」OCR 有时整块读不出来，
         exact 匹配失败 → 页面判定和点击一起失灵。
 
         2026-11-24 11:20 实跑又出现 3 次「没读到决定」，说明这个兜底不是偶发。
-        原来兜底是死坐标 (0.926, 0.831)，但「决定」按钮**按技能换版式、位置不固定**
-        （见 anchors.json 里 训练核心_决定_1..4，四套区域的 y 差了近 200px），
+        原来兜底是死坐标 (0.926, 0.831)，但「决定」按钮**按训练项换版式、位置不固定**
+        （见 anchors.json 里 训练项页_决定_1..4，四套区域的 y 差了近 200px），
         死坐标只能碰运气。现在改成：先问框架「决定按钮的像素在哪」（模板匹配），
         命中就点它自己的中心；锚点也没命中（画面被浮层盖住）才退回死坐标。
         """
@@ -3385,15 +3400,15 @@ class AutoTask(MyBaseTask):
             return True
         if self._click_confirm(items, frame):
             return True
-        name, box = self._anchor_find("训练核心", frame)
+        name, box = self._anchor_find("训练项页", frame)
         if box is None:
-            # 这一步用的 frame 通常是「点技能胶囊之前」那一帧，按钮可能还在动画里
+            # 这一步用的 frame 通常是「点训练项条目之前」那一帧，按钮可能还在动画里
             # （2026-11-24 11:23 实测 3 次读不到「决定」，就是卡在加成飘字的过渡帧）。
             # 等半秒重新取一帧再匹配，比直接退回经验坐标可靠。
             self.sleep(0.5)
             f2 = self._frame()
             if f2 is not None:
-                name, box = self._anchor_find("训练核心", f2)
+                name, box = self._anchor_find("训练项页", f2)
         if box is not None:
             cx, cy = box.x + box.width / 2, box.y + box.height / 2
             self.log_info(f"没读到「决定」文字 → 锚点 {name} 定位 ({int(cx)},{int(cy)})")
@@ -3405,7 +3420,7 @@ class AutoTask(MyBaseTask):
         return True
 
     def _selected_skill(self, frame, rows):
-        """从当前帧认出「深蓝高亮」的技能胶囊 = 游戏默认选中的那一项。
+        """从当前帧认出「深蓝高亮」的训练项条目 = 游戏默认选中的那一项。
 
         实测两帧（2026-11-23 20:37）：
           W1D4 点开弹跳后：选中态整条带 亮度≈124、B-R≈9（深藏青）；
@@ -3438,33 +3453,40 @@ class AutoTask(MyBaseTask):
             return None
 
     def _do_training_core(self, items, frame):
-        """训练核心页：点开带角标（=有人站台）的技能 → 读队友 / 器材 / 失败率 → 打分 → 决定。
+        """训练项页：点开带角标（=有人站台）的训练项 → 读队友 / 器材 / 失败率 → 打分 → 决定。
 
         候选池判定（玩家 2026-11-24 12:55）：「角标代表有人，没角标的一定没有人」
-        → 没角标的技能队友恒为 0，不采；默认选中项若在候选里，则**先采且一次都不点**
+        → 没角标的训练项队友恒为 0，不采；默认选中项若在候选里，则**先采且一次都不点**
         （点了会把游戏的默认态变成手动选中，触发二次确认直接开训）。
 
-        每轮都从画面上重新认「主训人员」（每个技能都在场的名字），不写死名字。
+        每轮都从画面上重新认「主训人员」（每个训练项都在场的名字），不写死名字。
         """
         h, w = frame.shape[:2]
         rows = [it for it in items if it["t"] in self.SKILLS and it["cx"] / w > 0.70]
         rows.sort(key=lambda x: x["cy"])
         if not rows:
-            self.log_warning("训练核心页没找到技能胶囊，直接决定")
+            # 【2026-11-26】以前这里直接 _decide（= 点「决定」），等于蒙一项开训。
+            # 页面上连六项训练项都读不全，就不该替玩家选。
+            if self._read_fail_stop_now(
+                    "训练项页", "训练项页没找到任何训练项条目（认页失败/残帧）", frame=frame,
+                    hint="页面上连六项训练项都没读全，分不清哪一项是默认的「投射」，不敢替玩家选。"
+            ):
+                return True
+            self.log_warning("训练项页没找到训练项条目，直接决定")
             return self._decide(items, frame)
 
-        if self.core_checked:
+        if self.item_checked:
             return self._decide(items, frame)
-        self.core_checked = True
+        self.item_checked = True
 
         # ── 角标扫描 + 坏帧重取 ──
         # **扫不到可用的角标 = 坏帧，不是「今天没人」**。依据（2026-11-24 13:00）：
-        # 575 张真实训练核心帧，每帧都有 1~6 个角标（1个:3 / 2个:55 / 3个:198 /
+        # 575 张真实训练项页帧，每帧都有 1~6 个角标（1个:3 / 2个:55 / 3个:198 /
         # 4个:259 / 5个:58 / 6个:2，均值 3.5），**0 张是「全无」**。
         # 实跑第 3 轮那 3 次「六项都没角标」，同时伴随「没认出默认选中态」
-        # 「只读到 5 个技能（缺防守）」「所有候选都没读到编队」—— 典型的刚切页、
+        # 「只读到 5 个训练项（缺防守）」「所有候选都没读到训练项详情」—— 典型的刚切页、
         # 胶囊和角标还在淡入的残帧。拿这种帧比较必然白扔一次训练。
-        # 所以：角标一个都扫不到，或者扫到了却一个都对不上技能行（OCR 行纵向偏了），
+        # 所以：角标一个都扫不到，或者扫到了却一个都对不上训练项行（OCR 行纵向偏了），
         # 都先重取帧，最多 3 次；仍不行才降级到按默认项决定。
         def _scan(fr, its):
             bl = self._badge_blobs(fr)
@@ -3478,7 +3500,7 @@ class AutoTask(MyBaseTask):
         for attempt in range(1, 4):
             if targets:
                 break
-            self.log_warning(f"角标不可用（全图 {len(blobs)} 个 / 技能区 {len(rows)} 项 / 对上 {len(targets)} 项）"
+            self.log_warning(f"角标不可用（全图 {len(blobs)} 个 / 训练项区 {len(rows)} 项 / 对上 {len(targets)} 项）"
                              f"→ 疑似坏帧，重取第 {attempt} 次")
             self.sleep(0.5)
             f2 = self._frame()
@@ -3488,27 +3510,29 @@ class AutoTask(MyBaseTask):
             b2, r2, t2 = _scan(f2, items)
             frame, blobs, rows, targets = f2, b2, r2, t2
             if not rows:
-                self.log_warning("重取后的帧读不到技能胶囊 → 直接按默认项决定")
+                self.log_warning("重取后的帧读不到训练项条目 → 直接按默认项决定")
                 return self._decide(items, frame)
         if not targets:
             self.log_warning("连续重取 3 次仍拿不到可用角标 → 按坏帧处理，直接按默认项决定")
             return self._decide(items, frame)
         if attempt:
             self.log_info(f"重取第 {attempt} 次后角标可用：全图 {len(blobs)} 个，对上 {len(targets)} 项")
-        self.log_info(f"角标扫描：全图 {len(blobs)} 个橙色小人，技能区 {len(rows)} 项，有角标 {len(targets)} 项")
+        self.log_info(f"角标扫描：全图 {len(blobs)} 个橙色小人，训练项区 {len(rows)} 项，有角标 {len(targets)} 项")
 
-        # 2026-11-23 玩家指出（14 次实跑全部验证）：训练核心页默认选中的是「投射」，
-        # 再点它一次游戏就当作确认开训，3~4 秒后直接跳「训练结果」，整次编队比较作废。
-        # 所以当前高亮的那一项只读不点；实测深蓝胶囊就是选中态，用画面认，不写死。
-        selected = self._selected_skill(frame, rows)
-        if selected:
-            self.log_info(f"当前默认选中「{selected}」→ 这一项全程不点击，直接采默认帧")
-        else:
-            self.log_warning("没认出默认选中态（深蓝高亮）→ 所有带角标的技能都点开采，靠排名选")
+        # 【2026-11-26 玩家定版 A】默认项 = 「投射」，写死，不再靠颜色猜。
+        # 历史：11-23 用两帧截图凑出「深蓝高亮」判据；11-26 10:54 实跑把它猜成了「体能」，
+        # 于是「投射」被当成普通项去点开 —— 点默认项 = 确认开训，撞剧情、整次训练作废。
+        # 现在：读的是常量，颜色识别只留作对账日志（猜的和写死的不一致就记一笔，方便
+        # 以后发现游戏改了默认项），**绝不拿它做决策**。
+        selected = self.DEFAULT_ITEM
+        guess = self._selected_skill(frame, rows)
+        if guess and guess != selected:
+            self.log_info(f"颜色识别猜「{guess}」，但按写死的默认项「{selected}」处理（不采信颜色）")
+        self.log_info(f"默认选中「{selected}」（写死，不猜）→ 这一项全程不点击，直接采默认帧")
 
         cfg = self._tuning().get("core_score", {}) or {}
         audit_week, audit_day = self._read_week(items)   # 证据目录按「第N周星期X」分组
-        # 候选池 = **带角标的技能**。
+        # 候选池 = **带角标的训练项**。
         # 【2026-11-24 12:55 玩家纠错】「角标代表有人，没角标的一定没有人！」
         #   → 角标 = 这一项有支援单位站台（有人 → 有队友分）；
         #     没角标 = 一定没人 → 队友恒为 0，采它只是白烧几帧 OCR，还可能把误读的名字
@@ -3523,8 +3547,8 @@ class AutoTask(MyBaseTask):
                 self.log_info(f"「{r['t']}」没有角标 → 没人，跳过")
 
         # 器材基线：进页面这一帧先读一次。卡片是**淡入淡出**的（实测同一场训练里
-        # 4 个技能帧分别读到 2/1/0/0 张），而同一场带的器材是固定的 ——
-        # 所以拿进页面这一帧当基线，某个技能的采样帧没卡也不至于白丢器材分。
+        # 4 个训练项帧分别读到 2/1/0/0 张），而同一场带的器材是固定的 ——
+        # 所以拿进页面这一帧当基线，某个训练项的读数帧没卡也不至于白丢器材分。
         base_equips = []
         try:
             base_equips = [card_glow(frame, c) for c in find_cards(frame)]
@@ -3535,43 +3559,69 @@ class AutoTask(MyBaseTask):
 
         scored = []
         # ① 默认选中项**最先采，而且一次都不点**。
-        #    玩家 2026-11-24 11:55：「进入的时候默认就是投射的，不用点击直接就能采样，
+        #    玩家 2026-11-24 11:55：「进入的时候默认就是投射的，不用点击直接就能读数，
         #    如果这时候要去点击它，会直接变成选中」。也就是说这页一进来就已经展开着默认项的
         #    编队，点击动作本身会把"游戏默认态"改成"手动选中"（会触发二次确认直接开训），
-        #    所以这里连"没读到就补点"都不做，采不到只重新取帧（_core_measure 内部处理）。
+        #    所以这里连"没读到就补点"都不做，采不到只重新取帧（_measure_item 内部处理）。
         #    为什么必须排在最前面：按胶囊的 cy 从上往下逐个点开的话，一旦前面的技能先被点，
-        #    画面就变成那个技能的编队了，轮到这里再"采当前帧"采到的根本不是默认项
+        #    画面就变成那个训练项的编队了，轮到这里再"采当前帧"采到的根本不是默认项
         #    —— W2D4「带经理加成 + 器材」的投射掉出候选池，正是这个顺序问题。
         #    前提：默认项必须在候选里（有角标 = 有人）。没角标说明它没人，採出来是 0 分，
         #    不白花这几帧。
         preset_row = None
         if selected:
             preset_row = next((r for r, _s in targets if r["t"] == selected), None)
+        if preset_row is None:
+            # 【2026-11-26 玩家定版 A】默认项的两种缺席，处理方式完全不同：
+            #   ①「投射」这行还在画面上、只是没角标 → 今天没人站台，队友恒 0，跳过它；
+            #      此时点其余项是「切换选择」，不是确认开训，安全。
+            #   ② 画面上根本读不到「投射」这一行 → 页面残缺/切页残帧，此时**一个都不点**，
+            #      因为分不清哪一项才是当前展开的那项，点下去可能正好点在默认项上。
+            #      按玩家要求：判不出来就停下来问，不许蒙。
+            in_page = any(r["t"] == selected for r in rows)
+            if in_page:
+                self.log_info(f"默认项「{selected}」今天没角标（没人站台）→ 不采它，只点其余带角标的项")
+            else:
+                if self._read_fail_stop_now(
+                        selected, "训练项页读不到默认项这一行（坏帧/切页残帧）", frame=frame,
+                        hint=f"页面上读不到默认项「{selected}」这一行，"
+                             f"怕手一点正好点成「确认开训」。"
+                ):
+                    return True
+                self.log_warning(f"读不到默认项「{selected}」→ 不敢点任何项，交回主循环")
+                return True
         if preset_row is not None:
             self.log_info(f"默认选中「{selected}」→ 进页面就展开着它的编队，先采它，全程不点击")
-            rec = self._core_measure(preset_row, selected, "default", base_equips,
+            rec = self._measure_item(preset_row, selected, "default", base_equips,
                                      audit_week, audit_day, idx=0, shot=frame)
             if rec is None:
                 return True
             scored.append(rec)
 
-        # ② 其余技能逐个点开（带角标的才值得花一次点击 + 若干帧 OCR）
+        # ② 其余训练项逐个点开（带角标的才值得花一次点击 + 若干帧 OCR）
         rest = [(r, s) for (r, s) in targets if r is not preset_row]
         if rest:
-            self.log_info(f"接下来点开 {len(rest)} 个带角标的技能：[{', '.join(r['t'] for r, _ in rest)}]")
+            self.log_info(f"接下来点开 {len(rest)} 个带角标的训练项：[{', '.join(r['t'] for r, _ in rest)}]")
         for idx, (r, _spot) in enumerate(rest, 1):
-            rec = self._core_measure(r, r["t"], "click", base_equips,
+            rec = self._measure_item(r, r["t"], "click", base_equips,
                                      audit_week, audit_day, idx=idx)
             if rec is None:
                 return True
             scored.append(rec)
+        # 读数失败已经请求停机（_read_fail_stop_now 会把 read_fail_stop 置 True）：
+        # 不要再排名、不要再点决定，直接把控制权交回主循环去 break。
+        if self.read_fail_stop:
+            return True
 
         if not scored:
-            self.log_warning("所有候选都没读到编队，按当前默认项决定")
+            # 玩家 2026-11-26：一个都没读到就按「默认项」决定 = 蒙，改成停下。
+            if self._read_fail_stop_now("本次全部训练项", "所有候选都没读到训练项详情", frame=frame):
+                return True
+            self.log_warning("所有候选都没读到训练项详情，按当前默认项决定")
             return self._decide(items, frame)
 
         # 记下这一场器材最多有几张 —— 商店那边「器材暴击道具只有器材上站人才买」
-        # 要用它（wiki 原话）。商店页看不到器材，只能靠训练核心页这一眼。
+        # 要用它（wiki 原话）。商店页看不到器材，只能靠训练项页这一眼。
         seen_eq = max([len(d.get("equips") or []) for d in scored] or [0])
         if seen_eq:
             self.last_equip_count = seen_eq
@@ -3579,23 +3629,27 @@ class AutoTask(MyBaseTask):
         usable = [d for d in scored if d["valid"]]
         if usable:
             if len(usable) < len(scored):
-                self.stat["sample_fail"] += len(scored) - len(usable)
-                self.log_warning(f"{len(scored) - len(usable)} 个技能采样失败，已排除在排名外")
+                # 计数已经在 _measure_item 里按「每个训练项一次读数」加过了，
+                # 这里只打日志，别再重复加（2026-11-25 修「读数失败恒为 0」时统一了口径）。
+                self.log_warning(f"{len(scored) - len(usable)} 个训练项读数失败，已排除在排名外")
             scored = usable
         else:
-            self.log_warning("全部技能采样都失败，按当前默认项决定")
+            # 全部 0 帧：同样是「蒙」，停下等人看画面（玩家 2026-11-26）。
+            if self._read_fail_stop_now("本次全部训练项", "每个训练项都是 0 帧有效", frame=frame):
+                return True
+            self.log_warning("全部训练项读数都失败，按当前默认项决定")
             return self._decide(items, frame)
 
-        # 主训人员：出现在**每个**技能里的那个名字（玩家：不能写死名字）。
+        # 主训人员：出现在**每个**训练项里的那个名字（玩家：不能写死名字）。
         #   ・只用来「知道这轮主训是谁」并打进日志，**不从队友里剔除** ——
-        #     玩家同时要求「经理也算队友」，而恒在场的名字对每个技能都是 +1，排名不受影响。
+        #     玩家同时要求「经理也算队友」，而恒在场的名字对每个训练项都是 +1，排名不受影响。
         main_char = self._main_char_of_round(scored, cfg)
         if main_char:
             self.main_char_round = main_char
             self._remember_main_char(main_char)
-            self.log_info(f"本轮主训人员：{main_char}（每个技能都在场，按队友计入）")
+            self.log_info(f"本轮主训人员：{main_char}（每个训练项都在场，按队友计入）")
         else:
-            self.log_warning("没认出主训人员（只采到一个技能 / OCR 漏读），按场上名字直接算队友")
+            self.log_warning("没认出主训人员（只采到一个训练项 / OCR 漏读），按场上名字直接算队友")
 
         # ===== 失败率硬门槛（玩家 2026-11-23：手动打从来不失败）=====
         scored = self._apply_fail_limit(scored, cfg)
@@ -3607,7 +3661,7 @@ class AutoTask(MyBaseTask):
             d["mates"] = len(real)
             mgr_hit = sorted(real & mgr_names)
             mgr_txt = f" 经理{mgr_hit}×{mgr_w}" if mgr_hit else ""
-            d["score"] = self._score_core(sorted(real), d["level"], d["pct"], cfg,
+            d["score"] = self._score_item(sorted(real), d["level"], d["pct"], cfg,
                                           d.get("equips"))
             eq = d.get("equips") or []
             self.log_info(f"「{d['row']['t']}」{d['level'] or '?'} 失败率={d['pct']}% "
@@ -3615,20 +3669,20 @@ class AutoTask(MyBaseTask):
                           f"→ 得分 {d['score']:.2f}")
 
         # ===== 意识加权 = 精力泵（玩家 2026-11-23）=====
-        # 意识训练**不消耗精力、反而小幅回精力**，而且是所有技能里成功率最高的。
+        # 意识训练**不消耗精力、反而小幅回精力**，而且是所有训练项里成功率最高的。
         # 所以精力见底时它不是「次优解」，而是唯一能让「周一到周六每天都训练」成立的选择。
         # 精力充足时不加权，避免抢掉正常成长。
         self._apply_consciousness_boost(scored, cfg)
 
         scored.sort(key=lambda d: (-d["score"],
                                    d["pct"] if d["pct"] is not None else 999))
-        self.log_info("编队排名：" + " | ".join(
+        self.log_info("训练项排名：" + " | ".join(
             f"{d['row']['t']} {d['score']:.2f}分(队友{d['mates']} 器材{len(d.get('equips') or [])}"
             f"/{d['level'] or '?'}) 失败率{d['pct']}%"
             for d in scored))
 
         # 玩家规则（2026-11-23）：
-        #   能练的技能失败率**全部**高于阈值时，练下去就是白扔精力；
+        #   能练的训练项失败率**全部**高于阈值时，练下去就是白扔精力；
         #   如果商店又确认买不到精力药（精力补不回来），改练「意识」（成功率最高）。
         #   商店本期没进去看过 = 不知道有没有药，这条规则不生效，按原排名走。
         forced = self._force_skill_when_risky(scored, cfg)
@@ -3640,7 +3694,7 @@ class AutoTask(MyBaseTask):
         # 全员 0 分 = 队友和器材都没读到，这时候的排名没有意义，别装作在"赌"
         if best.get("score", 0) <= 0:
             self.log_warning(f"所有候选得分都是 0（队友/器材没读到），按「{best['row']['t']}」"
-                             f"——采样可能不全，这一手不算决策")
+                             f"——读数可能不全，这一手不算决策")
         # 选中项带失败率 → 明确打一条「赌」的日志，事后复盘输赢用
         elif best.get("pct"):
             alt = [d for d in scored if d is not best and not d.get("pct")]
@@ -3669,13 +3723,13 @@ class AutoTask(MyBaseTask):
             f"第{audit_week}周 星期{audit_day}  判定时刻 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"精力 {self.stamina}/{self.stamina_max}  金币 {getattr(self, 'gold', None)}\n\n"
             f"【每项原始读数与得分】\n" + "\n".join(detail_lines) + "\n\n"
-            f"【编队排名】\n{rank_txt}\n\n"
+            f"【训练项排名】\n{rank_txt}\n\n"
             f"【默认选中项】{selected or '未识别'}"
             f"（{'先进页面直接采默认帧、全程未点击' if any(d['row']['t'] == selected for d in scored) else '未采到，未参与排名'}）\n"
             f"【规则覆盖】{'改练 ' + forced['row']['t'] + '（原第一 ' + scored[0]['row']['t'] + '）'
                          if forced and scored[0] is not forced else '无'}\n"
             f"【最终选择】{_sk}  得分 {best['score']:.2f}  失败率 {best.get('pct')}%\n"
-            f"【采样是否有效】{'有效' if best.get('score', 0) > 0 else '全员0分/采样可能不全'}\n"
+            f"【读数是否有效】{'有效' if best.get('score', 0) > 0 else '全员0分/读数可能不全'}\n"
         )
         self._audit_save(audit_week, audit_day, "DECIDE", None, decide_txt)
 
@@ -3686,7 +3740,7 @@ class AutoTask(MyBaseTask):
             # 本来就是默认选中项，再点一次会被游戏当成确认开训，跳过直接点「决定」
             self.log_info(f"「{_sk}」本来就是默认选中项 → 不再点它，避免二次确认开训")
         else:
-            self._click_item(best["row"], f"[最优编队 {_sk} 得分{best['score']:.1f}]")
+            self._click_item(best["row"], f"[最优训练项 {_sk} 得分{best['score']:.1f}]")
         self.sleep(1.0)
         f3 = self._frame()
         if f3 is None:
@@ -3703,66 +3757,118 @@ class AutoTask(MyBaseTask):
             pool.append(name)
             del pool[:-8]
 
-    def _core_measure(self, row, name, how, base_equips, audit_week, audit_day,
+    def _read_fail_stop_now(self, name, detail, frame=None, hint=None):
+        """训练项读数失败 → **停在这里**，不许按默认项蒙着继续。
+
+        玩家 2026-11-26：「为什么读数 0 帧这么多还继续？应该停下来，你找到原因，再看。
+        而不是一股脑流过去。」——所以读数失败不再降级为「排除该项 / 按默认项决定」，
+        而是截图 + 桌面弹窗 + 退出主循环，等人看一眼画面再决定。
+
+        hint：弹窗里那句「到底什么地方出问题」，不同调用点说法不同
+        （读数失败 vs 认页失败 vs 读不到默认项），不传就用读数失败那句。
+
+        返回 True 表示已经请求停机（调用方应直接返回，不要再排名、不要再点）。
+        """
+        cfg = self._tuning()
+        # 任务配置优先（configs/AutoTask.json），其次 strategy.yaml 的 tuning 段，
+        # 都没有就按「停」——玩家要的就是别蒙着继续。
+        stop = self.config.get("读数失败即暂停", cfg.get("读数失败即暂停", True))
+        if not stop:
+            self.log_warning(f"「{name}」读数失败：{detail}（配置要求继续，按默认项走）")
+            return False
+        if frame is not None:
+            self._shot(frame, f"read_fail_{name}")
+        self.read_fail_stop = True
+        self.log_error(f"「{name}」读数失败：{detail} → 已停下，不按默认项猜", notify=True)
+        self._alert_popup(
+            "篮球少女：训练项读数失败，已暂停",
+            (hint or f"点开「{name}」之后没读到训练项详情（队友 / 器材 / 失败率 / 等级）。") + "\n\n"
+            f"原因：{detail}\n\n"
+            f"脚本不会按默认项蒙着继续（那等于白扔一次训练）。\n"
+            f"请看一眼游戏画面：如果卡在经理增益 / 剧情 / 结算页，点掉它再重跑；\n"
+            f"如果是「训练项详情」根本没弹（点空 / 点了没选中），也重跑一次。\n\n"
+            f"截图：screenshots/auto/read_fail_{name}_*.png")
+        return True
+
+    def _measure_item(self, row, name, how, base_equips, audit_week, audit_day,
                       idx=0, shot=None):
-        """采一个技能候选的编队并落一份证据，返回参与排名的记录。
+        """采一个训练项候选的编队并落一份证据，返回参与排名的记录。
 
         how:
           "default" —— 页面进来自带选中态（玩家 2026-11-24 11:55：游戏默认就选中「投射」，
-                       编队已经摊开，「不用点击直接就能采样」；「如果这时候要去点击它，
+                       编队已经摊开，「不用点击直接就能读数」；「如果这时候要去点击它，
                        会直接变成选中」）→ **一次都不点**，连"没读到就补点"也不做，
                        只重新取帧。点了会把默认态变成手动选中并触发二次确认直接开训。
-          "click"   —— 其余技能：点开胶囊再采；没读到就上移 26px 补点一次。
+          "click"   —— 其余训练项：点开胶囊再采；没读到就上移 26px 补点一次。
 
-        返回 None 表示采样途中页面已经切走，调用方应放弃本次编队比较。
+        返回 None 表示读数途中页面已经切走，调用方应放弃本次训练项比较。
         """
         if how == "click":
-            self.log_info(f"—— 点开「{name}」（第 {idx} 项）看编队")
-            self._click_item(row, "[展开编队]")
-            # 选中态会一直保留，起手等 0.4s 就够（由 _sample_core 的 warmup 控制）
-            names, pct, level, equips = self._sample_core(row)
+            self.log_info(f"—— 点开「{name}」（第 {idx} 项）看训练项详情")
+            self._click_item(row, "[展开训练项详情]")
+            # 选中态会一直保留，起手等 0.4s 就够（由 _sample_item 的 warmup 控制）
+            names, pct, level, equips = self._sample_item(row)
         else:
-            # 默认帧就在眼前：起手几乎不用等，直接连拍（_sample_core 内部多帧投票）
-            names, pct, level, equips = self._sample_core(row, warmup=0.1)
+            # 默认帧就在眼前：起手几乎不用等，直接连拍（_sample_item 内部多帧投票）
+            names, pct, level, equips = self._sample_item(row, warmup=0.1)
+        # 【2026-11-25】画面在读数途中已经切走（开训 / 剧情 / 结算遮罩）：
+        # 这时候**绝对不能补点** —— 补的那一下会落在经理增益卡片或事件选项上，
+        # 等于替玩家瞎选一次，还让整次训练项比较作废。直接交回主循环处理那一页。
+        if getattr(self, "_item_interrupt", None):
+            self.log_warning(f"「{name}」读数被「{self._item_interrupt}」打断 → 不补点、不排名，"
+                             f"交给主循环（这一天按画面上的实际情况继续）")
+            self._item_interrupt = None
+            self.stat["sample_fail"] += 1
+            return None
+
         if not names and pct is None and level is None:
             if how == "click":
-                # 2026-11-23 实测：「意识」这一档常点了没反应（选中的还是上一个技能），
+                # 2026-11-23 实测：「意识」这一档常点了没反应（选中的还是上一个训练项），
                 # 因为它贴在最底下、离属性条太近。往上挪 26px 重点一次再读。
-                self.log_warning(f"「{name}」没读到编队（可能点偏了），往上挪 26px 重点一次")
+                self.log_warning(f"「{name}」没读到训练项详情（可能点偏了），往上挪 26px 重点一次")
                 self.click(row["cx"], row["cy"] - 26)
-                names, pct, level, equips = self._sample_core(row)
+                names, pct, level, equips = self._sample_item(row)
             else:
                 # 默认项不能补点（会开训），只能等画面渲完再重采一次
-                self.log_warning(f"「{name}」默认帧没读到编队 → 等一拍重采（仍然不点击）")
-                names, pct, level, equips = self._sample_core(row, warmup=0.6)
+                self.log_warning(f"「{name}」默认帧没读到训练项详情 → 等一拍重采（仍然不点击）")
+                names, pct, level, equips = self._sample_item(row, warmup=0.6)
 
-        # 页面守卫：采样途中页面可能已经变了（实测第 6 周点开「体能」时，
-        # 画面已经跳到「器材事件」，后面 3 步全在对着事件页点技能 + 点决定）。
-        # 一旦不是训练核心页就立刻交回主循环，别把后续技能也点一遍。
+        # 页面守卫：读数途中页面可能已经变了（实测第 6 周点开「体能」时，
+        # 画面已经跳到「器材事件」，后面 3 步全在对着事件页点训练项 + 点决定）。
+        # 一旦不是训练项页就立刻交回主循环，别把后续训练项也点一遍。
         f_chk = self._frame()
         if f_chk is not None:
             now_page = self._classify(self._texts(f_chk), f_chk)
-            if now_page != "训练核心":
-                self.log_warning(f"采样途中页面已变成「{now_page}」→ 放弃本次编队比较，交给主循环")
+            if now_page != "训练项页":
+                self.log_warning(f"读数途中页面已变成「{now_page}」→ 放弃本次训练项比较，交给主循环")
                 return None
 
-        # 三项全空 = 这次采样整个失败了（取帧全 None / 画面还在渲染），
+        # 三项全空 = 这次读数整个失败了（取帧全 None / 画面还在渲染），
         # 不能当成「0 队友 0 分」参与排名，否则会把本来最好的选项排到最后。
         valid = not (level is None and pct is None and not names)
+        if not valid:
+            # 2026-11-25：以前这个计数只在「部分失败」那条分支里加，最惨的
+            # 「整次 0 帧有效」反而漏计，摘要里永远写「读数失败 0 项」。
+            # 现在按「每个训练项一次读数」在这里统一计。
+            self.stat["sample_fail"] += 1
+            # 2026-11-26（玩家）：0 帧不许蒙着继续 —— 默认直接停下等人看画面。
+            self._read_fail_stop_now(
+                name, f"6 帧里 0 帧读到训练项详情（方式：{how}）", frame=self._frame())
+            return None
         # 默认选中的那一项，证据就用刚进页面时的原始帧（数据也是从这一帧读的）
         f2 = shot if shot is not None else self._frame()
         if f2 is not None and self.config.get("保存截图"):
-            self._shot(f2, f"core_{idx}")
+            self._shot(f2, f"item_{idx}")
         rec = {"row": row, "pct": pct, "mates": 0, "level": level,
                "valid": valid, "names": set(names), "score": 0.0,
                "equips": equips or list(base_equips), "how": how}
-        # 采样证据（玩家 16:47 要人工检查）：每个技能一帧图 + OCR 原文 +
+        # 读数证据（玩家 16:47 要人工检查）：每个训练项一帧图 + OCR 原文 +
         # 这次读到的队友/器材/失败率/等级；打分在下面算完后会再补写一份汇总。
         f2_items = self._texts(f2) if f2 is not None else []
         audit_txt = (
-            f"第{audit_week}周 星期{audit_day}  采样时刻 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"技能：{name}  有效采样：{valid}  "
-            f"采样方式：{'默认选中帧(未点击)' if how == 'default' else '点开胶囊后采样'}\n"
+            f"第{audit_week}周 星期{audit_day}  读数时刻 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"训练项：{name}  有效读数：{valid}  "
+            f"读数方式：{'默认选中帧(未点击)' if how == 'default' else '点开胶囊后读数'}\n"
             f"队友({len(names)})：{names}\n"
             f"器材({len(equips or base_equips)})：{equips or base_equips}"
             f"{'' if equips else '（本帧没读到，用进页面基线）'}\n"
@@ -3771,19 +3877,19 @@ class AutoTask(MyBaseTask):
             + "\n".join(f"{it.get('cx'):.0f},{it.get('cy'):.0f}  {it['t']}"
                         for it in (f2_items or []))
         )
-        self._audit_save(audit_week, audit_day, f"core{idx}_{name}", f2, audit_txt)
+        self._audit_save(audit_week, audit_day, f"item{idx}_{name}", f2, audit_txt)
         return rec
 
     def _main_char_of_round(self, scored, cfg):
-        """本轮主训人员是谁 —— 出现在**每个**技能里的那个名字。
+        """本轮主训人员是谁 —— 出现在**每个**训练项里的那个名字。
 
         玩家 2026-11-23 两条要求：
           1.「每轮训练你要知道主训人员是谁，不能写死名字」
-             主训每局会换（上一局希雅、这一局闪堂），所以按「每个技能都在场」自动判。
+             主训每局会换（上一局希雅、这一局闪堂），所以按「每个训练项都在场」自动判。
           2.「经理也是算作队友的」
-             所以判出来**只记录、不剔除**；恒在场 = 对每个技能都 +1，排名不受影响。
+             所以判出来**只记录、不剔除**；恒在场 = 对每个训练项都 +1，排名不受影响。
 
-        判不出来（只采到一个技能、或 OCR 漏读）就返回 None，不猜。
+        判不出来（只采到一个训练项、或 OCR 漏读）就返回 None，不猜。
         多个候选（主训 + 常驻经理都满场）时取出现帧数最多的那个。
         """
         if len(scored) < 2:
@@ -3800,15 +3906,15 @@ class AutoTask(MyBaseTask):
         return max(cands.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
 
     def _force_skill_when_risky(self, scored, cfg):
-        """失败率全高于阈值 + 商店没精力道具 → 改练指定技能（默认「意识」）。"""
+        """失败率全高于阈值 + 商店没精力道具 → 改练指定训练项（默认「意识」）。"""
         force = cfg.get("force_when_risky") or {}
         if not force.get("enabled", True):
             return None
         thr = int(force.get("fail_over", 30))
         want = str(force.get("skill", "意识"))
         if any(d["pct"] is None for d in scored):
-            # 有技能没读到失败率 → 不能断定「全部高风险」，那条未读到的可能正是安全项
-            self.log_info("有技能没读到失败率，无法断定全部高风险 → 按原排名")
+            # 有训练项没读到失败率 → 不能断定「全部高风险」，那条未读到的可能正是安全项
+            self.log_info("有训练项没读到失败率，无法断定全部高风险 → 按原排名")
             return None
         known = [d["pct"] for d in scored if d["pct"] is not None]
         if not known or not all(p > thr for p in known):
@@ -3826,12 +3932,34 @@ class AutoTask(MyBaseTask):
         self.log_info(f"失败率全部 >{thr}% 且商店无精力道具 → 改练「{want}」（成功率最高）")
         return cand
 
-    def _sample_core(self, row, frames=6, gap=0.18, warmup=0.35, max_tries=18,
+    # 读数帧「已经不在训练项页」的硬指纹（2026-11-25 实跑归纳）。
+    #   · 经理增益：点训练项后直接开训 → 三选一，画面背景还挂着「心·技·体」，
+    #     会被 is_attr_panel 当成"加成动画"一直等，是 0 帧有效的最大来源；
+    #   · 剧情/剧本事件：右上角一定有「跳过」，训练项页没有这个词；
+    #   · 结算遮罩：整屏半透明 + 「点击屏幕继续」。
+    # 只在「画面里一个训练项条目都没有（hits==0）」时才敢用，避免把
+    # 训练项页上真有「跳过」的浮层（比如合宿）误判。
+    ITEM_LEFT_HINTS = (
+        ("经理增益", ("请选择一种加强训练",)),
+        ("结算遮罩", ("点击屏幕继续", "点击继续")),
+        ("剧情事件", ("剧本事件", "跳过剧情", "跳过")),
+    )
+
+    def _left_item_page(self, txt, hits):
+        """读数帧是否已经离开训练项页 → 返回页面名，否则 None。见 ITEM_LEFT_HINTS。"""
+        if hits:
+            return None
+        for page, keys in self.ITEM_LEFT_HINTS:
+            if any(k in (txt or "") for k in keys):
+                return page
+        return None
+
+    def _sample_item(self, row, frames=6, gap=0.18, warmup=0.35, max_tries=18,
                      min_frames=4):
-        """点开技能后等 0.4 秒（选中态出来），再连拍几帧投票成稳定值。
+        """点开训练项后等 0.4 秒（选中态出来），再连拍几帧投票成稳定值。
 
         2026-11-23 10:14 CoreSweepTask 逐帧扫查的结论（玩家提示「不用特定时间窗口」）：
-            点完技能后**选中态会一直保留**，不是一闪而过的浮层：
+            点完训练项后**选中态会一直保留**，不是一闪而过的浮层：
               · 帧00（+0.34s）偶有缺字，帧01（+0.5s）起「失败率 N%」稳定出现；
               · 球场上的队友名（佐久间 / 希雅）和主训（闪堂）、中间器材卡也一直在。
             所以只需 0.4s 起手 + 3~5 帧确认，不需要长窗口，也不需要死等 1.2s
@@ -3843,12 +3971,15 @@ class AutoTask(MyBaseTask):
         """
         self.sleep(warmup)
         pcts, name_sets, levels = [], [], []
-        # 器材：训练核心页中部会摆 1~3 张卡（玩家：「中间一个器材（鞋子），不是很明显吗」），
+        # 器材：训练项页中部会摆 1~3 张卡（玩家：「中间一个器材（鞋子），不是很明显吗」），
         # 卡面是这次训练带的支援单位，外框金/彩光 = 品质。选中态一直保留，所以每帧都能读。
         equips = []
         used = 0
         tries = 0
         bad_streak = 0
+        # 2026-11-25：本次读数是否被「画面已经切走」打断（经理增益 / 剧情 / 结算遮罩）。
+        # 记在这里，交给 _measure_item 判断「不要补点、不要排名」。
+        self._item_interrupt = None
         while used < frames and tries < max_tries:
             tries += 1
             f = self._frame_retry()
@@ -3858,36 +3989,51 @@ class AutoTask(MyBaseTask):
             its = self._texts(f)
             hits = len({it["t"].replace(" ", "") for it in its
                         if it["t"].replace(" ", "") in self.SKILLS})
-            # 浮层盖住右列时 hits 会掉到 0~1，所以「还像训练核心页」不能只看技能名：
-            # 技能名 ≥1 / 有「失败率」/ 有 Lv·MAX / 场上 ≥2 个队友名，任一命中就算。
+            # 浮层盖住右列时 hits 会掉到 0~1，所以「还像训练项页」不能只看训练项名：
+            # 训练项名 ≥1 / 有「失败率」/ 有 Lv·MAX / 场上 ≥2 个队友名，任一命中就算。
             # 但也不能放太松，否则切场景的中途帧会把别的页面文字当队友
             # （05:29 出现过把出行页的「游戏厅」当队友）。
             names = self._court_names(its, f)
             has_pct = any("失败率" in it["t"] for it in its)
             has_lv = any(re.match(r"^(LV\.?\s*\d+|MAX)", it["t"].replace(" ", "").upper())
                          for it in its)
-            # 反例加固（2026-11-23 10:32 实测）：采样中途点了按钮切到「赛前准备」，
+            # 反例加固（2026-11-23 10:32 实测）：读数中途点了按钮切到「赛前准备」，
             # 那一帧把阵容页的位置名（分卫/大前/控卫）当成队友、把球队大卡当成器材，
-            # 结果唯一一项得分 8 分，直接定案选错技能。只要出现比赛/结算类的字眼就丢帧。
+            # 结果唯一一项得分 8 分，直接定案选错训练项。只要出现比赛/结算类的字眼就丢帧。
             _txt = " ".join(it["t"] for it in its)
             off_core = is_attr_panel(_txt) or any(w in _txt
                            for w in ("赛前准备", "跳过比赛", "前往比赛", "MVP", "目标达成",
-                                     # 2026-11-23 12:10 实跑发现：点技能后有时先弹「心·技·体」
-                                     # 属性/加成大浮层，把编队面板整个盖住。这类帧以前会被
-                                     # 当成训练核心页的错误读数，现在明确丢掉（48% 的采样
+                                     # 2026-11-23 12:10 实跑发现：点训练项后有时先弹「心·技·体」
+                                     # 属性/加成大浮层，把训练项详情整个盖住。这类帧以前会被
+                                     # 当成训练项页的错误读数，现在明确丢掉（48% 的读数
                                      # 0 帧有效就是栽在这上面）。
                                      "表情升级"))
             looks_core = (not off_core) and (hits >= 1 or has_pct or has_lv or len(names) >= 2)
             if not looks_core and not off_core:
-                # 框架锚点补位（2026-11-24）：点技能后常弹「倍率加成 / 心·技·体」浮层把
-                # 右列技能名和失败率整片盖住，文字判据全灭 → 这一帧白丢。但训练核心页
+                # 框架锚点补位（2026-11-24）：点训练项后常弹「倍率加成 / 心·技·体」浮层把
+                # 右列训练项名和失败率整片盖住，文字判据全灭 → 这一帧白丢。但训练项页
                 # 的「决定」按钮在浮层之下仍在，用框架模板匹配（4 套版式，任一命中即算）
                 # 做像素级确认，比"靠文字猜"稳。只在这一页的 4 个锚点上匹配，不做全页遍历。
-                if self._anchor_page(f, only="训练核心") == "训练核心":
+                if self._anchor_page(f, only="训练项页") == "训练项页":
                     looks_core = True
                     self._vis_bump("anchor_rescue")
             if not looks_core:
-                # 【2026-11-23 13:1x 实跑修正】点开技能后游戏先播一段「加成展示」动画
+                # 【2026-11-25 三轮实跑修正】122 次「读数 0 帧有效」的主因：
+                # 点开训练项后游戏常常**根本没给你训练项详情**，而是先弹
+                #   ①「请选择一种加强训练」三选一（= 这一下已经把训开掉了）
+                #   ②「剧情事件 / 剧本事件」（右上角有「跳过」）
+                #   ③「点击屏幕继续」结算遮罩
+                # 旧逻辑把这些帧当"加成浮层"一直等到 tries 打满（≈5 秒），
+                # 等完还按 26px 偏移补点一次 —— 那一击正好落在经理增益卡片 /
+                # 事件选项上，等于替玩家瞎选。所以先认「已经离开训练项页」，
+                # 命中就立刻停手，一帧不再点。
+                left = self._left_item_page(_txt, hits)
+                if left:
+                    self._item_interrupt = left
+                    self.log_warning(f"画面已切到「{left}」→ 立刻停止读数，不补点，交给主循环"
+                                     f"（文字 {[it['t'] for it in its][:10]}）")
+                    break
+                # 【2026-11-23 13:1x 实跑修正】点开训练项后游戏先播一段「加成展示」动画
                 # （画面上只剩「倍率加成」「属性加成」「C」这类字，1~3 秒才消失）。
                 # 以前把这类帧也算进 bad_streak，4 帧（≈0.7s）就判「页面切走了」收工，
                 # 于是 0 帧有效的占比 20%。现在分两种：
@@ -3898,7 +4044,7 @@ class AutoTask(MyBaseTask):
                     continue
                 bad_streak += 1
                 if bad_streak >= 4 and used == 0:
-                    self.log_warning(f"连续 4 帧都不像训练核心页 → 页面已经切走，停止采样"
+                    self.log_warning(f"连续 4 帧都不像训练项页 → 页面已经切走，停止读数"
                                      f"（画面文字 {[it['t'] for it in its][:8]}）")
                     break
                 self.sleep(gap)
@@ -3916,9 +4062,9 @@ class AutoTask(MyBaseTask):
                 cs = find_cards(f)
                 equips.append(tuple(card_glow(f, c) for c in cs))
                 if used == 1:
-                    self.log_info(f"采样帧 {f.shape[1]}x{f.shape[0]} 器材 {len(cs)} "
+                    self.log_info(f"读数帧 {f.shape[1]}x{f.shape[0]} 器材 {len(cs)} "
                                   f"{[(int(c['x']), int(c['y']), card_glow(f, c)) for c in cs]}")
-            except Exception as e:      # 器材读失败不能拖累编队采样
+            except Exception as e:      # 器材读失败不能拖累训练项读数
                 self.log_info(f"器材检测失败（忽略）：{e}")
             # 【2026-11-23 12:05 实跑修正】原来 `>=2 帧就 break`，一局下来 78% 的训练
             # 只采到 2 帧。配合下面「名字要出现 >=2 帧才算」，等于**两帧都得读到**——
@@ -3938,7 +4084,7 @@ class AutoTask(MyBaseTask):
             # 粘连词/误读已经由 _is_mate_name 过滤，这里不用太严。
             # 【2026-11-23 10:14 扫查修正】这里**不再按 MAIN_CHAR 剔人**：
             # 主训人员每局都可能换（这一局是「闪堂」，上一局是「希雅」），
-            # 写死一个名字必然剔错。谁该忽略交给 _do_training_core 用「每个技能都有」
+            # 写死一个名字必然剔错。谁该忽略交给 _do_training_core 用「每个训练项都有」
             # 的常驻名来判。
             # 门槛随帧数走：6 帧要 4 帧命中，4 帧要 2 帧命中。
             # （原来写死 >=2，帧少时等于"必须每帧都读到"，见上面 12:05 那条）
@@ -3969,19 +4115,19 @@ class AutoTask(MyBaseTask):
                 cnt[e] = cnt.get(e, 0) + 1
             equip = max(cnt.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
         if used == 0:
-            # 一帧都没通过「像训练核心页」的判据 —— 把画面文字和截图留下来，
-            # 不然只能猜（实跑里 48% 的采样是这种情况）。
+            # 一帧都没通过「像训练项页」的判据 —— 把画面文字和截图留下来，
+            # 不然只能猜（实跑里 48% 的读数是这种情况）。
             try:
-                self.log_warning(f"采样 0 帧有效，画面文字：{[it['t'] for it in its][:14]}")
+                self.log_warning(f"读数 0 帧有效，画面文字：{[it['t'] for it in its][:14]}")
                 self._shot(f, "core_fail")
             except Exception:
                 pass
         if used < frames:
-            self.log_info(f"编队采样 {used}/{frames} 帧有效（试了 {tries} 次，废帧已丢弃）")
+            self.log_info(f"训练项读数 {used}/{frames} 帧有效（试了 {tries} 次，废帧已丢弃）")
         return mates, pct, level, list(equip)
 
     def _skill_level(self, items, row):
-        """技能胶囊右边那个 Lv.1 / Lv.2 / MAX。"""
+        """训练项条目右边那个 Lv.1 / Lv.2 / MAX。"""
         best, best_d = None, 1e9
         for it in items:
             t = it["t"].replace(" ", "").upper()
@@ -4005,7 +4151,7 @@ class AutoTask(MyBaseTask):
           ⑤ **玩家当天撤回：「不失败只是理想状态，不是严格禁止」→ 还原 `fail_limit: 30`**
              （strict_fallback 回到 old）。0% 的课只是期望值更高，不是硬门槛；
              高收益的 20~30% 课照样赌，这才是人工手打的选法。
-        全部技能都 >limit 时退回原排名 —— 否则当天就彻底没得练了。
+        全部训练项都 >limit 时退回原排名 —— 否则当天就彻底没得练了。
         读不到失败率（pct=None）仍视为不安全（不能假定它 0%）。
         """
         lim = cfg.get("fail_limit")
@@ -4025,7 +4171,7 @@ class AutoTask(MyBaseTask):
                         f"今天没有 0% 的稳课（最低失败率 {low:g}%）→ 只保留最低风险项 "
                         f"{[(d['row']['t'], d['pct']) for d in keep]}，不碰更高的")
                     return keep
-            self.log_warning(f"所有技能失败率都 >{lim}%，只能按原排名（今天没得选，硬着头皮练）")
+            self.log_warning(f"所有训练项失败率都 >{lim}%，只能按原排名（今天没得选，硬着头皮练）")
             return scored
         if len(safe) < len(scored):
             drop = [(d["row"]["t"], d["pct"]) for d in scored if d not in safe]
@@ -4047,7 +4193,7 @@ class AutoTask(MyBaseTask):
         if not cons.get("enabled", True) or not scored:
             return
         st_now = self.stamina if self.stamina is not None else 999
-        low = float(cons.get("stamina_below", 45))
+        low = float(cons.get("stamina_below", 30))
         if st_now >= low:
             return
         target = str(cons.get("skill") or "意识")
@@ -4055,17 +4201,17 @@ class AutoTask(MyBaseTask):
         if not hit:
             self.log_info(f"精力 {st_now} < {low}，但「{target}」今天没有角标，按原排名")
             return
-        boost = float(cons.get("boost", 99))
+        boost = float(cons.get("boost", 2))
         for d in hit:
             d["score"] += boost
         self.log_info(f"精力 {st_now} < {low} → 「{target}」加权 +{boost:g}"
                       f"（不耗精力、小幅回精力、成功率最高）")
 
-    def _score_core(self, mates, level, pct, cfg, equips=None):
-        """编队打分 = 出场队友数，再按失败率打折。
+    def _score_item(self, mates, level, pct, cfg, equips=None):
+        """训练项打分 = 出场队友数，再按失败率打折。
 
         2026-11-23 玩家口径（当次确定）：
-          - **技能等级不计分**（Lv.1/Lv.2/MAX 三档全部当 0），只是照旧读出来打在日志里，
+          - **训练项等级不计分**（Lv.1/Lv.2/MAX 三档全部当 0），只是照旧读出来打在日志里，
             方便人工复核；配置里 level_bonus 三项已置 0。
           - 失败率 = 乘法折扣：分数 ×(1 - 失败率/100 × fail_weight)，fail_weight=1.0
             意味着 30% 失败率直接打七折、50% 打五折 —— 「失败 = 白扔一次精力」按比例扣。
@@ -4081,17 +4227,17 @@ class AutoTask(MyBaseTask):
           1. 场上出场队友数（含经理、含主训本人）  ← 每个 +teammate 分
           2. 器材卡数量 × 光效档位（金 1.0 / 彩 1.5 / 普通 0.5）
           3. 失败率（失败 = 白扔体力）→ 整包乘法打折
-          4. 技能等级 Lv.1/Lv.2/MAX ← 只记录，**不计分**（玩家口径）
+          4. 训练项等级 Lv.1/Lv.2/MAX ← 只记录，**不计分**（玩家口径）
         """
         # 队友计分：普通队友 teammate（默认 1.0），球队经理单独 manager_weight（默认 1.5）。
-        # 玩家 2026-11-23 22:14：「经理的权重调为1.5」。经理场边常驻、每个技能都在场，
+        # 玩家 2026-11-23 22:14：「经理的权重调为1.5」。经理场边常驻、每个训练项都在场，
         # 名字命中 manager_names 就按这个权重算；老配置没配经理名时退化为「全员同权」，行为不变。
         teammate_w = float(cfg.get("teammate", 1.0))
         mgr_w = float(cfg.get("manager_weight", teammate_w))
         mgr_names = set(cfg.get("manager_names") or [])
         base = sum(mgr_w if m in mgr_names else teammate_w for m in mates)
 
-        # 器材：训练核心页中场摆着的 1~3 张支援卡，按外框光效计分。
+        # 器材：训练项页中场摆着的 1~3 张支援卡，按外框光效计分。
         #   玩家原口径：「队友 +1、器材 0.5、金光 1、彩光 1.5」
         #   （2026-11-23 早先误判成「器材读不到」，实机截图证明选之前就画在场上，
         #     检测用 src/core/cards.py，离线 70 帧稳定：单张卡 x≈620、框色判定正常。）
@@ -4293,7 +4439,7 @@ class AutoTask(MyBaseTask):
         equips = [it for it in items if 0.3 < it["cy"] / h < 0.72 and it["cx"] / w > 0.68
                   and _num(it["t"]) and len(it["t"]) <= 4]
         score = len(names) * 1.0 + len(equips) * 0.5
-        self.log_info(f"编队评分：队友 {len(names)} 人（{sorted(names)}），器材 {len(equips)} 个，小计 {score}")
+        self.log_info(f"训练项评分：队友 {len(names)} 人（{sorted(names)}），器材 {len(equips)} 个，小计 {score}")
         for it in items:
             if "消耗" in it["t"] or "确定要继续" in it["t"]:
                 self.log_warning(f"开打前提示：{it['t']}")
@@ -4318,7 +4464,7 @@ class AutoTask(MyBaseTask):
         return sorted(best_row, key=lambda x: x["cx"]) if len(best_row) >= 2 else []
 
     def _score_option(self, text):
-        """事件选项打分：统一走 `_reward_key`（笔记 > 技能 > 未溢出精力 > 属性）。
+        """事件选项打分：统一走 `_reward_key`（笔记 > 训练项 > 未溢出精力 > 属性）。
 
         2026-11-23 06:43 玩家指出优先级问题后，这里不再单独维护一套权重。
         以前是「精力一律 60+数值×0.5」，精力快满时 +70 仍压过「+30 且带属性」，
@@ -4360,7 +4506,7 @@ class AutoTask(MyBaseTask):
         return cards if len(cards) >= 2 else []
 
     def _do_event(self, items, frame, options=None):
-        """随机事件：技能 > 精力(未溢出) > 属性 > 金钱；判断不了选第一个。"""
+        """随机事件：训练项 > 精力(未溢出) > 属性 > 金钱；判断不了选第一个。"""
         cards = self._event_cards(frame, items)
         if cards:
             scored = [(self._score_option(c["text"]), c) for c in cards]
@@ -4395,7 +4541,7 @@ class AutoTask(MyBaseTask):
         指纹表在 strategy.yaml → tuning.unknown.overlays。每项是
         `{name, keys: [...], action: next}`；keys 里任一关键词出现在画面文字里就算命中。
         可选 `exclude: [...]`：出现任一排除词则本条不命中（用来区分长得像的可交互页，
-        例如加强训练页也有「心·技·体」，但有「确定」按钮，不该当属性浮层点掉）。
+        例如经理增益页也有「心·技·体」，但有「确定」按钮，不该当属性浮层点掉）。
         纯展示页（比赛横幅、周总结、属性加成…）命中后走 `next`（点继续/中间推进），
         不再算「未知」——这样摘要里的未知次数才是真的「没见过」。
         """
@@ -4880,7 +5026,9 @@ class AutoTask(MyBaseTask):
         self.out_focus = None
         self.out_focus_max = None
         self.weekday = None
-        self.core_checked = False
+        self.item_checked = False
+        self.read_fail_stop = False    # 训练项读数失败 → 主循环停机（玩家 2026-11-26）
+        self._item_interrupt = None      # 读数被经理增益/剧情/遮罩打断时的页面名
         self.trip_picked = False
         # 「出行先探笔记，笔记 > 训练」（玩家 2026-11-23）：
         #   每日页同时有「训练」和「出行」时，先进出行页看地点标签里有没有笔记。
@@ -4933,7 +5081,7 @@ class AutoTask(MyBaseTask):
 
         # ---- 收工摘要统计 ----
         #   2026-11-23 16:4x：原来 stat 全局累计、跨轮不清，摘要却叫「本轮运行摘要」，
-        #   早期采样失败留下的「投射×5」被每次 stop 反复打印几十次（假数据）。
+        #   早期读数失败留下的「投射×5」被每次 stop 反复打印几十次（假数据）。
         #   现在拆两份：stat=本轮，stat_total=本次运行累计；每轮开始把上一轮并入累计
         #   再清零本轮，摘要的「本轮」名副其实，累计另起一行。
         self.stat = self._new_stat()
@@ -5103,7 +5251,7 @@ class AutoTask(MyBaseTask):
                             "rounds": int(loop.get("max_rounds") or 1)})
 
     def _runlog_train(self, skill, score, pct, mates, equips):
-        """一次选课 = 一条训练记录。得分是 _score_core 算出来的编队期望分。"""
+        """一次选课 = 一条训练记录。得分是 _score_item 算出来的编队期望分。"""
         if not getattr(self, "run_id", None):
             return
         st, fo = self.stamina, self.out_focus
@@ -5144,7 +5292,7 @@ class AutoTask(MyBaseTask):
     # 状态机本来就是按页面流转的（任何一屏都能接着跑），所以断点只需记住
     # 「今天探没探笔记 / 进没进过店 / 这是第几轮」这类**记账**，不用记完整画面。
     RESUME_FIELDS = (
-        "saw_training", "in_training", "phase", "weekday", "core_checked",
+        "saw_training", "in_training", "phase", "weekday", "item_checked",
         "trip_picked", "trip_probe", "trip_probe_done",
         "trip_probe_retry", "trip_probe_retry_day",
         "trip_back_tries", "shop_day", "shop_week", "shop_bought",
@@ -5232,7 +5380,7 @@ class AutoTask(MyBaseTask):
             f"本轮训练 {sum(train.values())} 次：" + ("、".join(f"{k}×{v}" for k, v in train.items()) or "无"),
             f"累计训练 {sum(tt.values())} 次：" + ("、".join(f"{k}×{v}" for k, v in tt.items()) or "无"),
             f"探步行街笔记 {st.get('note_probe', 0)} 次（拿到笔记 {st.get('note', 0)} 次）"
-            f"　采样失败 {st.get('sample_fail', 0)} 项",
+            f"　训练项读数失败 {st.get('sample_fail', 0)} 项",
             f"商店买 {len(buys)} 件：" + ("、".join(f"{n}({p})" for _, n, p in buys[:8]) or "无"),
             f"赌一把 {len(gamble)} 次：" + ("、".join(f"{k}@{p}%" for k, p in gamble[:8]) or "无"),
         ]
@@ -5255,7 +5403,7 @@ class AutoTask(MyBaseTask):
         if st:
             lines.append(f"锚点层：命中 {st.get('hit', 0)} 次、补位 {st.get('fill', 0)} 次、"
                          f"冲突改判 {st.get('conflict', 0)} 次、硬约束否决 {st.get('veto', 0)} 次"
-                         f"、采样救回 {st.get('anchor_rescue', 0)} 帧")
+                         f"、读数救回 {st.get('anchor_rescue', 0)} 帧")
         trans = getattr(self, "transition_warns", []) or []
         if trans:
             pairs = {}
@@ -5327,12 +5475,12 @@ class AutoTask(MyBaseTask):
     @staticmethod
     def _new_stat():
         return {
-            "train": {},        # 技能 -> 次数
-            "gamble": [],       # 每次下注 (技能, 失败率)
+            "train": {},        # 训练项 -> 次数
+            "gamble": [],       # 每次下注 (训练项, 失败率)
             "buy": [],          # 每次购买 (类别, 名称, 价格)
             "note": 0,          # 出行拿到笔记的次数
             "note_probe": 0,    # 真点进步行街探笔记的次数（含没命中的）
-            "sample_fail": 0,   # 训练技能采样失败数
+            "sample_fail": 0,   # 训练项读数失败次数（0 帧有效）
             "stamina_drink": 0, # 喝精力药次数
             "scores": [],       # 每轮最终评分（训练评分页那个 8000/9000 的数）
         }
@@ -5370,7 +5518,9 @@ class AutoTask(MyBaseTask):
         self.in_training = False
         self.phase = PHASE_HALL
         self.weekday = None
-        self.core_checked = False
+        self.item_checked = False
+        self.read_fail_stop = False    # 训练项读数失败 → 主循环停机（玩家 2026-11-26）
+        self._item_interrupt = None      # 读数被经理增益/剧情/遮罩打断时的页面名
         self.trip_picked = False
         self.trip_probe = False
         self.trip_probe_done = None
@@ -5451,8 +5601,8 @@ class AutoTask(MyBaseTask):
                 page = "剧情事件"
             if page != "未知":
                 self.unknown_count = 0
-            if page != "训练核心":
-                self.core_checked = False
+            if page != "训练项页":
+                self.item_checked = False
             # 离开炒股页就把计数和「已选卡」清掉，否则下一轮进选股页会残留 True，
             # 直点「确定」白费一步（08:26 实测）。
             if page != "炒股小游戏":
@@ -5600,7 +5750,7 @@ class AutoTask(MyBaseTask):
                 self._do_egg_select(items, frame)
             elif page == "扭蛋机":
                 self._do_egg_machine(items, frame)
-            elif page == "加强训练":
+            elif page == "经理增益":
                 self._do_enhance(items, frame)
             elif page == "出行":
                 self._do_trip(items, frame)
@@ -5614,8 +5764,13 @@ class AutoTask(MyBaseTask):
                 self._do_go(items, frame)
             elif page == "商店":
                 self._do_shop(items, frame)
-            elif page == "训练核心":
+            elif page == "训练项页":
                 self._do_training_core(items, frame)
+                if self.read_fail_stop:
+                    # 读数失败 → 玩家的要求是「停下来，你找到原因，再看」，
+                    # 而不是拿默认项蒙着把这一天走完。
+                    self.read_fail_stop = False
+                    break
             elif page in ("点击继续", "本周总结"):
                 # 本周总结是比赛周结算的滚动动画页（球队评分数字一直在变），
                 # 没有明确按钮，和「点击屏幕继续」遮罩一样点一下推进即可。

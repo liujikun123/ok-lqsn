@@ -1,24 +1,24 @@
 """「默认选中项」相关逻辑的离线单测（不打游戏、不依赖真实窗口）。
 
 背景（玩家 2026-11-24 11:55 原话）：
-    「进入的时候默认就是投射的，不用点击直接就能采样，如果这时候要去点击它，
+    「进入的时候默认就是投射的，不用点击直接就能读数，如果这时候要去点击它，
       会直接变成选中。」
-→ 训练核心页一进来，游戏就默认选中「投射」并把它的编队摊在画面上：
-   · 这时候**不需要点**，直接采样就能拿到投射的队友/器材/失败率；
+→ 训练项页一进来，游戏就默认选中「投射」并把它的编队摊在画面上：
+   · 这时候**不需要点**，直接读数就能拿到投射的队友/器材/失败率；
    · 一旦去点它，默认态被改成"手动选中"，游戏就要二次确认 → 直接开训，本次比较作废。
 
 验证：
   1. _selected_skill 能从深蓝高亮胶囊认出当前选中项（浅蓝/橙底两种皮肤、认不出返回 None）；
   2. 默认选中项**第一个采**（在点开任何其它技能之前），且全程不点；
-  3. 认不出高亮时，所有带角标的技能都点开采样；
+  3. 认不出高亮时，所有带角标的训练项都点开读数；
   4. **没角标 = 没人**（玩家 2026-11-24 12:55），不进候选池、不采；
-  5. 默认项采样失败只重取帧、不补点；最终选择就是默认项时收尾不点它，直接点「决定」。
+  5. 默认项读数失败只重取帧、不补点；最终选择就是默认项时收尾不点它，直接点「决定」。
 
 【变更记录】
- · 11:25 撤掉「投射不是默认选中项就跳过」的硬规则（实测点胶囊只是展开编队，不会开训，
+ · 11:25 撤掉「投射不是默认选中项就跳过」的硬规则（实测点胶囊只是展开训练项详情，不会开训，
    旧规则让 W2D4 那局「带经理加成 + 器材」的投射整项掉出候选池）。
  · 11:55 玩家澄清默认态本来就是投射、不点就能采 → 改成**先把默认帧采下来**，
-   再逐个点开其它技能。旧的实现虽然也判断了 `name == selected` 就不点，但采样顺序按
+   再逐个点开其它技能。旧的实现虽然也判断了 `name == selected` 就不点，但读数顺序按
    胶囊 cy 从上往下，前面若有技能先被点开，轮到默认项时画面早已不是它的编队。
  · 12:55 玩家纠错：「角标代表有人，没角标的一定没有人！」→ 候选池回到「只含有角标」，
    没角标的项队友恒为 0，采它只是白烧 OCR、还可能把误读的名字当队友抬分。
@@ -88,13 +88,13 @@ class CoreStub(AutoTask):
         self.config = {"保存截图": False}
         self.stat = {"train": {}, "gamble": [], "sample_fail": 0}
         self.stamina, self.stamina_max, self.gold = 84, 130, 120
-        self.core_checked = False
-        self.badges = badges            # False = 六个技能都没角标
+        self.item_checked = False
+        self.badges = badges            # False = 六个训练项都没角标
         self.badge_seq = badge_seq or []  # 模拟逐帧变化：第 i 次重取帧后的角标配置
         self.frames = 0                 # 取帧次数（验证"坏帧重取"用）
-        self.empty_skill = empty_skill  # 这个技能采不到编队（模拟采样失败）
-        self.clicks = []                # (技能名, 原因)
-        self.trace = []                 # 事件顺序：("click"/"sample", 技能名)
+        self.empty_skill = empty_skill  # 这个训练项采不到编队（模拟读数失败）
+        self.clicks = []                # (训练项名, 原因)
+        self.trace = []                 # 事件顺序：("click"/"sample", 训练项名)
         self.audits = []                # (tag, 文本)
         self.decided = []
         self.runlog = []
@@ -118,7 +118,7 @@ class CoreStub(AutoTask):
         """打桩角标：真实分配逻辑（_badges_for_rows）照跑，只替换"画面里有哪些角标"。
 
         合成角标放在 (cx+100, cy-50)：横向落在胶囊列（cx≈1600 > 0.62*1920），
-        纵向比技能行中心高 50px —— 和真实素材实测的 43~45px 一致，在 0.055h(=59px) 内。
+        纵向比训练项行中心高 50px —— 和真实素材实测的 43~45px 一致，在 0.055h(=59px) 内。
         """
         if self.badges is False:
             return []
@@ -134,7 +134,7 @@ class CoreStub(AutoTask):
         self.clicks.append(("坐标点击", f"({x},{y})"))
         self.trace.append(("click", "坐标点击"))
 
-    def _sample_core(self, r, **kw):
+    def _sample_item(self, r, **kw):
         self.trace.append(("sample", r["t"]))
         if r["t"] == self.empty_skill:
             return [], None, None, []
@@ -152,7 +152,7 @@ class CoreStub(AutoTask):
         return self.items
 
     def _classify(self, items, frame):
-        return "训练核心"
+        return "训练项页"
 
     def _shot(self, *a, **kw):
         return None
@@ -167,7 +167,7 @@ class CoreStub(AutoTask):
     def _apply_fail_limit(self, scored, cfg):
         return scored
 
-    def _score_core(self, real, level, pct, cfg, equips):
+    def _score_item(self, real, level, pct, cfg, equips):
         return float(len(real))
 
     def _apply_consciousness_boost(self, scored, cfg):
@@ -207,7 +207,7 @@ clicked = [c[0] for c in st.clicks]
 check("投射一次都没被点（含收尾）", "投射" in clicked, False)
 check("第一个动作就是采投射", st.trace[0], ("sample", "投射"))
 check("投射只采一次", sample_order(st).count("投射"), 1)
-check("6 个技能全采到", len(sample_order(st)), 6)
+check("6 个训练项全采到", len(sample_order(st)), 6)
 check("其它带角标技能照常点开", len([c for c in clicked if c != "坐标点击"]), 5)
 check("写出 DECIDE", "DECIDE" in [t for t, _ in st.audits], True)
 dec = find_audit(st, "DECIDE")
@@ -221,13 +221,13 @@ check("证据标注未点击", "默认选中帧(未点击)" in core0[0][1], True
 check("收尾点了决定", st.decided, ["决定"])
 check("记了一条训练", len(st.runlog), 1)
 
-print("\n== 3. 认不出高亮 → 所有带角标的技能都点开采样（不特殊对待投射）==")
+print("\n== 3. 认不出高亮 → 所有带角标的训练项都点开读数（不特殊对待投射）==")
 st2 = run_flow(make_frame(None))
 clicked2 = [c[0] for c in st2.clicks]
 check("投射也会被点开", "投射" in clicked2, True)
-# 认不出高亮时收尾仍会点一次「最优编队」（合理：无法假定它已选中），这里只数采样点击
-sample_clicks2 = [c for c in st2.clicks if not str(c[1]).startswith("[最优编队")]
-check("六个技能都采样", len(sample_clicks2), 6)
+# 认不出高亮时收尾仍会点一次「最优训练项」（合理：无法假定它已选中），这里只数读数点击
+sample_clicks2 = [c for c in st2.clicks if not str(c[1]).startswith("[最优训练项")]
+check("六个训练项都读数", len(sample_clicks2), 6)
 dec2 = find_audit(st2, "DECIDE")
 check("DECIDE 标注未识别", "【默认选中项】未识别" in dec2, True)
 check("投射参与排名", "投射 4.00分" in dec2, True)
@@ -239,9 +239,9 @@ clicked3 = [c[0] for c in st3.clicks]
 check("投射照常点开", "投射" in clicked3, True)
 check("弹跳（高亮）也不点击", "弹跳" in clicked3, False)
 check("第一个动作就是采弹跳", st3.trace[0], ("sample", "弹跳"))
-# 收尾还会点一次「最优编队」，那不是采样点击，排除掉再数
-sample_clicks3 = [c for c in st3.clicks if not str(c[1]).startswith("[最优编队")]
-check("其余 5 个技能点开", len([c for c in sample_clicks3 if c != "坐标点击"]), 5)
+# 收尾还会点一次「最优训练项」，那不是读数点击，排除掉再数
+sample_clicks3 = [c for c in st3.clicks if not str(c[1]).startswith("[最优训练项")]
+check("其余 5 个训练项点开", len([c for c in sample_clicks3 if c != "坐标点击"]), 5)
 dec3 = find_audit(st3, "DECIDE")
 check("DECIDE 标注默认选中弹跳", "【默认选中项】弹跳" in dec3, True)
 
@@ -250,22 +250,22 @@ print("\n== 5. 六项都没角标 = 残帧 → 先重取 3 次，仍没有才决
 # 但 2026-11-24 13:00 玩家又追问「不可能一整天都没角标」——对，575 张真实核心帧
 # 0 张是全无（最少 1 个，均值 3.5），所以「全无」是残帧信号，要先重取帧。
 st4 = run_flow(make_frame("投射"), badges=False)
-check("一个采样点击都没有", [c[0] for c in st4.clicks if c[0] != "坐标点击"], [])
-check("一次采样都没有", sample_order(st4), [])
+check("一个读数点击都没有", [c[0] for c in st4.clicks if c[0] != "坐标点击"], [])
+check("一次读数都没有", sample_order(st4), [])
 check("重取了 3 次帧", st4.frames, 3)
 check("兜底直接点决定", st4.decided, ["决定"])
 
-print("\n== 6. 默认项采样失败：只重取帧、不补点 ==")
+print("\n== 6. 默认项读数失败：只重取帧、不补点 ==")
 st5 = run_flow(make_frame("投射"), empty_skill="投射")
 check("投射始终没被点", "投射" in [c[0] for c in st5.clicks], False)
-check("投射重采了一次（共 2 次采样）", sample_order(st5).count("投射"), 2)
+check("投射重采了一次（共 2 次读数）", sample_order(st5).count("投射"), 2)
 dec5 = find_audit(st5, "DECIDE")
 check("DECIDE 说明默认项没采到", "未采到，未参与排名" in dec5, True)
 check("仍选出其它技能", "【最终选择】" in dec5, True)
 
 print("\n== 7. 只采有角标的：默认项没角标就是没人，不采也不点 ==")
 st6 = run_flow(make_frame("投射"), badges={"弹跳", "意识"})
-order = [c[0] for c in st6.clicks if not str(c[1]).startswith("[最优编队")]
+order = [c[0] for c in st6.clicks if not str(c[1]).startswith("[最优训练项")]
 check("只点有角标的两项（收尾点最优不算）", order, ["弹跳", "意识"])
 check("只采这两项", sample_order(st6), ["弹跳", "意识"])
 dec6 = find_audit(st6, "DECIDE")

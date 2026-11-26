@@ -81,7 +81,7 @@ def summarize_rule(path: str) -> list[tuple[str, str]]:
         ("炒股模式", str(stock.get("mode") or "-")),
         ("出行优先", " > ".join(trip.get("priority") or []) or "-"),
         ("出行排除", "、".join(trip.get("exclude") or []) or "-"),
-        ("加强训练", str((t.get("enhance") or {}).get("strategy") or "-")),
+        ("经理增益", str((t.get("enhance") or {}).get("strategy") or "-")),
         ("商店自动买", "是" if shop.get("auto_buy") else "否"),
     ]
     routes = cfg.get("routes") or {}

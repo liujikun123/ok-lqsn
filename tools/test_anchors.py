@@ -94,16 +94,16 @@ s2.log_info = s2.log_warning = lambda *a, **k: None
 s2._tuning_cache = {"anchors": {"enabled": False}}
 s2._vis_stats = {"hit": 0, "fill": 0, "conflict": 0, "veto": 0}
 s2._anchor_page = lambda frame: None
-s2._last_page_hint = "训练核心"
+s2._last_page_hint = "训练项页"
 s2._classify_ocr = lambda items, frame=None: "大厅"
-check("训练核心→大厅 被否决", s2._classify([], None), "未知")
+check("训练项页→大厅 被否决", s2._classify([], None), "未知")
 s2._last_page_hint = "选择队友"
 s2._classify_ocr = lambda items, frame=None: "每日页"
 check("选择队友→每日页 被否决", s2._classify([], None), "未知")
 s2._last_page_hint = "每日页"
-s2._classify_ocr = lambda items, frame=None: "训练核心"
-check("每日页→训练核心 合法", s2._classify([], None), "训练核心")
-ok("商店确实在训练核心的禁用表里", "商店" in PAGE_FORBIDDEN["训练核心"])
+s2._classify_ocr = lambda items, frame=None: "训练项页"
+check("每日页→训练项页 合法", s2._classify([], None), "训练项页")
+ok("商店确实在训练项页的禁用表里", "商店" in PAGE_FORBIDDEN["训练项页"])
 
 print("--- 4. 推进器底层件 ---")
 shop = sorted(glob.glob(os.path.join(ROOT, "screenshots/auto/*_shop.png")))

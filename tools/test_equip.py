@@ -99,7 +99,7 @@ def main():
     print("--- 计分接入 ---")
     cfg = {"teammate": 1.0, "level_bonus": {}, "fail_weight": 1.0,
            "equipment": 0.5, "equipment_tier": {"金": 1.0, "彩": 1.5, "无": 0.5}}
-    got = AutoTask._score_core(None, ["a"], "LV.1", 0, cfg, ["金"])
+    got = AutoTask._score_item(None, ["a"], "LV.1", 0, cfg, ["金"])
     allok &= check("1 队友 + 1 金卡 = 2.0", abs(got - 2.0) < 1e-9, f"got {got}")
 
     print("\n结果:" + (" 全部通过" if allok else " 有失败项"))

@@ -1,6 +1,6 @@
 """把当前页面的可选项清单导出来（支持右侧长列表滚动、拖拽两种下滑方式）。
 
-用在「训练核心（选人）/ 选择队友 / 选择器材 / 选择笔记」这几页 ——
+用在「训练项页（选人）/ 选择队友 / 选择器材 / 选择笔记」这几页 ——
 右边是一长串卡片，屏幕只显示一部分，得往下滑才看得到全部。
 
     # 只抓当前这一屏
@@ -144,7 +144,7 @@ def drag_at(rect, rx, y_from, y_to, steps=14, hold=0.02):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", required=True, help="清单名，如 选择队友 / 选择器材 / 选择笔记 / 训练核心")
+    ap.add_argument("--tag", required=True, help="清单名，如 选择队友 / 选择器材 / 选择笔记 / 训练项页")
     ap.add_argument("--scroll", type=int, default=0, help="下滑次数（0 = 只抓当前屏）")
     ap.add_argument("--notches", type=int, default=3, help="每次滚轮滚动几格（drag 模式下无效）")
     ap.add_argument("--at", default="0.72,0.55", help="滚动/拖拽的落点相对坐标 rx,ry")

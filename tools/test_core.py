@@ -1,4 +1,4 @@
-"""离线验证编队打分 / 器材计分 / 主训识别 / 高风险改练规则（不碰游戏、不用截图）。
+"""离线验证训练项打分 / 器材计分 / 主训识别 / 高风险改练规则（不碰游戏、不用截图）。
 
     ..\\ok-bsg\\.venv\\Scripts\\python.exe tools\\test_core.py
 """
@@ -23,7 +23,7 @@ class Stub:
         print(f"    warn | {msg}")
 
 
-Stub._score_core = AutoTask._score_core
+Stub._score_item = AutoTask._score_item
 Stub._force_skill_when_risky = AutoTask._force_skill_when_risky
 Stub._main_char_of_round = AutoTask._main_char_of_round
 Stub._apply_fail_limit = AutoTask._apply_fail_limit
@@ -41,7 +41,7 @@ def row(name):
 
 def item(name, mates, level, pct):
     s = Stub()
-    score = s._score_core([f"队友{i}" for i in range(mates)], level, pct, CFG)
+    score = s._score_item([f"队友{i}" for i in range(mates)], level, pct, CFG)
     return {"row": row(name), "mates": mates, "level": level, "pct": pct,
             "score": score, "valid": True}
 
@@ -57,20 +57,20 @@ def main():
     allok = True
 
     print("--- 计分：等级不计分，队友数 × 失败率折扣 ---")
-    allok &= check("2 队友 MAX 0%失败", round(s._score_core(["a", "b"], "MAX", 0, CFG), 3), 2.0)
+    allok &= check("2 队友 MAX 0%失败", round(s._score_item(["a", "b"], "MAX", 0, CFG), 3), 2.0)
     allok &= check("2 队友 Lv.1 0%失败（等级不加工）",
-                   round(s._score_core(["a", "b"], "LV.1", 0, CFG), 3), 2.0)
-    allok &= check("2 队友 40%失败 → ×0.6", round(s._score_core(["a", "b"], "LV.1", 40, CFG), 3), 1.2)
-    allok &= check("3 队友 50%失败 → ×0.5", round(s._score_core(["a", "b", "c"], "LV.2", 50, CFG), 3), 1.5)
+                   round(s._score_item(["a", "b"], "LV.1", 0, CFG), 3), 2.0)
+    allok &= check("2 队友 40%失败 → ×0.6", round(s._score_item(["a", "b"], "LV.1", 40, CFG), 3), 1.2)
+    allok &= check("3 队友 50%失败 → ×0.5", round(s._score_item(["a", "b", "c"], "LV.2", 50, CFG), 3), 1.5)
 
     print("--- 器材计分：张数 × 光效档位（玩家：器材 0.5 / 金光 1 / 彩光 1.5）---")
-    allok &= check("0 队友 + 1 张金卡", round(s._score_core([], "LV.1", 0, CFG, ["金"]), 3), 1.0)
-    allok &= check("0 队友 + 1 张彩卡", round(s._score_core([], "LV.1", 0, CFG, ["彩"]), 3), 1.5)
-    allok &= check("0 队友 + 1 张普通卡", round(s._score_core([], "LV.1", 0, CFG, ["无"]), 3), 0.5)
-    allok &= check("1 队友 + 2 张金卡", round(s._score_core(["a"], "LV.1", 0, CFG, ["金", "金"]), 3), 3.0)
+    allok &= check("0 队友 + 1 张金卡", round(s._score_item([], "LV.1", 0, CFG, ["金"]), 3), 1.0)
+    allok &= check("0 队友 + 1 张彩卡", round(s._score_item([], "LV.1", 0, CFG, ["彩"]), 3), 1.5)
+    allok &= check("0 队友 + 1 张普通卡", round(s._score_item([], "LV.1", 0, CFG, ["无"]), 3), 0.5)
+    allok &= check("1 队友 + 2 张金卡", round(s._score_item(["a"], "LV.1", 0, CFG, ["金", "金"]), 3), 3.0)
     allok &= check("1 队友 + 1 金 1 彩 50%失败 → (1+1+1.5)×0.5",
-                   round(s._score_core(["a"], "LV.1", 50, CFG, ["金", "彩"]), 3), 1.75)
-    allok &= check("器材传 None 不炸", round(s._score_core(["a"], "LV.1", 0, CFG, None), 3), 1.0)
+                   round(s._score_item(["a"], "LV.1", 50, CFG, ["金", "彩"]), 3), 1.75)
+    allok &= check("器材传 None 不炸", round(s._score_item(["a"], "LV.1", 0, CFG, None), 3), 1.0)
 
     print("--- 高风险规则：失败率全部 >30 且商店无精力药 → 改练意识 ---")
     risky = [item("投射", 2, "LV.1", 45), item("意识", 1, "LV.1", 35)]
@@ -122,12 +122,12 @@ def main():
                    sorted(d["row"]["t"] for d in kept30), ["弹跳", "投射", "防守"])
 
     # 期望收益的实质：4 队友 ×25% 失败 = 3.0 分，仍然赢过「2 队友 0 失败 = 2.0 分」
-    high = s._score_core(["a", "b", "c", "d"], "LV.1", 25, CFG)
-    safe = s._score_core(["a", "b"], "LV.1", 0, CFG)
+    high = s._score_item(["a", "b", "c", "d"], "LV.1", 25, CFG)
+    safe = s._score_item(["a", "b"], "LV.1", 0, CFG)
     allok &= check("高收益值得赌：25% 失败的 4 人场赢过 0 失败的 2 人场",
                    high > safe, True)
     # 反过来：收益差不多就不该赌
-    same = s._score_core(["a", "b"], "LV.1", 25, CFG)
+    same = s._score_item(["a", "b"], "LV.1", 25, CFG)
     allok &= check("收益一样就别赌：25% 失败输给 0 失败", same < safe, True)
 
     allok &= check("不配 fail_limit → 不过滤", len(s._apply_fail_limit(pool, CFG)), 4)
@@ -154,14 +154,14 @@ def main():
                    max(picks3, key=lambda d: d["score"])["row"]["t"], "防守")
     s.stamina = None
 
-    print("--- 主训人员：每个技能都在场的名字（不写死、且仍算队友）---")
+    print("--- 主训人员：每个训练项都在场的名字（不写死、且仍算队友）---")
     skills = [{"names": {"佐久间", "闪堂"}}, {"names": {"希雅", "闪堂"}},
               {"names": {"闪堂"}}, {"names": {"闪堂"}}]
     allok &= check("认出主训 = 闪堂", s._main_char_of_round(skills, CFG), "闪堂")
     allok &= check("主训仍算队友（不剔除）", [len(d["names"]) for d in skills], [2, 2, 1, 1])
 
     one = [{"names": {"闪堂", "希雅"}}]
-    allok &= check("只采到一个技能 → 认不出主训", s._main_char_of_round(one, CFG), None)
+    allok &= check("只采到一个训练项 → 认不出主训", s._main_char_of_round(one, CFG), None)
 
     odd = [{"names": {"闪堂", "希雅"}}, {"names": {"闪堂"}}, {"names": {"闪堂", "佐久间"}}]
     allok &= check("闪堂三场全有 → 主训是闪堂", s._main_char_of_round(odd, CFG), "闪堂")
