@@ -2,8 +2,10 @@
 
 ⚠️ 这里是**纯图像识别，不走 OCR**（玩家 2026-11-26 点明：「器材上面没有文字」）：
    卡面是插画/图标（球、护腕、人物…），玩家看到的「像个字」其实是图标形状，
-   没有任何可读文本。所以只能靠「边框颜色 + 轮廓尺寸」找卡，靠「光晕暖/冷色」判品质。
-   读得出：几张、普通/彩 → 读不出：是哪件器材（要认具体器材得做图标模板匹配，暂不做）。
+   没有任何可读文本。所以只能靠「边框颜色 + 轮廓尺寸」找卡，靠「光晕色相构成」判品质。
+   读得出：几张、普/金/彩 → 读不出：是哪件器材（要认具体器材得做图标模板匹配，暂不做）。
+   ⚠️ 也**不能靠 MAX 标记**判品质（玩家 2026-11-26 明确「MAX 不是一定有的」）：
+      实测 24 张普卡里有 2 张带 MAX，11 张彩卡里也有不带 MAX 的 —— 两者互不蕴含。
 
 页面事实（重新核对于 2026-11-24，1600x900 实机帧 + 1080p 历史帧）：
 - 训练项页右侧是 6 个训练项条目；选中项高亮，上方显示「失败率 N%」。
@@ -69,7 +71,8 @@ MIN_EXTENT = 0.66
 #
 # 交叉验证：同一帧里同时存在三张卡时（如 111156_item1_Jump），
 # 球鞋 S=123、篮球 S=164、希雅星卡 S=209 —— 同屏同光照同尺寸，
-# 只能是品质差异，不是卡种指纹。且比例 普176 / 金111 / 彩3 = 61% / 39% / 1%，
+# 只能是品质差异，不是卡种指纹。全量 826 张的比例是
+# 普519 / 金296 / 彩11 = 62.9% / 35.8% / 1.3%，
 # 与玩家「普最多、金次之、彩最少」完全一致。
 QUALITY_CALIBRATED = True
 
@@ -81,12 +84,38 @@ GOLD_RULE = lambda ring: ring.get("edge_sat", 0) >= GOLD_EDGE_SAT
 #   131px 的卡 → 内缩 1px、厚 2px，即 bbox 内 1~3px 那一圈（正好压在框线上）。
 # 再往里就进卡面了（卡面也是橙黄，会把金的读数压平），见上面那段说明。
 QUALITY_RING = (0.008, 0.016)
-QUALITY_HUE_BIG = 0.08          # 某个色相桶占总像素 ≥8% 才算「一种颜色」（仅日志用）
-# 「彩」的判据：框线上**青/蓝/紫**（H 78~165）像素的占比。
-# 用「暖色占比」不行 —— 白色底卡（「藥」字卡）暖色只有 0.71、绿黄色卡 0.91，
-# 都会挤到阈值附近。改用「彩虹色相」占比，两边拉得极开（实测，人工核对过）：
-#   彩卡   0.77 / 0.78 / 0.82     非彩卡  0.00 ~ 0.06
+QUALITY_HUE_BIG = 0.08          # 某个色相桶占总像素 ≥8% 才算「一种颜色」
+# 「彩」的判据（2026-11-26 玩家指出「彩色实际长这样」后重做）。
+#
+# 玩家给了两张图：一张室内木地板（暖背景）双彩卡，一张室外球场（蓝背景）单彩卡。
+# 彩卡的样子是**围着整张卡一圈完整的彩虹光晕**（青→绿→黄→粉→紫），
+# 和金卡（浓橙金粗框，没有彩虹）是两回事。
+#
+# 关键陷阱：**蓝色背景会把「青蓝紫占比」这个单指标打爆**。
+#   实测纯蓝地板 rainbow=1.00、纯蓝天 rainbow=0.96~1.00 —— 比彩卡还高。
+#   所以只看 rainbow 必然把室外球场的所有卡都判成彩。
+#   彩虹的本质是「多色相 + 冷暖共存」，单色背景只有一个色相、一点暖色都没有：
+#
+#     来源            rainbow      warm    nbig(占比≥8%的色相桶数)
+#     彩卡（黄背景）  0.66~0.90   0.08~0.15   4~7
+#     彩卡（蓝背景）  0.66~0.81   0.06~0.30   3~6
+#     纯蓝地板        1.00        0.00        1
+#     纯蓝天          0.96~1.00   0.00        1
+#     金卡            0.00        0.98        1
+#     普卡            0.00~0.09   0.93~1.00   1~2
+#
+# 于是彩 = rainbow≥0.30 且 warm≥0.05 且 nbig≥3。三个条件缺一不可。
 QUALITY_RAINBOW = 0.30
+QUALITY_RAINBOW_WARM = 0.05     # 彩虹的另一半必须是暖色（挡掉纯蓝背景）
+QUALITY_RAINBOW_NBIG = 3        # 至少 3 个色相桶，白/蓝单色背景读不出这么多
+
+# 光晕扫描圈：bbox 内 0.8%~11%。彩卡的光晕有厚度，只读最外沿会漏（见 _rainbow_scan）。
+QUALITY_GLOW_GAPS = (0.008, 0.016, 0.024, 0.032, 0.042, 0.055, 0.070, 0.090, 0.110)
+QUALITY_GLOW_TH = 0.018         # 每圈的厚度
+# 低致密度候选的「复活」门槛：致密度掉到 MIN_EXTENT 以下时，
+# 只有强彩签名（rainbow≥0.55）才认作卡。UI 图标最多 0.48，挡得住。
+RAINBOW_STRONG = 0.55
+MIN_EXTENT_LOOSE = 0.35         # 低于这个连彩卡都不可能是（纯噪声）
 
 
 def _gold_mask(roi):
@@ -152,8 +181,20 @@ def find_cards(frame):
             continue
         if not (CARD_RATIO[0] < hh / max(ww, 1) < CARD_RATIO[1]):
             continue
-        if cv2.contourArea(c) / max(1, ww * hh) < MIN_EXTENT:
-            continue        # 不是实心矩形卡（火焰伤害数字、飘字特效）
+        ext = cv2.contourArea(c) / max(1, ww * hh)
+        if ext < MIN_EXTENT:
+            # 普通卡是实心矩形（0.93+）；彩卡的光晕会把轮廓撑散，掉到 0.69~0.88，
+            # 光晕更散时（玩家 2026-11-26 截的那张篮球架彩卡）只有 0.41。
+            # 一律按 MIN_EXTENT 砍掉 → 彩卡整张漏检，器材分直接少算一个。
+            # 这里只给「强彩签名」开口：多色相 + 冷暖共存 + rainbow≥0.55。
+            # 右侧训练项按钮/笔记页商品卡虽然也是彩色，但实测 rainbow ≤0.48，过不了；
+            # 「+33/+36」火焰伤害数字是纯橙黄，rainbow=0，也过不了。
+            if ext < MIN_EXTENT_LOOSE:
+                continue
+            probe = {"x": x + x1, "y": y + y1, "w": ww, "h": hh}
+            g = _rainbow_scan(frame, probe)
+            if not (g and g["multi"] and g["rainbow"] >= RAINBOW_STRONG):
+                continue
         card = {"x": x + x1, "y": y + y1, "w": ww, "h": hh, "cx": x + x1 + ww / 2}
         # 双掩膜会给出两个略有偏差的框（金框紧、彩色框带光晕），合并成一个。
         for i, other in enumerate(out):
@@ -219,6 +260,67 @@ def _quality_ring(frame, card):
             "sat": int(np.median(sat[sel])), "val": int(np.median(val[sel])), "n": int(len(hs))}
 
 
+def _rainbow_scan(frame, card):
+    """扫 bbox 内 0.8%~11% 的多圈，找「彩虹光晕」最浓的一圈。
+
+    【为什么不能只看最外沿】
+      2026-11-26 玩家手机截图里并排两张彩卡，左边那张（篮球架）最外沿 1~3px 的
+      rainbow 只有 0.21，扫到 7px 才是 0.79 —— 固定采样会把它漏成「普」。
+      原因是 bbox 来自掩膜轮廓：彩卡光晕会把轮廓撑大，致密度只有 0.69~0.88
+      （普通卡 0.93+；光晕更散时能掉到 0.41）。bbox 一旦偏大，
+      最外沿就落在光晕外的过渡带或背景上。
+
+    【为什么必须 warm + nbig 双条件】
+      室外球场是蓝色地板/蓝天，青蓝紫占比 1.00（比彩卡还高），
+      只看 rainbow 会把室外场景的每张卡都判成彩。彩虹环是「多色相 + 冷暖共存」，
+      纯色背景只有一个色相桶、暖色为 0。
+
+    【为什么金仍然用最外沿那一圈】
+      edge_sat 判金靠的是框线本身的饱和度（金 209 vs 普 120~165）。
+      往深扫会碰到**所有卡共用**的亮黄内框，普卡 max 能飙到 244、和金完全重叠
+      （2026-11-26 实测），所以金只能在最外沿读，不能取多圈最大值。
+    """
+    if frame is None or card is None:
+        return None
+    x, y, w, h = int(card["x"]), int(card["y"]), int(card["w"]), int(card["h"])
+    short = min(w, h)
+    th = max(2, int(round(short * QUALITY_GLOW_TH)))
+    best = None
+    for g in QUALITY_GLOW_GAPS:
+        gap = max(1, int(round(short * g)))
+        x0, y0, x1, y1 = x + gap, y + gap, x + w - gap, y + h - gap
+        if x1 - x0 < 2 * th + 4 or y1 - y0 < 2 * th + 4:
+            continue
+        pat = frame[max(0, y0):y1, max(0, x0):x1]
+        if pat.size == 0:
+            continue
+        hsv = cv2.cvtColor(pat, cv2.COLOR_BGR2HSV)
+        ring = np.zeros(pat.shape[:2], bool)
+        ring[:th, :] = ring[-th:, :] = True
+        ring[:, :th] = ring[:, -th:] = True
+        hue = hsv[:, :, 0].astype(int)
+        sat, val = hsv[:, :, 1].astype(int), hsv[:, :, 2].astype(int)
+        sel = ring & (sat > 80) & (val > 90)
+        if sel.sum() < 40:
+            continue
+        hs = hue[sel]
+        cnt = {}
+        for v in (hs // 11):
+            cnt[int(v)] = cnt.get(int(v), 0) + 1
+        nbig = sum(1 for v in cnt.values() if v / len(hs) >= QUALITY_HUE_BIG)
+        cand = {
+            "rainbow": round(float(((hs >= 78) & (hs <= 165)).mean()), 3),
+            "warm": round(float((((hs >= 8) & (hs <= 48)) | (hs >= 172)).mean()), 3),
+            "nbig": nbig,
+            "gap": round(g, 3),
+        }
+        # 「像彩虹」的圈才有资格参与比较，否则纯蓝背景会把读数带到 1.00
+        cand["multi"] = (nbig >= QUALITY_RAINBOW_NBIG) and (cand["warm"] >= QUALITY_RAINBOW_WARM)
+        if best is None or (cand["multi"], cand["rainbow"]) > (best["multi"], best["rainbow"]):
+            best = cand
+    return best
+
+
 def card_quality(frame, card):
     """品质读数：{"q": 普/金/彩/无, "ring": 框线特征, "confident": 是否确证}
 
@@ -226,11 +328,14 @@ def card_quality(frame, card):
     不要把它当成「已确认」再去对账。
     """
     ring = None if (frame is None or card is None) else _quality_ring(frame, card)
+    glow = _rainbow_scan(frame, card)
+    # 彩优先：彩虹光晕（多色相 + 冷暖共存 + 青蓝紫够多）。
+    # 不看 MAX —— 玩家 2026-11-26 明确「MAX 不是一定有的」，有 MAX 的金卡也存在，
+    # 有彩虹没 MAX 的彩卡也存在，两者不能互推。
+    if glow and glow["multi"] and glow["rainbow"] >= QUALITY_RAINBOW:
+        return {"q": "彩", "ring": ring, "glow": glow, "confident": True}
     if ring is None:
-        return {"q": "无", "ring": None, "confident": False}
-    # 彩优先：框线上青/蓝/紫像素够多（彩虹光晕）。实测彩 0.77~0.91、非彩 ≤0.06。
-    if ring["rainbow"] >= QUALITY_RAINBOW:
-        return {"q": "彩", "ring": ring, "confident": True}
+        return {"q": "无", "ring": None, "glow": glow, "confident": False}
     if QUALITY_CALIBRATED and callable(GOLD_RULE):
         try:
             if GOLD_RULE(ring):
@@ -244,10 +349,10 @@ def card_quality(frame, card):
 def card_glow(frame, card):
     """卡片品质：彩 / 金 / 普（读不到 → "无"）。
 
-    【2026-11-26 三次纠正的完整结论】
+    【2026-11-26 五次纠正的完整结论】
 
       第一次「除了普通和彩，还有一个金框，这个不稀有的呀」
-              → 我改成看饱和度 ≥150，结果 287 张里 274 张判金，把普全吞了。
+              → 我改成看饱和度 ≥150，结果 274/287 张判金，把普全吞了。
       第二次「普最多、金次之、彩最少，这个规律」
               → 发现是**两层框**：外圈品质色 + 内圈所有卡共用的亮黄细框，
                 旧读法读的是内圈，当然全是暖金色。
@@ -255,14 +360,26 @@ def card_glow(frame, card):
               → 对照图才找到正确的采样点：**框线最外沿 1~3px**。
                 之前取 2~6px 已经越过框线进了卡面（卡面也是橙黄 S≈170），
                 所以读出来是单峰 —— 单峰是采样错的假象，不是游戏里真没有金。
+      第四次「彩色实际是长这样的」（附彩虹卡图）
+              → 彩 = **环绕整卡的完整彩虹光晕**，和金的「浓橙金粗框」是两回事。
+                原来的判据只看青蓝紫占比，会把**室外球场的蓝色地板判成彩**
+                （蓝地板 rainbow=1.00，比彩卡还高）。改成 rainbow + warm + nbig 三条件。
+      第五次「背景也有可能会变，除了黄色还有这种蓝色背景」
+              → 同上，用「多色相 + 冷暖共存」把单色背景排除；
+                并补了跨背景合成回归测试（tools/test_equip.py 的「双背景」段）。
 
-    当前判据（287 张实机卡实测，中间有空档）：
+    当前判据（826 张实机卡实测，三档之间都有空档）：
 
-      彩   框线青/蓝/紫占比 ≥0.30      → 彩虹光晕，实测 3 张（1%）
-      金   框线最外沿饱和度 ≥185        → 浓橙金粗框，实测 111 张（39%）
-      普   其余（浅奶油黄细框）         → 实测 176 张（61%）
+      彩   rainbow≥0.30 且 warm≥0.05 且 nbig≥3   → 彩虹光晕，实测 11 张（1.3%）
+      金   框线最外沿 edge_sat ≥185              → 浓橙金粗框，实测 296 张（35.8%）
+      普   其余（浅奶油黄细框）                   → 实测 519 张（62.9%）
 
     与玩家手机截图对账：截图左卡（球鞋）→ S≈123 判普；右卡（希雅＋大星星）
     → S≈209 判金，与电脑端同一件器材的读数完全一致。
+
+    ⚠️ 比例这件事要按「卡张数」还是「器材件数」看，是两个分母：
+       11 张彩卡去重后涉及 5 种不同图标（篮球/球鞋/希雅/籃/双节棍），
+       而玩家手里正好是「开局选的 5 个器材」。所以「我的器材里彩很多」
+       和「场上 826 张卡里彩只有 1.3%」并不矛盾 —— 后者是每帧出现次数的占比。
     """
     return card_quality(frame, card)["q"]

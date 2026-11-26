@@ -104,6 +104,57 @@ def main():
     blank[:] = (120, 160, 200)     # 木地板色（旧实现在这种纯地板上会整片误检）
     allok &= check("纯地板色帧 0 张", len(find_cards(blank)) == 0, str(find_cards(blank)))
 
+    # ===== 两种背景都要能分清 彩 / 金 / 普（玩家 2026-11-26 要求）=====
+    # 玩家：「背景也是有可能会变，除了那种黄色的背景之外，还会有这种蓝色的背景，
+    #        你要测试一下这两种都能区分出来。」
+    # 审计帧里几乎全是室内木地板，室外蓝色球场只有玩家给的两张截图，
+    # 所以这里分两段：① 真截图上判彩  ② 把实机卡贴到蓝背景上判不误判。
+    print("--- 双背景：黄木地板 / 蓝色球场 ---")
+    warm = rd(os.path.join(ROOT, "tools", "fixtures", "bg_warm_two_cai.jpg"))
+    cool = rd(os.path.join(ROOT, "tools", "fixtures", "bg_cool_one_cai.jpg"))
+    if warm is not None:
+        cs = find_cards(warm)
+        got = [card_glow(warm, c) for c in cs]
+        allok &= check(
+            "黄背景 2 张彩卡（左侧 bbox 外扩那张曾被致密度 0.41 漏掉）",
+            len(cs) == 2 and got == ["彩", "彩"], f"实测 {len(cs)} 张{got}")
+    if cool is not None:
+        cs = find_cards(cool)
+        got = [card_glow(cool, c) for c in cs]
+        allok &= check("蓝背景 1 张彩卡", len(cs) == 1 and got == ["彩"], f"实测 {len(cs)} 张{got}")
+
+    print("--- 蓝背景不把普/金卡判成彩（合成贴图）---")
+    # 纯蓝地板/蓝天的「青蓝紫占比」是 1.00（比彩卡还高），只看这个指标会把室外场景
+    # 每张卡都判彩。彩虹 = 多色相 + 冷暖共存，所以必须同时看 nbig 和 warm。
+    if warm is not None and cool is not None:
+        blue_bg = cool[700:900, 480:700]
+        for stamp, want in (("101011_core2_Def", "金"), ("171750_core2_Phys", "普")):
+            p = locate(stamp)
+            if not p:
+                continue
+            im = rd(p)
+            cs = find_cards(im)
+            if not cs:
+                allok &= check(f"{stamp} 转贴蓝背景仍判{want}", False, "原帧没检出卡")
+                continue
+            c = cs[0]
+            x, y, w, h = int(c["x"]), int(c["y"]), int(c["w"]), int(c["h"])
+            patch = im[y:y + h, x:x + w]
+            canvas = cv2.resize(blue_bg, (400, 400))
+            ox, oy = (400 - w) // 2, (400 - h) // 2
+            canvas[oy:oy + h, ox:ox + w] = patch
+            box = {"x": ox, "y": oy, "w": w, "h": h}
+            got = card_glow(canvas, box)
+            allok &= check(f"{stamp} 卡贴到蓝色球场仍判{want}", got == want, f"实测 {got}")
+
+    print("--- 纯蓝背景本身读不出彩虹 ---")
+    from src.core.cards import _rainbow_scan   # noqa: E402
+    if cool is not None:
+        for tag, (bx, by) in (("蓝地板", (502, 716)), ("蓝天", (1380, 404))):
+            g = _rainbow_scan(cool, {"x": bx, "y": by, "w": 183, "h": 204})
+            ok = bool(g) and not g["multi"]
+            allok &= check(f"{tag} 不算彩虹（nbig={g['nbig'] if g else '-'} warm={g['warm'] if g else '-'}）", ok)
+
     print("--- 计分接入 ---")
     cfg = {"teammate": 1.0, "level_bonus": {}, "fail_weight": 1.0,
            "equipment": 0.5, "equipment_tier": {"金": 1.0, "彩": 1.5, "无": 0.5}}
