@@ -259,7 +259,7 @@ tuning:
   shop:
     auto_buy: true
     snapshot: true                   # 每次进店存一张图（screenshots/auto/*_shop.png）便于校准
-    max_buy_per_run: 4               # 一次进店最多买几件
+    max_buy_per_run: 4               # 一次进店最多买几件（不是整轮上限；下次上新照进）
     # 玩家 2026-11-23 16:25：「优先保证有 120 块钱，要不然笔记刷出来买不了」。
     # 笔记继承扭蛋上限 120（下面 egg.max_price），商店任何付费商品买完跌破 120 就不买。
     # 玩家 2026-11-27：本轮笔记已经拿到 → 不用再留这 120。

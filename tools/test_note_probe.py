@@ -103,7 +103,7 @@ def make_stub():
     s._reward_key = lambda text: (0, 0, 0, 0)
     s._key_value = lambda key: 0.0
     s._shop_button = lambda items, frame: None
-    s._want_shop = lambda items: False
+    s._want_shop = lambda items, frame=None, shop=None: False
     s._btn_in_area = lambda items, words, frame: None
     s.stamina, s.stamina_max = 80, 130
     s.shop_week = "3"

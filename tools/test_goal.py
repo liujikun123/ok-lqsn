@@ -56,7 +56,7 @@ def make_stub(weekday, stamina=80, buttons=("训练", "出行")):
     s._read_week = lambda items: (3, weekday)
     s._day_key = lambda items: f"3-{weekday}"
     s._shop_button = lambda items, frame: None
-    s._want_shop = lambda items: False
+    s._want_shop = lambda items, frame=None, shop=None: False
     s._event_cards = lambda frame, items: []
     s.sleep = lambda x: None
     s._shot = lambda *a, **k: None

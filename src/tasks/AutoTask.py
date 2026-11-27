@@ -211,7 +211,7 @@ class AutoTask(MyBaseTask):
         # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
         # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
         self.shop_day = None
-        self.shop_week = None          # 已经例行看过货的那一周（商店 7 天刷新）
+        self.shop_week = None          # 上次看货是第几周（只作记录；判上新看图标 NEW 角标）
         self.unknown_count = 0
         self.known_overlay_hits = {}     # 已知浮层命中计数 {名称: 次数}，收工摘要用
         self.unknown_texts = []          # 真·未知页的文字（最多留 20 条），收工摘要/排复用
@@ -229,6 +229,7 @@ class AutoTask(MyBaseTask):
         # 「失败率全部>30 且无精力药 → 改练意识」这条规则要用它，没进店就不敢乱判。
         self.shop_has_stamina = None
         self.shop_bought = 0
+        self.shop_bought_trip = 0        # 本次进店买了几件（每次进店清零）
         # 进店当天是星期几（1~7）：周六不囤精力药，商店页本身读不到星期X
         self.shop_weekday = None
         # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
@@ -1707,7 +1708,7 @@ class AutoTask(MyBaseTask):
         # 商店（玩家 2026-11-23：只买 0 元 + 精力 <50 买精力药）
         #   以前这里没接入口，整轮一次店都没进过 → 精力药从来没买过。
         #   放在训练前：先把能补的精力补上，再决定练什么。
-        if shop and self._want_shop(items):
+        if shop and self._want_shop(items, frame, shop):
             self.shop_day = self._day_key(items)
             self.shop_week = (self.shop_day or "").split("-")[0] or None
             self._click_btn(shop, f"[进商店 精力{self.stamina} 看货架]", frame)
@@ -2219,14 +2220,46 @@ class AutoTask(MyBaseTask):
             return False
         return True
 
-    def _want_shop(self, items):
+    def _shop_new_badge(self, items, frame=None, shop=None):
+        """商店图标上方有没有「NEW」角标 = 这家店上新了。
+
+        玩家 2026-11-27：商店**不是**一周刷一次，上新时图标会变（角标）。
+        实机截图（1600x900）量出来的事实：
+          * 角标是**橙色**小标签，白字 NEW，挂在图标右上方；
+          * 一屏经常同时有 2~3 个（活动 / 商城 / 飞跃计划），
+            商城那个离商店只有 ~80px —— 不按位置绑定就会天天误判成上新。
+        所以只认「商店正上方、离得够近」的那个：
+            dy ∈ (-3.2h, -0.9h)、|dx| ≤ 1.7h（h = 「商店」文字框高度）
+        OCR 常把 NEW 读成 FNEW / OA / SOA，同位置出现 2~4 个字母也算。
+        """
+        if shop is None and frame is not None:
+            shop = self._shop_button(items, frame)
+        if not shop:
+            return None
+        hh = max(float(shop["b"].height), 8.0)
+        for it in items:
+            t = (it["t"] or "").upper().replace(" ", "")
+            if not t:
+                continue
+            dy = it["cy"] - shop["cy"]
+            if not (-3.2 * hh < dy < -0.9 * hh):
+                continue
+            if abs(it["cx"] - shop["cx"]) > 1.7 * hh:
+                continue
+            if re.search(r"N\s*E\s*W", t) or (2 <= len(t) <= 4
+                                             and sum(c in "NEWSOA1" for c in t) >= 2):
+                return "ocr"
+        return None
+
+    def _want_shop(self, items, frame=None, shop=None):
         """今天要不要进商店看一眼。
 
         商店现在不只买精力药了 —— 摇摆饮料 / 器材手册 / 0 元馈赠都值得买。
         但每天都绕一趟要白烧 2~3 步，所以只在两种时候进：
           1) 精力 < 50：缺精力，进去把牛奶 / 饮料按规矩补上；
-          2) 换周了：商店「上新时间 7天后」，一周才刷一次货，例行进去把该买的买齐。
+          2) 商店图标亮「NEW」角标 = 上新（不按周算，看图标，见 _shop_new_badge）。
         按天记账，一天最多进一次，避免每日页 ↔ 商店来回打转。
+        买过几件不影响进店 —— `max_buy_per_run` 是**一次进店**的上限（见 _do_shop）。
 
         **周日一律不进**（玩家 2026-11-23）：周日去公园就能把精力回满，
         这时候再买精力药纯属溢出浪费钱。配置 shop.skip_weekdays: [7] 可改。
@@ -2236,14 +2269,18 @@ class AutoTask(MyBaseTask):
         if not self.config.get("商店自动购买", True):
             return False
         day = self._day_key(items)
-        if self.shop_day is not None and self.shop_day == day:
+        # 读不到「第N周-星期X」就没法记账，进去会每天反复进出 → 宁可不进。
+        if day is None:
+            if getattr(self, "_shop_nokey_at", 0) + 30 < time.time():
+                self._shop_nokey_at = time.time()
+                self.log_info("读不到「第N周-星期X」→ 今天不进商店（没法按天记账）")
             return False
-        if self.shop_bought >= int(shop_cfg.get("max_buy_per_run", 4)):
+        if self.shop_day is not None and self.shop_day == day:
             return False
 
         # 玩家 2026-11-23 12:47：「周日就不要去商店了，周日能逛公园回复，
         # 再去商店买精力药不就溢出了」→ 周日（7）默认不进店。
-        week, wd = self._read_week(items)
+        _, wd = self._read_week(items)
         if wd is None:
             wd = self.weekday              # 这一帧没读到就用上一帧的结果，别留下周六的陈值
         if wd is not None:
@@ -2257,10 +2294,13 @@ class AutoTask(MyBaseTask):
         st = self.stamina if self.stamina is not None else 999
         below = int(((shop_cfg.get("rules") or {}).get("stamina") or {}).get("when_below", 50))
         if st < below:
+            self.shop_bought_trip = 0      # 新的一次进店，件数从 0 数
             return True
-        week = day.split("-")[0] if day else None
-        if week and self.shop_week != week:
-            self.log_info(f"新的一周（{week}）→ 例行进店看货（商店 7 天刷新一次）")
+        # 上新：商店图标上挂出「NEW」角标（玩家 2026-11-27：不是一周一次，看图标）。
+        badge = self._shop_new_badge(items, frame, shop)
+        if badge:
+            self.log_info(f"商店图标有上新标记（{badge}）→ 进店看货")
+            self.shop_bought_trip = 0
             return True
         return False
 
@@ -2662,9 +2702,11 @@ class AutoTask(MyBaseTask):
         if not self.config.get("商店自动购买", True):
             return self._leave_shop(items, frame)
 
+        # 「一次进店最多买几件」——数的是这次进店，不是整轮。整轮买了多少只进统计
+        # （self.shop_bought），不拿它拦下次上新。
         max_buy = int(cfg.get("max_buy_per_run", 4))
-        if self.shop_bought >= max_buy:
-            self.log_info(f"本期商店已买 {self.shop_bought} 件（上限 {max_buy}），不再买")
+        if self.shop_bought_trip >= max_buy:
+            self.log_info(f"本次进店已买 {self.shop_bought_trip} 件（上限 {max_buy}），先出去")
             return self._leave_shop(items, frame)
 
         o, why = self._shop_plan(offers, cfg)
@@ -2672,6 +2714,7 @@ class AutoTask(MyBaseTask):
             self.log_info(f"商店：{why}")
             return self._leave_shop(items, frame)
 
+        self.shop_bought_trip += 1
         self.shop_bought += 1
         self.stat["buy"].append((why, o["name"], o["price"]))
         self._click_item(o["item"], f"[商店-{why} 「{o['name']}」{o['price']}元]")
@@ -5182,7 +5225,7 @@ class AutoTask(MyBaseTask):
         # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
         # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
         self.shop_day = None
-        self.shop_week = None          # 已经例行看过货的那一周（商店 7 天刷新）
+        self.shop_week = None          # 上次看货是第几周（只作记录；判上新看图标 NEW 角标）
         self.unknown_count = 0
         self.minigame_tries = 0
         self.stock_idx = 0
@@ -5198,6 +5241,7 @@ class AutoTask(MyBaseTask):
         # 「失败率全部>30 且无精力药 → 改练意识」这条规则要用它，没进店就不敢乱判。
         self.shop_has_stamina = None
         self.shop_bought = 0
+        self.shop_bought_trip = 0        # 本次进店买了几件（每次进店清零）
         # 进店当天是星期几（1~7）：周六不囤精力药，商店页本身读不到星期X
         self.shop_weekday = None
         # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
@@ -5430,7 +5474,7 @@ class AutoTask(MyBaseTask):
         "trip_picked", "trip_probe", "trip_probe_done",
         "trip_probe_retry", "trip_probe_retry_day",
         "trip_back_tries", "shop_day", "shop_week", "shop_bought",
-        "shop_has_stamina", "shop_weekday", "notes_done", "minigame_tries", "stock_idx",
+        "shop_has_stamina", "shop_weekday", "shop_bought_trip", "notes_done", "minigame_tries", "stock_idx",
         "stock_tries", "stock_picked", "stamina_refills", "stamina_misses",
         "last_equip_count", "rounds_done", "stat",
         "run_id", "_runlog_first_stamina", "_runlog_first_focus",
