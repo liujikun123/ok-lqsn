@@ -211,7 +211,7 @@ class AutoTask(MyBaseTask):
         # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
         # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
         self.shop_day = None
-        self.shop_week = None          # 上次看货是第几周（只作记录；判上新看图标 NEW 角标）
+        self.shop_week = None          # 上次看货是第几周（只用来给「找不到商店按钮」的日志去重）
         self.unknown_count = 0
         self.known_overlay_hits = {}     # 已知浮层命中计数 {名称: 次数}，收工摘要用
         self.unknown_texts = []          # 真·未知页的文字（最多留 20 条），收工摘要/排复用
@@ -232,9 +232,6 @@ class AutoTask(MyBaseTask):
         self.shop_bought_trip = 0        # 本次进店买了几件（每次进店清零）
         # 进店当天是星期几（1~7）：周六不囤精力药，商店页本身读不到星期X
         self.shop_weekday = None
-        # 上新排程：商店页底部「上新时间 N天后」→ 换成绝对天序号（第W周星期D = (W-1)*7+D）
-        self.shop_restock_abs = None    # 下次预计上新的天序号
-        self.shop_last_abs = None       # 上次进店的天序号（≥7 天兜底回访）
         # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
         self.main_char_round = None
         # 已知主角名池：只用于剔除 OCR 粘连词（「百希雅」= 百目鬼 + 希雅），
@@ -430,26 +427,6 @@ class AutoTask(MyBaseTask):
             return p
         except Exception:
             return None
-
-    def _save_shop_area(self, frame, shop, tag):
-        """把商店图标周围裁一块放大 3 倍存图（校准 NEW 角标位置用，只读不点）。"""
-        try:
-            import cv2
-            os.makedirs("screenshots/auto", exist_ok=True)
-            h, w = frame.shape[:2]
-            hh = max(float(shop["b"].height), 8.0)
-            x1 = max(0, int(shop["cx"] - 4.0 * hh))
-            x2 = min(w, int(shop["cx"] + 4.0 * hh))
-            y1 = max(0, int(shop["cy"] - 6.0 * hh))
-            y2 = min(h, int(shop["cy"] + 1.5 * hh))
-            sub = frame[y1:y2, x1:x2]
-            if sub.size:
-                sub = cv2.resize(sub, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-                p = f"screenshots/auto/{time.strftime('%H%M%S')}_{tag}.png"
-                cv2.imwrite(p, sub)
-                self.log_info(f"[商店·校准] 已存放大图 {p}｜裁自 ({x1},{y1})-({x2},{y2})")
-        except Exception as exc:
-            self.log_warning(f"[商店·校准] 存图失败：{exc}")
 
     def _audit_path(self, week, day, tag):
         """读数证据目录：logs/audit/<run_id>/W<周>D<星期>/<时刻>_<tag>.png。
@@ -2261,69 +2238,41 @@ class AutoTask(MyBaseTask):
         return True
 
     def _shop_new_badge(self, items, frame=None, shop=None):
-        """商店图标上方有没有「NEW」角标 = 这家店上新了。
+        """商店图标右上角挂着「新品上市」橙色标签 = 这家店上新了。
 
-        玩家 2026-11-27：商店**不是**一周刷一次（局内商店页底部是「上新时间 N天后」
-        的倒计时，2~7 天不等，不跟周对齐），上新时图标会变（角标，OCR 能读到）。
+        玩家 2026-11-27 给的真图：标签是橙色圆角底 + 白字「新品上市」，
+        OCR 整段读得出来（score 1.00），位置在商店图标右上、商店文字框上方约 2.8 个字高。
+        以前按英文字母 NEW 去找，所以一整轮 20+ 个游戏日一次都没命中。
 
-        ⚠️ 位置约束**还没用局内每日页的真实样本校准过**：目前按「商店文字框上方
-        0.5~4 个字高、左右 2.5 个字宽」找 NEW，并在日志里打出所有候选坐标，
-        跑一轮就能看出真实偏移再收紧。
-        OCR 常把 NEW 读成 FNEW / OA / SOA，同位置出现 2~4 个字母也算。
+        判据：文字落在商店文字框上方 1.2~4.2 个字高、左右 3.0 个字宽内，
+        且含「新品」/「上市」/「上新」（OCR 偶尔读成「上币」）→ 算上新。
         """
         if shop is None and frame is not None:
             shop = self._shop_button(items, frame)
         if not shop:
             return None
         hh = max(float(shop["b"].height), 8.0)
-        day = self._day_key(items)
-        # ── 埋点：每天第一次到每日页时，把商店图标周围存一张放大图 + 候选文字全打出来。
-        #    没有样本就没法校准偏移（2026-11-27 已因拿错局外大厅的图白跑一轮）。
-        if day and getattr(self, "_shop_cal_day", None) != day:
-            self._shop_cal_day = day
-            near_all = []
-            for it in items:
-                dy = it["cy"] - shop["cy"]
-                if not (-6.0 * hh < dy < 1.5 * hh):
-                    continue
-                if abs(it["cx"] - shop["cx"]) > 4.0 * hh:
-                    continue
-                near_all.append(f"{it['t']}@({int(it['cx'])},{int(it['cy'])})")
-            self.log_info(f"[商店·校准] {day} 商店@({int(shop['cx'])},{int(shop['cy'])}) "
-                          f"字高{hh:.0f}｜周边文字 {near_all}")
-            if frame is not None:
-                self._save_shop_area(frame, shop, "shoparea")
         near = []
         for it in items:
-            t = (it["t"] or "").upper().replace(" ", "")
+            t = re.sub(r"\s+", "", it["t"] or "")
             if not t:
                 continue
             dy = it["cy"] - shop["cy"]
-            if not (-4.0 * hh < dy < -0.5 * hh):
+            if not (-4.2 * hh < dy < -1.2 * hh):
                 continue
-            if abs(it["cx"] - shop["cx"]) > 2.5 * hh:
+            if abs(it["cx"] - shop["cx"]) > 3.0 * hh:
                 continue
             near.append(f"{it['t']}@({int(it['cx'])},{int(it['cy'])})")
-            if re.search(r"N\s*E\s*W", t) or (2 <= len(t) <= 4
-                                             and sum(c in "NEWSOA1" for c in t) >= 2):
-                self.log_info(f"商店上方候选「{it['t']}」@({int(it['cx'])},{int(it['cy'])})"
-                              f"｜商店@({int(shop['cx'])},{int(shop['cy'])}) → 判定为上新")
+            if any(k in t for k in ("新品", "上新", "上市", "上币")):
+                self.log_info(f"商店图标挂着「{it['t']}」@({int(it['cx'])},{int(it['cy'])})"
+                              f"｜商店@({int(shop['cx'])},{int(shop['cy'])}) → 上新")
                 return "ocr"
+        # 没判成也要留候选，方便日后 OCR 漏字时补判据（120 秒最多一打）。
         if near and getattr(self, "_shop_new_near_at", 0) + 120 < time.time():
             self._shop_new_near_at = time.time()
-            self.log_info(f"商店上方候选（未判成 NEW）：{near}"
+            self.log_info(f"商店上方候选（未判成新品上市）：{near}"
                           f"｜商店@({int(shop['cx'])},{int(shop['cy'])})")
         return None
-
-    def _abs_day(self, day=None):
-        """把 '第3周-星期5' 折算成一个连续的天序号，用来算「过几天」。
-
-        读不到返回 None。例：第1周星期1 = 1，第2周星期2 = 9。
-        """
-        m = re.match(r"\s*(\d+)\s*-\s*(\d+)\s*$", str(day or ""))
-        if not m:
-            return None
-        return (int(m.group(1)) - 1) * 7 + int(m.group(2))
 
     def _want_shop(self, items, frame=None, shop=None):
         """今天要不要进商店看一眼。
@@ -2331,7 +2280,7 @@ class AutoTask(MyBaseTask):
         商店现在不只买精力药了 —— 摇摆饮料 / 器材手册 / 0 元馈赠都值得买。
         但每天都绕一趟要白烧 2~3 步，所以只在两种时候进：
           1) 精力 < 50：缺精力，进去把牛奶 / 饮料按规矩补上；
-          2) 商店图标亮「NEW」角标 = 上新（不按周算，看图标，见 _shop_new_badge）。
+          2) 商店图标挂着「新品上市」标签 = 上新（见 _shop_new_badge）。
         按天记账，一天最多进一次，避免每日页 ↔ 商店来回打转。
         买过几件不影响进店 —— `max_buy_per_run` 是**一次进店**的上限（见 _do_shop）。
 
@@ -2362,35 +2311,17 @@ class AutoTask(MyBaseTask):
             return self._shop_verdict(items, False,
                                       f"星期{wd} 不进店：这天靠公园回精力，买精力药会溢出")
 
+        # 进店只有两条路（玩家 2026-11-27）：精力低（缺精力要补）、图标挂「新品上市」（上新了）。
         st = self.stamina if self.stamina is not None else 999
         below = int(((shop_cfg.get("rules") or {}).get("stamina") or {}).get("when_below", 50))
         if st < below:
             self.shop_bought_trip = 0      # 新的一次进店，件数从 0 数
             return self._shop_verdict(items, True, f"精力 {st} < {below}")
-        # 上新：商店图标上挂出「NEW」角标（玩家 2026-11-27：不是一周一次，看图标）。
         badge = self._shop_new_badge(items, frame, shop)
         if badge:
             self.shop_bought_trip = 0
-            return self._shop_verdict(items, True, f"商店图标有上新标记（{badge}）")
-
-        # 到这里说明「精力够」且「图标没读出角标」。还留两条**兜底**进店：
-        #   ① 到上新日：上次进店读到「上新时间 N天后」，记成绝对天序号，到点就进；
-        #   ② 从没进过 / 距上次进店 ≥7 天：进去把倒计时读回来。
-        # 为什么需要②：角标识别一直没拿到正样本（2026-11-27 这轮 15 个游戏日
-        # 一次都没读出 NEW，见日志 [商店·校准]），没有①就永远不知道哪天上新。
-        # 进店本身不消耗行动、不花金币（买不买还有 keep_gold 卡着），代价只有 2 次点击。
-        abs_day = self._abs_day(day)
-        restock = getattr(self, "shop_restock_abs", None)
-        if abs_day is not None and restock is not None and abs_day >= restock:
-            self.shop_bought_trip = 0
-            return self._shop_verdict(items, True, f"到上新日（预计第 {restock} 天，今天第 {abs_day} 天）")
-        last = getattr(self, "shop_last_abs", None)
-        if abs_day is not None and (last is None or abs_day - last >= 7):
-            self.shop_bought_trip = 0
-            why = "本轮还没进过店，进去读货架和上新倒计时" if last is None \
-                else f"距上次进店 {abs_day - last} 天（≥7）→ 回访看有没有上新"
-            return self._shop_verdict(items, True, why)
-        return self._shop_verdict(items, False, f"精力 {st} ≥ {below}、没上新、也没到回访日")
+            return self._shop_verdict(items, True, "商店图标挂着「新品上市」")
+        return self._shop_verdict(items, False, f"精力 {st} ≥ {below}、图标没有「新品上市」")
 
     def _shop_verdict(self, items, ok, why):
         """统一的「今天进不进店」出口：结论一变就打一行，同一天同结论只打一次。
@@ -2807,26 +2738,6 @@ class AutoTask(MyBaseTask):
               f"｜星期{getattr(self, 'shop_weekday', None)}")
         if cfg.get("snapshot", True):
             self._shot(frame, "shop")
-
-        # 「上新时间 4天后」→ 记成下次上新日（绝对天序号）。
-        # 这是唯一能确定「哪天上新」的硬数据：图标角标一直没拿到正样本，
-        # 倒计时却是每进一次店就写着的（2026-11-27 商店截图）。
-        today = self._day_key(items)
-        today_abs = self._abs_day(today) if today else None
-        if today_abs is not None:
-            self.shop_last_abs = today_abs
-            m = re.search(r"(\d+)\s*天\s*后", " ".join(it["t"] for it in items))
-            if m:
-                days = int(m.group(1))
-                self.shop_restock_abs = today_abs + days
-                if getattr(self, "_shop_restock_log", None) != (today, days):
-                    self._shop_restock_log = (today, days)
-                    self.log_info(f"商店「上新时间 {days} 天后」→ 下次上新日 第 "
-                                  f"{today_abs + days} 天（今天第 {today_abs} 天）")
-            elif getattr(self, "_shop_restock_log", None) != ("none", today):
-                self._shop_restock_log = ("none", today)
-                self.log_warning("商店页没读到「上新时间 N天后」｜文字 "
-                                 f"{[it['t'] for it in items][:16]}")
 
         if not self.config.get("商店自动购买", True):
             return self._leave_shop(items, frame)
@@ -5354,7 +5265,7 @@ class AutoTask(MyBaseTask):
         # 整轮跑下来一次店都没进、精力药也没买过（2026-11-23 查 run_1100/1105 日志确认）。
         # 现在每日页在「精力 < 阈值」时进店看一眼，按天记账，一天最多进一次。
         self.shop_day = None
-        self.shop_week = None          # 上次看货是第几周（只作记录；判上新看图标 NEW 角标）
+        self.shop_week = None          # 上次看货是第几周（只用来给「找不到商店按钮」的日志去重）
         self.unknown_count = 0
         self.dialog_pokes = 0          # 过场/剧情帧点一下屏幕的次数（只记数，不刷 WARNING）
         self.minigame_tries = 0
@@ -5374,9 +5285,6 @@ class AutoTask(MyBaseTask):
         self.shop_bought_trip = 0        # 本次进店买了几件（每次进店清零）
         # 进店当天是星期几（1~7）：周六不囤精力药，商店页本身读不到星期X
         self.shop_weekday = None
-        # 上新排程：商店页底部「上新时间 N天后」→ 换成绝对天序号（第W周星期D = (W-1)*7+D）
-        self.shop_restock_abs = None    # 下次预计上新的天序号
-        self.shop_last_abs = None       # 上次进店的天序号（≥7 天兜底回访）
         # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
         self.main_char_round = None
         # 已知主角名池：只用于剔除 OCR 粘连词（「百希雅」= 百目鬼 + 希雅），
@@ -5608,7 +5516,7 @@ class AutoTask(MyBaseTask):
         "trip_probe_retry", "trip_probe_retry_day",
         "trip_back_tries", "shop_day", "shop_week", "shop_bought",
         "shop_has_stamina", "shop_weekday", "shop_bought_trip", "notes_done",
-        "shop_restock_abs", "shop_last_abs", "minigame_tries", "stock_idx",
+        "minigame_tries", "stock_idx",
         "stock_tries", "stock_picked", "stamina_refills", "stamina_misses",
         "last_equip_count", "rounds_done", "stat",
         "run_id", "_runlog_first_stamina", "_runlog_first_focus",

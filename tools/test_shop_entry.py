@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""进店判断自测（离线）：精力低 / 图标角标 / 到上新日 / 兜底回访 / 周日 / 已处理。
+"""进店判断自测（离线）：精力低 / 图标「新品上市」/ 周日 / 已处理。
 
 跑法： ../ok-bsg/.venv/Scripts/python.exe tools/test_shop_entry.py
 """
@@ -19,7 +19,6 @@ class Box:
 class Stub:
     _want_shop = AutoTask._want_shop
     _shop_verdict = AutoTask._shop_verdict
-    _abs_day = AutoTask._abs_day
     _shop_new_badge = AutoTask._shop_new_badge
 
     # 默认状态
@@ -28,10 +27,7 @@ class Stub:
     shop_week = None
     shop_bought_trip = 0
     shop_weekday = None
-    shop_restock_abs = None
-    shop_last_abs = None
     _shop_verdict_key = None
-    _shop_cal_day = None
     logs = []
 
     # 假的页面读数（用例里改）
@@ -67,9 +63,6 @@ class Stub:
     def _shop_button(self, items, frame=None):
         return SHOP
 
-    def _save_shop_area(self, frame, shop, tag):
-        pass
-
     def log_info(self, m):
         Stub.logs.append(m)
 
@@ -98,9 +91,6 @@ def run(**kw):
     s.config = Stub._Cfg(s)
     s.shop_weekday = None
     s._shop_verdict_key = None
-    s._shop_cal_day = None
-    s.shop_restock_abs = None
-    s.shop_last_abs = None
     s.badge = None
     s.day = "2-3"
     s.wd = 3
@@ -117,47 +107,51 @@ def _():
     assert ok is True, ok
 
 
-@case("精力 50（等于门槛）→ 不进（今天也没上新、没到回访日）")
+@case("精力 50（等于门槛）且没上新 → 不进")
 def _():
-    ok, s = run(stamina=50, shop_last_abs=11)      # 今天第 10 天，刚进过 1 天
+    ok, s = run(stamina=50)
     assert ok is False, s.logs
+    assert any("新品上市" in m for m in s.logs), s.logs
 
 
-@case("图标有 NEW → 进店")
+@case("图标挂「新品上市」→ 进店")
 def _():
-    ok, _s = run(badge="ocr")
-    assert ok is True, ok
-
-
-@case("到上新日（上次读到 3 天后）→ 进店")
-def _():
-    # 今天第2周星期3 = 10；上次第2周星期3 读到 3天后 = 13
-    ok, s = run(shop_restock_abs=10, shop_last_abs=8, stamina=100)
+    ok, s = run(stamina=100, badge="ocr")
     assert ok is True, s.logs
 
 
-@case("没到上新日 → 不进")
+@case("真图偏移：商店@(1469,195) 字高28，角标在其上方 2.8 字高 → 命中")
 def _():
-    ok, s = run(shop_restock_abs=13, shop_last_abs=9, stamina=100)
-    assert ok is False, s.logs
+    items = [SHOP, it("新品上市", 1469, 195 - 78)]
+    assert Stub()._shop_new_badge(items, None, SHOP) == "ocr"
+    s = Stub()
+    assert s._shop_new_badge([SHOP, it("新品上市", 1500, 195 - 78)], None, SHOP) == "ocr"
 
 
-@case("本轮从没进过店 → 进店读倒计时")
+@case("OCR 把「新品上市」拆成「新品」「上市」两段 → 也命中")
 def _():
-    ok, s = run(shop_last_abs=None, stamina=100)
-    assert ok is True, s.logs
+    for t in ("新品", "上市", "上币"):
+        items = [SHOP, it(t, 1469, 117)]
+        assert Stub()._shop_new_badge(items, None, SHOP) == "ocr", t
 
 
-@case("距上次进店 7 天 → 兜底回访")
+@case("商店上方是别的文字（「任务」/「活动」）→ 不算上新")
 def _():
-    ok, s = run(shop_last_abs=3, shop_restock_abs=None, stamina=100)   # 今天第 10 天
-    assert ok is True, s.logs
+    s = Stub()
+    for t in ("任务", "活动", "商城"):
+        assert s._shop_new_badge([SHOP, it(t, 1469, 117)], None, SHOP) is None, t
 
 
-@case("距上次进店 6 天 → 不回访")
+@case("横向差 4 个字宽（别的图标挂的新品上市）→ 不算")
 def _():
-    ok, s = run(shop_last_abs=4, shop_restock_abs=None, stamina=100)
-    assert ok is False, s.logs
+    items = [SHOP, it("新品上市", 1469 + 112, 117)]
+    assert Stub()._shop_new_badge(items, None, SHOP) is None
+
+
+@case("商店正下方（不是上方）的「新品上市」→ 不算")
+def _():
+    items = [SHOP, it("新品上市", 1469, 195 + 78)]
+    assert Stub()._shop_new_badge(items, None, SHOP) is None
 
 
 @case("周日 → 不进（哪怕精力见底）")
@@ -177,16 +171,6 @@ def _():
 def _():
     ok, s = run(day=None, stamina=10)
     assert ok is False, s.logs
-
-
-@case("_abs_day：第1周星期1=1、第2周星期3=10、第3周星期7=21")
-def _():
-    s = Stub()
-    assert s._abs_day("1-1") == 1
-    assert s._abs_day("2-3") == 10
-    assert s._abs_day("3-7") == 21
-    assert s._abs_day(None) is None
-    assert s._abs_day("乱码") is None
 
 
 @case("配置关了商店自动购买 → 不进")
