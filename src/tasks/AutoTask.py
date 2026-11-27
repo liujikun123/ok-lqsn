@@ -3670,11 +3670,17 @@ class AutoTask(MyBaseTask):
         self.log_info(f"本场器材分布：{eq_txt}（整场最多 {seen_eq} 张）")
         n_color = sum(1 for d in scored for e in (d.get("equips") or []) if e == "彩")
         n_gold = sum(1 for d in scored for e in (d.get("equips") or []) if e == "金")
-        n_plain = sum(1 for d in scored for e in (d.get("equips") or []) if e == "普")
-        if n_color or n_gold:
+        n_plain = sum(1 for d in scored for e in (d.get("equips") or []) if e in ("普", "无"))
+        # 【2026-11-27】这行**每轮都打**，哪怕一张暴击都没有 —— 否则「没识别到」和
+        # 「识别了但本局没暴击」在日志里长一样，没法核对器材暴击有没有被认出来。
+        if seen_eq:
             use_tier = bool((cfg.get("equipment_tier") or {}).get("use_in_score", False))
-            self.log_info(f"器材暴击（局内熟练度触发，瞬时状态）：金 {n_gold} 张 / 彩 {n_color} 张"
-                          f" / 未暴击 {n_plain} 张"
+            hits = " ".join(f"{d['row']['t']}:{'+'.join(e for e in (d.get('equips') or []) if e in ('金', '彩'))}"
+                            for d in scored
+                            if any(e in ("金", "彩") for e in (d.get("equips") or [])))
+            self.log_info(f"器材暴击（正规叫法；局内熟练度触发，瞬时状态）："
+                          f"金 {n_gold} 张 / 彩 {n_color} 张 / 未暴击 {n_plain} 张"
+                          + (f"　见：{hits}" if hits else "　本帧没拍到暴击")
                           + ("→ 按档位计分" if use_tier else "→ 不参与排名，只记录"))
 
 
