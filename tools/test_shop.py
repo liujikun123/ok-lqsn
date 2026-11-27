@@ -22,6 +22,7 @@ class Stub:
     last_equip_count = 0
     shop_has_stamina = None
     gold = 500          # 顶栏金币，留底逻辑需要；500 表示钱够，不影响原选货用例
+    weekday = None      # 1~7（周一到周日），周六买精力药有特例
 
     def log_info(self, m):
         print(f"    info | {m}")
@@ -79,12 +80,14 @@ Stub.GOLD_KEEP = AutoTask.GOLD_KEEP
 import copy
 
 
-def plan(goods, stamina=80, equip=0, gold=500, enable=None, notes=False):
-    """enable: 要临时打开的白名单类别（如 ['stat','crit']）；notes: 本轮笔记已拿到。"""
+def plan(goods, stamina=80, equip=0, gold=500, enable=None, notes=False, weekday=None):
+    """enable: 要临时打开的白名单类别（如 ['stat','crit']）；notes: 本轮笔记已拿到；
+    weekday: 1~7（周一到周日），不传就是读不到星期几。"""
     Stub.stamina = stamina
     Stub.last_equip_count = equip
     Stub.gold = gold
     Stub.notes_done = notes
+    Stub.weekday = weekday
     s = Stub()
     cfg = copy.deepcopy(s._tuning().get("shop") or {})
     for cat in (enable or []):
@@ -113,13 +116,13 @@ def _():
     assert name == "怪味饮料+", name
 
 
-@case("精力够（>=50）→ 不买饮料，改买特训牛奶")
+@case("精力够（>=50）→ 牛奶和饮料都不买（都是精力低了再买）")
 def _():
-    name, _, _ = plan([
+    name, why, _ = plan([
         ("怪味饮料+", 420, 420, 40),
         ("特训牛奶", 900, 420, 50),
     ], stamina=80)
-    assert name == "特训牛奶", name
+    assert name is None, (name, why)
 
 
 @case("精力饮料 130 元 > 上限 50 → 跳过（wiki：只买 50 以下）")
@@ -241,13 +244,63 @@ def _():
 
 @case("金币读不到(None)：付费项不买，0元仍买")
 def _():
-    name, why, _ = plan([("特训牛奶", 900, 420, 50)], gold=None)
+    name, why, _ = plan([("特训牛奶", 900, 420, 50)], stamina=30, gold=None)
     assert name is None, (name, why)
     s = Stub(); s.gold = None
     cfg = s._tuning().get("shop") or {}
     offers = s._shop_offers(shelf([("老板的馈赠+", 420, 420, 0)]), None)
     o, _ = s._shop_plan(offers, cfg)
     assert o and o["name"] == "老板的馈赠+", offers
+
+
+# --- 玩家 2026-11-27：牛奶也是精力低了才买；周六不囤精力药；看买完的金币 ---
+
+@case("精力 45 < 50 → 买特训牛奶（不再是精力充裕也买）")
+def _():
+    name, why, _ = plan([("特训牛奶", 900, 420, 50)], stamina=45)
+    assert name == "特训牛奶", (name, why)
+
+
+@case("精力 50 = 门槛 → 不买牛奶（要用「低于」）")
+def _():
+    name, why, _ = plan([("特训牛奶", 900, 420, 50)], stamina=50)
+    assert name is None, (name, why)
+
+
+@case("周六 精力 20 ≥10 → 饮料和牛奶都不买（明天公园能补）")
+def _():
+    name, why, _ = plan([
+        ("怪味饮料+", 420, 420, 40),
+        ("特训牛奶", 900, 420, 50),
+    ], stamina=20, weekday=6)
+    assert name is None, (name, why)
+
+
+@case("周六 精力 5 <10（见底）→ 可以买精力饮料")
+def _():
+    name, why, _ = plan([("怪味饮料+", 420, 420, 40)], stamina=5, weekday=6)
+    assert name == "怪味饮料+", (name, why)
+
+
+@case("周六 精力 20：不买精力药，但摇摆专属饮料照买（不是整店不进）")
+def _():
+    name, _, _ = plan([
+        ("怪味饮料+", 420, 420, 40),
+        ("摇摆专属饮料++", 900, 420, 130),
+    ], stamina=20, weekday=6)
+    assert name == "摇摆专属饮料++", name
+
+
+@case("紧急档也要看买完的金币：精力 30、饮料 30 元、金币 140 → 剩 110 <120 不买")
+def _():
+    name, why, _ = plan([("怪味饮料+", 420, 420, 30)], stamina=30, gold=140)
+    assert name is None, (name, why)
+
+
+@case("紧急档：金币 150 买 30 元饮料剩 120 = 留底 → 买")
+def _():
+    name, why, _ = plan([("怪味饮料+", 420, 420, 30)], stamina=30, gold=150)
+    assert name == "怪味饮料+", (name, why)
 
 
 def main():

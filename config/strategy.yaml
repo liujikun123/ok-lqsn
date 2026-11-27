@@ -267,10 +267,14 @@ tuning:
     # 玩家 2026-11-23 12:47：「周日就不要去商店了，周日能逛公园回复，
     # 再去商店买精力药不就溢出了」→ 这几个星期几一律不进店（7 = 周日）
     skip_weekdays: [7]
+    # 玩家 2026-11-27：周六也不该囤精力药 —— 明天（周日）公园就能补满。
+    # 周六只有精力跌破这个数（见底）才允许买牛奶 / 精力饮料。
+    saturday_stamina_min: 10
     order: [free, milk, stamina, sway, manual, crit, book, stat, charm]
     rules:
       free:    {max_price: 0}                     # 老板的馈赠 / 馈赠+：标价 0，白拿 80 零用钱
-      milk:    {max_price: 100}                   # 特训牛奶：减少训练精力消耗 = 变相多练一天
+      # 玩家 2026-11-27：牛奶也是「精力低了再买」，和饮料同一个门槛
+      milk:    {max_price: 100, when_below: 50}   # 特训牛奶：减少训练精力消耗 = 变相多练一天
       stamina: {max_price: 50, when_below: 50, urgent_below: 35}  # wiki：只买 50 以下的；<35 见底时优先于牛奶
       # 玩家 2026-11-27：摇摆专属饮料（两个推荐属性随机 +25~35），40 / 130 两档，都买
       sway:    {enabled: true, max_price: 130}

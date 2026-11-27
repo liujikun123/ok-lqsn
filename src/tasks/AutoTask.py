@@ -229,6 +229,8 @@ class AutoTask(MyBaseTask):
         # 「失败率全部>30 且无精力药 → 改练意识」这条规则要用它，没进店就不敢乱判。
         self.shop_has_stamina = None
         self.shop_bought = 0
+        # 进店当天是星期几（1~7）：周六不囤精力药，商店页本身读不到星期X
+        self.shop_weekday = None
         # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
         self.main_char_round = None
         # 已知主角名池：只用于剔除 OCR 粘连词（「百希雅」= 百目鬼 + 希雅），
@@ -2220,14 +2222,15 @@ class AutoTask(MyBaseTask):
     def _want_shop(self, items):
         """今天要不要进商店看一眼。
 
-        商店现在不只买精力药了 —— 特训牛奶 / 金色秘籍 / 器材暴击 / 0 元馈赠都值得买
-        （wiki 训练流口径）。但每天都绕一趟要白烧 2~3 步，所以只在两种时候进：
-          1) 精力 < 50：缺精力，得看有没有 50 元以下的饮料；
+        商店现在不只买精力药了 —— 摇摆饮料 / 器材手册 / 0 元馈赠都值得买。
+        但每天都绕一趟要白烧 2~3 步，所以只在两种时候进：
+          1) 精力 < 50：缺精力，进去把牛奶 / 饮料按规矩补上；
           2) 换周了：商店「上新时间 7天后」，一周才刷一次货，例行进去把该买的买齐。
         按天记账，一天最多进一次，避免每日页 ↔ 商店来回打转。
 
         **周日一律不进**（玩家 2026-11-23）：周日去公园就能把精力回满，
         这时候再买精力药纯属溢出浪费钱。配置 shop.skip_weekdays: [7] 可改。
+        **周六进店但不囤精力药**（玩家 2026-11-27）：除非精力 <10，次日公园就能补。
         """
         shop_cfg = self._tuning().get("shop") or {}
         if not self.config.get("商店自动购买", True):
@@ -2241,6 +2244,10 @@ class AutoTask(MyBaseTask):
         # 玩家 2026-11-23 12:47：「周日就不要去商店了，周日能逛公园回复，
         # 再去商店买精力药不就溢出了」→ 周日（7）默认不进店。
         week, wd = self._read_week(items)
+        if wd is None:
+            wd = self.weekday              # 这一帧没读到就用上一帧的结果，别留下周六的陈值
+        if wd is not None:
+            self.shop_weekday = wd         # 商店页顶栏不一定有「星期X」，先记下来
         skip_days = shop_cfg.get("skip_weekdays", [7])
         if wd is not None and wd in [int(x) for x in skip_days]:
             self.shop_day = day            # 记成今天已看过，免得每帧重复打日志
@@ -2518,9 +2525,9 @@ class AutoTask(MyBaseTask):
     def _shop_plan(self, offers, cfg):
         """按白名单挑一件要买的，返回 (offer, 原因) 或 (None, 不买的原因)。
 
-        优先级 order：0 元馈赠 > 特训牛奶 > 精力饮料 > 器材暴击 > 教科书 > 属性秘籍 > 护符
+        优先级 order：0 元馈赠 > 特训牛奶 > 精力饮料 > 摇摆饮料 > 器材手册 > 器材暴击 > …
         每条规则都能单独关（on: false）、单独设价格上限（max_price）、
-        精力饮料还要求「精力 < when_below」，器材暴击还要求「上一场器材上有人」。
+        牛奶和精力饮料都要求「精力 < when_below」，器材暴击还要求「上一场器材上有人」。
         """
         rules = cfg.get("rules") or {}
         order = cfg.get("order") or ["free", "milk", "stamina", "crit", "book", "stat", "charm"]
@@ -2528,24 +2535,64 @@ class AutoTask(MyBaseTask):
         eq = getattr(self, "last_equip_count", 0) or 0
 
         # 玩家 2026-11-23 16:25：优先留 120 块给笔记继承扭蛋（egg.max_price=120），
-        # 否则笔记刷出来买不起。金币读得到时，任何有价格的商品买了会跌破底线就不买。
+        # 否则笔记刷出来买不起。看的是**购买后的金币**：买完剩的钱仍要 ≥ keep。
         # 0 元馈赠不花钱，永远放行；读不到金币时不敢乱花，跳过付费项。
         # 本轮已经拿到笔记 → 不用再为笔记留底（玩家 2026-11-27）。
         keep = 0 if getattr(self, "notes_done", False) else int(cfg.get("keep_gold", self.GOLD_KEEP))
         gold = getattr(self, "gold", None)
 
-        # 紧急档：精力见底时先买饮料保命（否则今天直接练不动，牛奶再划算也没用）。
+        def payable(o):
+            """买完之后金币仍要 ≥ keep（玩家 2026-11-27 的口径：不是买之前够，是买完还够）。"""
+            if o["kind"] == "free":
+                return True
+            price = o["price"]
+            if price is None:
+                self.log_warning(f"「{o['name']}」价格没读到 → 不知道买完还剩多少"
+                                 f"（要留 {keep}）→ 不买")
+                return False
+            if price <= 0:
+                return True
+            if gold is None:
+                self.log_warning(f"「{o['name']}」要 {price} 元，但顶栏金币读不到 "
+                                 f"→ 不敢花（要留 {keep}）")
+                return False
+            if gold - price < keep:
+                why = "笔记继承" if keep else "留底"
+                self.log_warning(f"「{o['name']}」{price} 元：金币 {gold}-{price}="
+                                 f"{gold - price} < {why} {keep} → 不买")
+                return False
+            return True
+
+        # 精力类（牛奶 / 精力饮料）的购买时机（玩家 2026-11-27）：
+        #   ① 都是**精力低了再买**，不低不买；
+        #   ② 周六例外：周日去公园就能把精力补回来，所以周六除非精力见底
+        #      （< saturday_stamina_min，默认 10）否则不花金币买精力道具。
+        sat_min = int(cfg.get("saturday_stamina_min", 10))
+        # 星期几用「进店当天」记下的那个：商店页顶栏不一定有「星期X」，
+        # 直接读 self.weekday 可能已被刷成 None，周六规则就失效了。
+        wd = getattr(self, "shop_weekday", None)
+        if wd is None:
+            wd = getattr(self, "weekday", None)
+        sat_skip = (wd == 6) and (st is None or st >= sat_min)
+
+        # 紧急档：精力见底时先买饮料保命（否则今天直接练不动）。
         # 精力还宽裕时才按 order 走，牛奶（永久降低训练精力消耗）排在饮料前面。
         urgent_rule = rules.get("stamina") or {}
         urgent = int(urgent_rule.get("urgent_below", 35))
         if st is not None and st < urgent:
-            pool = [o for o in offers if o["kind"] == "stamina"]
-            cap = urgent_rule.get("max_price")
-            pool = [o for o in pool if cap is None or o["price"] is None or o["price"] <= float(cap)]
-            if pool:
-                pool.sort(key=lambda o: (o["price"] is None, o["price"] or 0))
-                self.log_info(f"精力 {st} < {urgent}（见底）→ 优先买精力饮料")
-                return pool[0], "stamina-urgent"
+            if sat_skip:
+                self.log_info(f"精力 {st} 偏低，但今天是周六且 ≥ {sat_min}："
+                              f"明天公园就能补 → 不买精力药")
+            else:
+                pool = [o for o in offers if o["kind"] == "stamina"]
+                cap = urgent_rule.get("max_price")
+                pool = [o for o in pool
+                        if cap is None or o["price"] is None or o["price"] <= float(cap)]
+                pool = [o for o in pool if payable(o)]
+                if pool:
+                    pool.sort(key=lambda o: (o["price"] is None, o["price"] or 0))
+                    self.log_info(f"精力 {st} < {urgent}（见底）→ 优先买精力饮料")
+                    return pool[0], "stamina-urgent"
 
         for cat in order:
             rule = rules.get(cat) or {}
@@ -2561,10 +2608,14 @@ class AutoTask(MyBaseTask):
             # 便宜的优先；读不到价格的排最后（不敢乱花）
             pool.sort(key=lambda o: (o["price"] is None, o["price"] or 0))
 
-            if cat == "stamina":
+            if cat in ("milk", "stamina"):
+                if sat_skip:
+                    self.log_info(f"周六 精力 {st} ≥ {sat_min}：「{pool[0]['name']}」先不买，"
+                                  f"明天去公园就能补")
+                    continue
                 below = int(rule.get("when_below", 50))
                 if st is None or st >= below:
-                    self.log_info(f"商店有精力饮料，但精力 {st} ≥ {below} → 先不买")
+                    self.log_info(f"商店有「{pool[0]['name']}」，但精力 {st} ≥ {below} → 先不买")
                     continue
             if cat == "crit" and rule.get("need_equip", True) and not eq:
                 self.log_info("商店有器材暴击道具，但上一场训练没采到器材 "
@@ -2576,18 +2627,9 @@ class AutoTask(MyBaseTask):
             if cap is not None and o["price"] is not None and o["price"] > float(cap):
                 self.log_warning(f"「{o['name']}」{o['price']} 元 > 上限 {cap} 元 → 不买")
                 continue
-            # 留 120 给笔记：付费商品买完会跌破底线就不买；0 元白拿放行。
-            price = o["price"]
-            if price is not None and price > 0:
-                if gold is None:
-                    self.log_warning(f"「{o['name']}」要 {price} 元，但顶栏金币读不到 "
-                                     f"→ 不敢花（要留 {keep} 给笔记）")
-                    continue
-                if gold - price < keep:
-                    why = "笔记继承" if keep else "留底"
-                    self.log_warning(f"「{o['name']}」{price} 元：金币 {gold}-{price}="
-                                     f"{gold - price} < {why} {keep} → 不买")
-                    continue
+            # 买完金币仍要 ≥ keep（0 元白拿放行）。
+            if not payable(o):
+                continue
             return o, cat
         return None, "没有符合白名单的商品"
 
@@ -2596,8 +2638,8 @@ class AutoTask(MyBaseTask):
 
         玩家 2026-11-23：「商店具体的效果你去 wiki 看看，决定可以买哪些、长什么样」。
         查证（篮球少女：飞跃巅峰·训练流攻略，多篇一致）：
-          ✅ 精力饮料（回精力，**只买 50 元以下**）
-          ✅ 特训牛奶（减少训练精力消耗 → 等于多练一天，本作最划算的一件）
+          ✅ 精力饮料（回精力，**只买 50 元以下**，精力 <50 才买）
+          ✅ 特训牛奶（减少训练精力消耗；同样精力 <50 才买，周六不囤）
           ✅ 器材暴击道具（带负面效果，且**只有当天器材上有站人时才买**）
           ✅ 摇摆专属饮料（两个推荐属性随机 +25~35，40 / 130 两档）
           ✅ 器材手册（全部器材熟练度 +10，100 元）
@@ -5156,6 +5198,8 @@ class AutoTask(MyBaseTask):
         # 「失败率全部>30 且无精力药 → 改练意识」这条规则要用它，没进店就不敢乱判。
         self.shop_has_stamina = None
         self.shop_bought = 0
+        # 进店当天是星期几（1~7）：周六不囤精力药，商店页本身读不到星期X
+        self.shop_weekday = None
         # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
         self.main_char_round = None
         # 已知主角名池：只用于剔除 OCR 粘连词（「百希雅」= 百目鬼 + 希雅），
@@ -5386,7 +5430,7 @@ class AutoTask(MyBaseTask):
         "trip_picked", "trip_probe", "trip_probe_done",
         "trip_probe_retry", "trip_probe_retry_day",
         "trip_back_tries", "shop_day", "shop_week", "shop_bought",
-        "shop_has_stamina", "notes_done", "minigame_tries", "stock_idx",
+        "shop_has_stamina", "shop_weekday", "notes_done", "minigame_tries", "stock_idx",
         "stock_tries", "stock_picked", "stamina_refills", "stamina_misses",
         "last_equip_count", "rounds_done", "stat",
         "run_id", "_runlog_first_stamina", "_runlog_first_focus",
