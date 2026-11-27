@@ -25,6 +25,12 @@ class Stub:
     def log_info(self, m):
         pass
 
+    def log_warning(self, m):
+        pass
+
+    def _day_key(self, items):
+        return "第3周-星期五"       # 校准埋点要读日期；这里给个固定值即可
+
 
 def it(t, x, y, h=30):
     return {"t": t, "cx": x, "cy": y, "b": Box(h)}
