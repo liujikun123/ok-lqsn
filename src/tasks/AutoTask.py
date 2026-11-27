@@ -5778,7 +5778,11 @@ class AutoTask(MyBaseTask):
             PHASE_SETTLING: (PHASE_HALL,),
         }
         if to not in allowed.get(old, ()):
-            self.log_warning(f"阶段跳跃 {old}→{to}（页面 {page}），按 {to} 处理：{reason}")
+            # SETTLING→TRAINING = 没回大厅就接着练下一场（连练），是常态不是异常；
+            # 下面那行「阶段 old→to」已经会打，这里不再按 WARNING 刷屏
+            # （2026-11-27 一轮 7 次，把真告警挤下去了）。
+            if not (old == PHASE_SETTLING and to == PHASE_TRAINING):
+                self.log_warning(f"阶段跳跃 {old}→{to}（页面 {page}），按 {to} 处理：{reason}")
         self.phase = to
         self.saw_training = to in (PHASE_TRAINING, PHASE_SETTLING)
         self.log_info(f"阶段 {old}→{to}" + (f"（{page}）" if page else "")
