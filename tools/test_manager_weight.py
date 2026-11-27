@@ -53,16 +53,13 @@ check(f"经理+2队友 = {MW + 2 * TW:g}", score(["球队经理", "真崎", "百
 check("两个普通队友 = 2.0", score(["真崎", "百目鬼"]), 2 * TW)
 check("没有经理时权重不变", score(["真崎"]), TW)
 
-# 器材：默认 use_in_score=false（玩家 2026-11-26：金/彩 是局内熟练度触发的随机暴击，
-# 不进排名），每张卡按 equipment 计。配置若改回 true 则按档位，期望值自动跟随。
+# 器材按档位计（彩 1.5 / 金 1.0 / 普 0.5），期望值从配置读。
 TIER = CFG.get("equipment_tier") or {}
-USE_TIER = bool(TIER.get("use_in_score", False))
 EQ = float(CFG.get("equipment", 0.5))
-CAI = float(TIER.get("彩", EQ)) if USE_TIER else EQ
-NONE = float(TIER.get("无", EQ)) if USE_TIER else EQ
-check(f"经理+器材(彩{CAI:g}) = {MW + CAI:g}" + ("" if USE_TIER else "（默认不计档位）"),
-      score(["球队经理"], equips=["彩"]), MW + CAI)
-check(f"经理+1队友+器材(无{NONE:g}) = {MW + TW + NONE:g}",
+CAI = float(TIER.get("彩", EQ))
+NONE = float(TIER.get("无", EQ))
+check(f"经理+彩卡 = {MW + CAI:g}", score(["球队经理"], equips=["彩"]), MW + CAI)
+check(f"经理+1队友+无档卡 = {MW + TW + NONE:g}",
       score(["球队经理", "真崎"], equips=["无"]), MW + TW + NONE)
 
 print("\n== 失败率打折 ==")

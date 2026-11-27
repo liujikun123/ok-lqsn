@@ -156,17 +156,12 @@ def main():
             allok &= check(f"{tag} 不算彩虹（nbig={g['nbig'] if g else '-'} warm={g['warm'] if g else '-'}）", ok)
 
     print("--- 计分接入 ---")
-    # use_in_score=true 时按档位算；默认 false 时暴击不进排名（玩家 2026-11-26：
-    # 金/彩 是局内熟练度触发的随机暴击，按项比档位会偏向最后采的那一项）。
     cfg = {"teammate": 1.0, "level_bonus": {}, "fail_weight": 1.0,
-           "equipment": 0.5,
-           "equipment_tier": {"use_in_score": True, "金": 1.0, "彩": 1.5, "无": 0.5}}
+           "equipment": 0.5, "equipment_tier": {"普": 0.5, "金": 1.0, "彩": 1.5, "无": 0.5}}
     got = AutoTask._score_item(None, ["a"], "LV.1", 0, cfg, ["金"])
-    allok &= check("1 队友 + 1 金卡 = 2.0（use_in_score=true）", abs(got - 2.0) < 1e-9, f"got {got}")
-
-    cfg_plain = dict(cfg, equipment_tier={"use_in_score": False, "金": 1.0, "彩": 1.5, "无": 0.5})
-    got = AutoTask._score_item(None, ["a"], "LV.1", 0, cfg_plain, ["金"])
-    allok &= check("1 队友 + 1 金卡 = 1.5（默认：只按张数）", abs(got - 1.5) < 1e-9, f"got {got}")
+    allok &= check("1 队友 + 1 金卡 = 2.0", abs(got - 2.0) < 1e-9, f"got {got}")
+    got = AutoTask._score_item(None, ["a"], "LV.1", 0, cfg, ["彩", "普"])
+    allok &= check("1 队友 + 彩 + 普 = 3.0", abs(got - 3.0) < 1e-9, f"got {got}")
 
     print("\n结果:" + (" 全部通过" if allok else " 有失败项"))
     return 0 if allok else 1

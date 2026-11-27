@@ -2413,6 +2413,9 @@ class AutoTask(MyBaseTask):
     SHOP_CATS = (
         ("free",    ("馈赠", "红包", "免费")),
         ("milk",    ("牛奶", "特训")),
+        # 「摇摆专属饮料」名字里带「饮料」，必须排在 stamina 之前，否则被当成回精力药
+        ("sway",    ("摇摆",)),
+        ("manual",  ("器材手册", "器材熟练")),
         ("stamina", ("饮料", "精力", "能量饮")),
         ("crit",    ("暴击",)),
         ("book",    ("教科书", "教材", "等级书")),
@@ -2527,7 +2530,8 @@ class AutoTask(MyBaseTask):
         # 玩家 2026-11-23 16:25：优先留 120 块给笔记继承扭蛋（egg.max_price=120），
         # 否则笔记刷出来买不起。金币读得到时，任何有价格的商品买了会跌破底线就不买。
         # 0 元馈赠不花钱，永远放行；读不到金币时不敢乱花，跳过付费项。
-        keep = int(cfg.get("keep_gold", self.GOLD_KEEP))
+        # 本轮已经拿到笔记 → 不用再为笔记留底（玩家 2026-11-27）。
+        keep = 0 if getattr(self, "notes_done", False) else int(cfg.get("keep_gold", self.GOLD_KEEP))
         gold = getattr(self, "gold", None)
 
         # 紧急档：精力见底时先买饮料保命（否则今天直接练不动，牛奶再划算也没用）。
@@ -2580,8 +2584,9 @@ class AutoTask(MyBaseTask):
                                      f"→ 不敢花（要留 {keep} 给笔记）")
                     continue
                 if gold - price < keep:
+                    why = "笔记继承" if keep else "留底"
                     self.log_warning(f"「{o['name']}」{price} 元：金币 {gold}-{price}="
-                                     f"{gold - price} < 留底 {keep}（笔记继承）→ 不买")
+                                     f"{gold - price} < {why} {keep} → 不买")
                     continue
             return o, cat
         return None, "没有符合白名单的商品"
@@ -2594,6 +2599,8 @@ class AutoTask(MyBaseTask):
           ✅ 精力饮料（回精力，**只买 50 元以下**）
           ✅ 特训牛奶（减少训练精力消耗 → 等于多练一天，本作最划算的一件）
           ✅ 器材暴击道具（带负面效果，且**只有当天器材上有站人时才买**）
+          ✅ 摇摆专属饮料（两个推荐属性随机 +25~35，40 / 130 两档）
+          ✅ 器材手册（全部器材熟练度 +10，100 元）
           ✅ 金色教科书 / 金色属性秘籍（属性；单项 >1200 后收益减半，不买）
           ✅ 表情提升 5% 护符
           ✅ 老板的馈赠 / 馈赠+（标价 0，零用钱 +80，白拿）
@@ -3657,10 +3664,6 @@ class AutoTask(MyBaseTask):
         #   也有可能不出现，所以不是固定的。」
         # 所以「这一项场上摆了几张」是**真实差异**，必须按项算 —— 别再像上一版那样
         # 取整场统一值（那会把真实差异抹平）。
-        # 【2026-11-26 再纠正】但**档位（普/金/彩）不能按项比**：玩家说明那是
-        # 「局内熟练度提升后随机触发的暴击效果」，会随时间闪；5 个训练项是依次采的，
-        # 后采的项熟练度更高、更容易拍到金/彩，按档位计分 = 让采样顺序决定排名。
-        # 所以张数进排名、档位只观察（见 _score_item 里的 use_in_score）。
         # last_equip_count 只记整场最多张数，供商店「器材暴击只有器材上站人才买」判断。
         seen_eq = max([len(d.get("equips") or []) for d in scored] or [0])
         if seen_eq:
@@ -3671,17 +3674,15 @@ class AutoTask(MyBaseTask):
         n_color = sum(1 for d in scored for e in (d.get("equips") or []) if e == "彩")
         n_gold = sum(1 for d in scored for e in (d.get("equips") or []) if e == "金")
         n_plain = sum(1 for d in scored for e in (d.get("equips") or []) if e in ("普", "无"))
-        # 【2026-11-27】这行**每轮都打**，哪怕一张暴击都没有 —— 否则「没识别到」和
-        # 「识别了但本局没暴击」在日志里长一样，没法核对器材暴击有没有被认出来。
+        # 这行每轮都打，哪怕一张暴击都没有 —— 否则「没识别到」和「本局没暴击」在日志里长一样。
         if seen_eq:
-            use_tier = bool((cfg.get("equipment_tier") or {}).get("use_in_score", False))
             hits = " ".join(f"{d['row']['t']}:{'+'.join(e for e in (d.get('equips') or []) if e in ('金', '彩'))}"
                             for d in scored
                             if any(e in ("金", "彩") for e in (d.get("equips") or [])))
-            self.log_info(f"器材暴击（正规叫法；局内熟练度触发，瞬时状态）："
+            self.log_info(f"器材暴击（局内熟练度触发，出现后持续显示）："
                           f"金 {n_gold} 张 / 彩 {n_color} 张 / 未暴击 {n_plain} 张"
                           + (f"　见：{hits}" if hits else "　本帧没拍到暴击")
-                          + ("→ 按档位计分" if use_tier else "→ 不参与排名，只记录"))
+                          + "→ 按档位计分")
 
 
         usable = [d for d in scored if d["valid"]]
@@ -4306,12 +4307,9 @@ class AutoTask(MyBaseTask):
 
         现在参与计分的信号有四个：
           1. 场上出场队友数（含经理、含主训本人）  ← 每个 +teammate 分
-          2. 器材卡**张数** × equipment（0.5/张）
-             ⚠️ 器材是**按训练项**变的（玩家 2026-11-26：「开局先选好五个，训练过程中
-                可能分布在各个不同的训练项里，也可能不出现」），所以张数进排名是合理的。
-             ⚠️ 金 / 彩 光效**不进排名**（玩家 2026-11-26 定论）：那是「局内熟练度
-                提升后随机触发的暴击效果」，是随时间闪的事件，不是器材固有品质。
-                按档位分会让「最后采的那个训练项」白占便宜（熟练度最高），见下方注释。
+          2. 器材卡：每张按档位计（普 0.5 / 金 1.0 / 彩 1.5）
+             器材按训练项分布（开局选 5 件，训练中分布在不同项，也可能不出现），
+             档位是局内熟练度提升后的暴击光效 —— 暴击项收益更高，所以按档位计分。
           3. 失败率（失败 = 白扔体力）→ 整包乘法打折
           4. 训练项等级 Lv.1/Lv.2/MAX ← 只记录，**不计分**（玩家口径）
 
@@ -4329,25 +4327,14 @@ class AutoTask(MyBaseTask):
         mgr_names = set(cfg.get("manager_names") or [])
         base = sum(mgr_w if m in mgr_names else teammate_w for m in mates)
 
-        # 器材：训练项页中场摆着的 1~5 张支援卡。
-        #   玩家 2026-11-26 定论：「随着训练，在局内器材的熟练度会提升，
-        #   就会有几率变成金色和彩色的暴击效果。」
-        #   → 金 / 彩 不是器材固有品质，是**局内熟练度触发的随机暴击光效**，
-        #     同一件器材会随时间在 普 / 金 / 彩 之间来回闪。
-        #   所以默认 **按张数计分**（equipment_tier.use_in_score=false）：
-        #     ① 暴击是随机事件，单帧拍到哪一档只是抽样，不代表这项值多少分；
-        #     ② 5 个训练项是依次采的，熟练度一路上涨，按档位计分等于给
-        #        「最后采的那项」白送 0.5~1.0 分 —— 这是测量顺序造成的假优势。
-        #   档位仍然读、仍然打日志，用来观察本局熟练度涨到哪了；只是不进排名。
-        #   想把档位计分打开：strategy.yaml → equipment_tier.use_in_score: true。
+        # 器材：训练项页中场摆着的 1~5 张支援卡，按档位计分。
+        #   档位 = 熟练度提升后几率的暴击光效（普=未暴击 / 金 / 彩），出现后持续显示。
+        #   暴击了这一项的收益更高，所以这里直接按档位加分（配置 equipment_tier）。
         if equips:
             tbl = cfg.get("equipment_tier") or {}
             base_card = float(cfg.get("equipment", 0.5))
-            if bool(tbl.get("use_in_score", False)):
-                for g in equips:
-                    base += float(tbl.get(g, base_card))
-            else:
-                base += len(equips) * base_card
+            for g in equips:
+                base += float(tbl.get(g, base_card))
 
         lv_table = cfg.get("level_bonus") or {}
         key = "MAX" if (level or "").upper().startswith("MAX") else ""

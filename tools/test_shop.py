@@ -79,11 +79,12 @@ Stub.GOLD_KEEP = AutoTask.GOLD_KEEP
 import copy
 
 
-def plan(goods, stamina=80, equip=0, gold=500, enable=None):
-    """enable: 要临时打开的白名单类别（如 ['stat','crit']），用于测算法本身。"""
+def plan(goods, stamina=80, equip=0, gold=500, enable=None, notes=False):
+    """enable: 要临时打开的白名单类别（如 ['stat','crit']）；notes: 本轮笔记已拿到。"""
     Stub.stamina = stamina
     Stub.last_equip_count = equip
     Stub.gold = gold
+    Stub.notes_done = notes
     s = Stub()
     cfg = copy.deepcopy(s._tuning().get("shop") or {})
     for cat in (enable or []):
@@ -124,7 +125,7 @@ def _():
 @case("精力饮料 130 元 > 上限 50 → 跳过（wiki：只买 50 以下）")
 def _():
     name, why, _ = plan([
-        ("摇摆专属饮料++", 420, 420, 130),
+        ("特调专属饮料", 420, 420, 130),
     ], stamina=20)
     assert name is None, (name, why)
 
@@ -199,6 +200,43 @@ def _():
 def _():
     name, _, _ = plan([("老板的馈赠+", 420, 420, 0)], gold=0)
     assert name == "老板的馈赠+", name
+
+
+@case("摇摆专属饮料 130 元 → 买（跟精力饮料区分开）")
+def _():
+    name, why, offers = plan([("摇摆专属饮料++", 420, 420, 130)], stamina=130)
+    assert name == "摇摆专属饮料++", (name, why, [(o["name"], o["kind"]) for o in offers])
+    assert [o["kind"] for o in offers] == ["sway"], offers
+
+
+@case("摇摆专属饮料 40 元（低档）也能买")
+def _():
+    name, _, _ = plan([("摇摆专属饮料", 420, 420, 40)], stamina=130)
+    assert name == "摇摆专属饮料", name
+
+
+@case("金币 200 买 130 摇摆 → 剩 70 < 120，不买")
+def _():
+    name, why, _ = plan([("摇摆专属饮料++", 420, 420, 130)], stamina=130, gold=200)
+    assert name is None, (name, why)
+
+
+@case("笔记已拿到 → 不留 120，金币 130 正好能买摇摆")
+def _():
+    name, why, _ = plan([("摇摆专属饮料++", 420, 420, 130)], stamina=130, gold=130, notes=True)
+    assert name == "摇摆专属饮料++", (name, why)
+
+
+@case("器材手册 100 元 → 买")
+def _():
+    name, _, offers = plan([("器材手册+", 420, 420, 100)], stamina=130)
+    assert name == "器材手册+", (name, [(o["name"], o["kind"]) for o in offers])
+
+
+@case("器材手册 100 元、金币 200 → 剩 100 < 120，不买")
+def _():
+    name, why, _ = plan([("器材手册+", 420, 420, 100)], stamina=130, gold=200)
+    assert name is None, (name, why)
 
 
 @case("金币读不到(None)：付费项不买，0元仍买")

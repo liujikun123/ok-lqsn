@@ -63,29 +63,15 @@ def main():
     allok &= check("2 队友 40%失败 → ×0.6", round(s._score_item(["a", "b"], "LV.1", 40, CFG), 3), 1.2)
     allok &= check("3 队友 50%失败 → ×0.5", round(s._score_item(["a", "b", "c"], "LV.2", 50, CFG), 3), 1.5)
 
-    print("--- 器材计分：use_in_score=true 时按暴击档位（玩家：器材 0.5 / 金 1 / 彩 1.5）---")
-    TIER_CFG = dict(CFG, equipment_tier={"use_in_score": True, "金": 1.0, "彩": 1.5, "无": 0.5})
-    allok &= check("0 队友 + 1 张金卡", round(s._score_item([], "LV.1", 0, TIER_CFG, ["金"]), 3), 1.0)
-    allok &= check("0 队友 + 1 张彩卡", round(s._score_item([], "LV.1", 0, TIER_CFG, ["彩"]), 3), 1.5)
-    allok &= check("0 队友 + 1 张普通卡", round(s._score_item([], "LV.1", 0, TIER_CFG, ["无"]), 3), 0.5)
-    allok &= check("1 队友 + 2 张金卡", round(s._score_item(["a"], "LV.1", 0, TIER_CFG, ["金", "金"]), 3), 3.0)
+    print("--- 器材计分：按暴击档位（玩家：普 0.5 / 金 1 / 彩 1.5）---")
+    allok &= check("0 队友 + 1 张金卡", round(s._score_item([], "LV.1", 0, CFG, ["金"]), 3), 1.0)
+    allok &= check("0 队友 + 1 张彩卡", round(s._score_item([], "LV.1", 0, CFG, ["彩"]), 3), 1.5)
+    allok &= check("0 队友 + 1 张普通卡", round(s._score_item([], "LV.1", 0, CFG, ["普"]), 3), 0.5)
+    allok &= check("1 队友 + 2 张金卡", round(s._score_item(["a"], "LV.1", 0, CFG, ["金", "金"]), 3), 3.0)
     allok &= check("1 队友 + 1 金 1 彩 50%失败 → (1+1+1.5)×0.5",
-                   round(s._score_item(["a"], "LV.1", 50, TIER_CFG, ["金", "彩"]), 3), 1.75)
+                   round(s._score_item(["a"], "LV.1", 50, CFG, ["金", "彩"]), 3), 1.75)
+    allok &= check("2 普 1 彩 = 0.5+0.5+1.5", round(s._score_item([], "LV.1", 0, CFG, ["普", "普", "彩"]), 3), 2.5)
     allok &= check("器材传 None 不炸", round(s._score_item(["a"], "LV.1", 0, CFG, None), 3), 1.0)
-
-    # 玩家 2026-11-26 定论：金/彩 是「局内熟练度触发、有几率出现的暴击效果」，
-    # 是随时间闪的，不是器材品质。按档位分会让「最后采到的训练项」白占便宜
-    # （熟练度最高 → 更容易暴击），所以默认不计档位，只按张数算。
-    print("--- 器材计分：默认（use_in_score=false）暴击档位不影响分数 ---")
-    PLAIN = dict(CFG, equipment_tier={"use_in_score": False, "金": 1.0, "彩": 1.5, "无": 0.5})
-    base_one = round(s._score_item([], "LV.1", 0, PLAIN, ["无"]), 3)
-    for g in ("普", "金", "彩", "无"):
-        allok &= check(f"1 张「{g}」都只算 {base_one:g} 分（暴击不进排名）",
-                       round(s._score_item([], "LV.1", 0, PLAIN, [g]), 3), base_one)
-    allok &= check("2 张卡（1 彩 1 金）= 2 × 0.5 = 1.0（仍按张数）",
-                   round(s._score_item([], "LV.1", 0, PLAIN, ["彩", "金"]), 3), 1.0)
-    allok &= check("不配 use_in_score 键 = 默认不计档位（老配置兼容）",
-                   round(s._score_item([], "LV.1", 0, dict(CFG, equipment_tier={"金": 1.0}), ["金"]), 3), 0.5)
 
     print("--- 高风险规则：失败率全部 >30 且商店无精力药 → 改练意识 ---")
     risky = [item("投射", 2, "LV.1", 45), item("意识", 1, "LV.1", 35)]
