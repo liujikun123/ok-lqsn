@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """商店「上新」角标识别自测（离线，不需要游戏在跑）。
 
-玩家口径：商店不按周刷新，上新时图标上会挂「NEW」角标。
-一屏可能同时有好几个 NEW（活动 / 商城 / 飞跃计划），所以只认**商店正上方**那个。
+玩家口径：商店不按周刷新（局内商店页底部是「上新时间 N天后」倒计时），
+上新时**局内每日页**的商店图标会挂角标，OCR 能读到。
+位置约束还没用局内真实样本校准，故意留宽；跑一轮看日志再收紧。
 跑法： ../ok-bsg/.venv/Scripts/python.exe tools/test_shop_new.py
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import numpy as np  # noqa: E402
 
 from src.tasks.AutoTask import AutoTask  # noqa: E402
 
@@ -31,15 +30,8 @@ def it(t, x, y, h=30):
     return {"t": t, "cx": x, "cy": y, "b": Box(h)}
 
 
-# 实机坐标基准（1600x900 帧）：商店按钮 @(1470,195)，角标在它正上方约 53px
-SHOP = it("商店", 1470, 195)
-
-
-def frame_with_green(x1, y1, x2, y2):
-    f = np.zeros((900, 1600, 3), dtype=np.uint8)
-    f[:] = 40
-    f[y1:y2, x1:x2] = (70, 220, 120)   # BGR：亮绿（角标色）
-    return f
+# 商店按钮坐标基准（局内每日页待校准，这里取日志里出现过的 (1469,195)）
+SHOP = it("商店", 1469, 195)
 
 
 def badge(items, frame=None):
@@ -75,27 +67,21 @@ def _():
         assert badge(items) == "ocr", (t, badge(items))
 
 
-@case("实机截图里「活动」的 NEW(1247,118) 不算")
+@case("横向差 3.5 个字宽（别的图标上的 NEW）不算")
 def _():
-    items = [SHOP, it("NEW", 1247, 118)]
-    assert badge(items) is None, badge(items)
-
-
-@case("实机截图里「商城」的 NEW(1549,118) 不算（离商店 80px）")
-def _():
-    items = [SHOP, it("NEW", 1549, 118)]
+    items = [SHOP, it("NEW", 1469 - 105, 118)]
     assert badge(items) is None, badge(items)
 
 
 @case("商店下方的 NEW 不算")
 def _():
-    items = [SHOP, it("NEW", 1470, 250)]
+    items = [SHOP, it("NEW", 1469, 250)]
     assert badge(items) is None, badge(items)
 
 
 @case("没有 NEW → 不算")
 def _():
-    assert badge([SHOP, it("任务", 1247, 195)]) is None
+    assert badge([SHOP, it("任务", 1469, 118)]) is None
 
 
 def main():

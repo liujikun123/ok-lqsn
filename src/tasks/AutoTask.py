@@ -2223,13 +2223,12 @@ class AutoTask(MyBaseTask):
     def _shop_new_badge(self, items, frame=None, shop=None):
         """商店图标上方有没有「NEW」角标 = 这家店上新了。
 
-        玩家 2026-11-27：商店**不是**一周刷一次，上新时图标会变（角标）。
-        实机截图（1600x900）量出来的事实：
-          * 角标是**橙色**小标签，白字 NEW，挂在图标右上方；
-          * 一屏经常同时有 2~3 个（活动 / 商城 / 飞跃计划），
-            商城那个离商店只有 ~80px —— 不按位置绑定就会天天误判成上新。
-        所以只认「商店正上方、离得够近」的那个：
-            dy ∈ (-3.2h, -0.9h)、|dx| ≤ 1.7h（h = 「商店」文字框高度）
+        玩家 2026-11-27：商店**不是**一周刷一次（局内商店页底部是「上新时间 N天后」
+        的倒计时，2~7 天不等，不跟周对齐），上新时图标会变（角标，OCR 能读到）。
+
+        ⚠️ 位置约束**还没用局内每日页的真实样本校准过**：目前按「商店文字框上方
+        0.5~4 个字高、左右 2.5 个字宽」找 NEW，并在日志里打出所有候选坐标，
+        跑一轮就能看出真实偏移再收紧。
         OCR 常把 NEW 读成 FNEW / OA / SOA，同位置出现 2~4 个字母也算。
         """
         if shop is None and frame is not None:
@@ -2237,18 +2236,26 @@ class AutoTask(MyBaseTask):
         if not shop:
             return None
         hh = max(float(shop["b"].height), 8.0)
+        near = []
         for it in items:
             t = (it["t"] or "").upper().replace(" ", "")
             if not t:
                 continue
             dy = it["cy"] - shop["cy"]
-            if not (-3.2 * hh < dy < -0.9 * hh):
+            if not (-4.0 * hh < dy < -0.5 * hh):
                 continue
-            if abs(it["cx"] - shop["cx"]) > 1.7 * hh:
+            if abs(it["cx"] - shop["cx"]) > 2.5 * hh:
                 continue
+            near.append(f"{it['t']}@({int(it['cx'])},{int(it['cy'])})")
             if re.search(r"N\s*E\s*W", t) or (2 <= len(t) <= 4
                                              and sum(c in "NEWSOA1" for c in t) >= 2):
+                self.log_info(f"商店上方候选「{it['t']}」@({int(it['cx'])},{int(it['cy'])})"
+                              f"｜商店@({int(shop['cx'])},{int(shop['cy'])}) → 判定为上新")
                 return "ocr"
+        if near and getattr(self, "_shop_new_near_at", 0) + 120 < time.time():
+            self._shop_new_near_at = time.time()
+            self.log_info(f"商店上方候选（未判成 NEW）：{near}"
+                          f"｜商店@({int(shop['cx'])},{int(shop['cy'])})")
         return None
 
     def _want_shop(self, items, frame=None, shop=None):
