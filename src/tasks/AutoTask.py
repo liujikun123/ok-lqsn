@@ -156,7 +156,7 @@ class AutoTask(MyBaseTask):
             "商店自动购买": True,
             # ↑ 打开不等于乱买：只买 0 元红包 + 精力低于阈值时的精力药，
             #   具体见 _do_shop 与 strategy.yaml 的 tuning.shop。
-            "未知页面兜底": "点屏幕中间",
+            "未知页面兜底": "点右下角",
             "排除地点": "游戏厅",
             "小游戏处理": "放弃",
             # 局内「精力」（顶栏 ⚡ a/130）：训练消耗它，低于这个值就不练了。
@@ -230,6 +230,12 @@ class AutoTask(MyBaseTask):
         self.shop_has_stamina = None
         self.shop_bought = 0
         self.shop_bought_trip = 0        # 本次进店买了几件（每次进店清零）
+        # 本次进店已经买过的类别。精力药/牛奶只买第一件：买完顶栏精力不一定立刻刷新，
+        # 旧值会让下一轮又判成「精力见底」重复买（2026-11-28 周六 7→47 还接着买第二瓶）。
+        self.shop_bought_cats = set()
+        # 本次进店每个商品名试过几次。点开详情面板对不上名字时记为失败，试满 2 次就跳过 ——
+        # 防止「白神的馈赠」这种 OCR 定位歪了的情况反复点同一张卡（2026-11-28 实测连点 4 次）。
+        self.shop_tried_names = {}
         # 进店当天是星期几（1~7）：周六不囤精力药，商店页本身读不到星期X
         self.shop_weekday = None
         # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
@@ -655,7 +661,34 @@ class AutoTask(MyBaseTask):
         self._ensure_foreground()
         return super().send_key(*args, **kwargs)
 
+    def _wheel(self, rx, ry, notches):
+        """在窗口相对位置滚轮。notches > 0 = 往下翻（看下面还没露出来的商品）。
+
+        2026-11-27 录制确认：商店货架、选人/选笔记/选器材的卡片列表都是 ScrollRect，
+        滚轮和拖拽都能滚。滚轮每次固定一格、没有惯性残余，比拖拽好控制 ——
+        拖拽松手后还会惯性滑一段，落点会差半行，滚轮不会。
+        """
+        h = self._game_hwnd()
+        if not h:
+            return False
+        self._ensure_foreground()
+        try:
+            import win32api
+            import win32con
+            import win32gui
+            _, _, cw, ch = win32gui.GetClientRect(h)
+            sx, sy = win32gui.ClientToScreen(h, (int(cw * rx), int(ch * ry)))
+            win32api.SetCursorPos((sx, sy))
+            time.sleep(0.12)
+            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -120 * int(notches), 0)
+            time.sleep(0.35)
+            return True
+        except Exception as e:
+            self.log_warning(f"滚轮失败：{e}")
+            return False
+
     def _click_item(self, it, why=""):
+
         """点一个文字框：坐标计算交给框架 click_box（它内部会调我们的 click 覆盖层）。"""
         self.log_info(f"点击「{it['t']}」@({int(it['cx'])},{int(it['cy'])}) {why}")
         b = it.get("b")
@@ -1520,8 +1553,21 @@ class AutoTask(MyBaseTask):
             return "出行"
         if any(t.startswith("前往") for t in texts):
             return "前往"
+        # 周四训练后的抽奖第一步：**选店铺**。
+        # 2026-11-28 09:22 实跑抓到的原文：标题「请选择要前往的店铺」，
+        # 三家店「风格过时的杂货铺 / 设计时尚的百货商场 / 装修奢华的玩偶店」，
+        # 顶栏又带着「第2周 星期四 精力 69/130」→ 被 12.1 的三件套判成每日页，
+        # 在页面中心连点 15 步（每点一次都算"没有按钮"），整次抽奖白扔。
+        # 这页没有任何行动按钮，靠店名/标题才认得出，必须排在每日页之前。
+        if "请选择要前往的店铺" in joined:
+            return "选店铺"
         if "幸运大抽奖" in joined:
             return "抽奖"
+        # 抽奖幸运转盘（玩家 2026-11-28）。实拍：标题「抽奖啦！」，中间一个大转盘，
+        # 四个扇区是「一等奖/二等奖/三等奖/特等奖」，指针在正上方。
+        # 以前落到未知页兜底；现在按转盘页处理：点「转一转」，没有就点转盘中心。
+        if "抽奖啦" in joined:
+            return "抽奖转盘"
         # 10. 训练剧本（这页也有 图鉴/成就 图标，会被大厅抢走）
         if has("训练剧本") or (has("启程") and has("托管")) or has("大师模式"):
             return "训练剧本"
@@ -1691,12 +1737,55 @@ class AutoTask(MyBaseTask):
         # 已经回到每日页 → 探笔记流程结束，清掉「还剩几层要退」的状态
         self.trip_probe_back = 0
 
+        # 刚进每日页那一帧常常还没淡入完，「第N周 / 星期X」读不全。
+        # 星期几只影响「周日不进店」「周六不囤药」和按天记账的精度（不是进店的闸门，
+        # 见 `_shop_day_key`），但读全了判断更准，所以还是补抓两帧。
+        _w, _d = self._read_week(items)
+        if _w and _d:
+            self._daily_reocr = 0
+            self._daily_nodate_warned = False
+        elif getattr(self, "_daily_reocr", 0) < 3:
+            self._daily_reocr = getattr(self, "_daily_reocr", 0) + 1
+            self.sleep(0.5)
+            f2 = self._frame()
+            if f2 is not None:
+                items2 = self._texts(f2)
+                w2, d2 = self._read_week(items2)
+                if w2 and d2:
+                    frame, items = f2, items2
+                    self._daily_reocr = 0
+                    self.log_info("每日页首帧没读全周次 → 重抓一帧补上")
+        elif not getattr(self, "_daily_nodate_warned", False):
+            # 3 次都读不全别静默：存图，事后能复盘是不是 HUD 被动画盖住了
+            self._daily_nodate_warned = True
+            self.log_warning(f"每日页连续 3 次没读到完整「第N周 星期X」"
+                             f"（读到 week={_w} day={_d}）→ 商店按降级键记账，照常判断")
+            if frame is not None:
+                self._shot(frame, "daily_nodate")
+
         # 二次确认弹窗（休息/训练前会弹「…是否要休息？」+ 取消/确认）
         ok = self._find(items, ["确认"], exact=True)
         cancel = self._find(items, ["取消"], exact=True)
         if ok and cancel:
             self._click_item(ok, "[确认弹窗]")
             return True
+
+        # 商店必须排在「比赛」之前：比赛日点完就进赛前准备了，永远轮不到商店。
+        # 玩家 2026-11-28：「第 7 周第 3 天商店上新，你没进去」—— 那天正是比赛日。
+        shop = self._shop_button(items, frame)
+        # 商店（玩家 2026-11-23：只买 0 元 + 精力 <50 买精力药）
+        #   以前这里没接入口，整轮一次店都没进过 → 精力药从来没买过。
+        #   放在训练前：先把能补的精力补上，再决定练什么。
+        if shop and self._want_shop(items, frame, shop):
+            self.shop_day = self._shop_day_key(items)
+            self.shop_week = (self.shop_day or "").split("-")[0] or None
+            self._click_btn(shop, f"[进商店 精力{self.stamina} 看货架]", frame)
+            return True
+        if not shop:
+            day = self._day_key(items) or ""
+            if self.shop_week != day.split("-")[0]:
+                self.log_info(f"每日页没找到「商店」按钮（本周期还没看过货架）"
+                              f"｜文字 {[it['t'] for it in items][:12]}")
 
         match = self._btn_in_area(items, ["比赛"], frame)
         if match:
@@ -1720,21 +1809,6 @@ class AutoTask(MyBaseTask):
         train = self._btn_in_area(items, ["训练"], frame)
         rest = self._btn_in_area(items, ["休息"], frame)
         go = self._btn_in_area(items, ["出行"], frame)
-        shop = self._shop_button(items, frame)
-
-        # 商店（玩家 2026-11-23：只买 0 元 + 精力 <50 买精力药）
-        #   以前这里没接入口，整轮一次店都没进过 → 精力药从来没买过。
-        #   放在训练前：先把能补的精力补上，再决定练什么。
-        if shop and self._want_shop(items, frame, shop):
-            self.shop_day = self._day_key(items)
-            self.shop_week = (self.shop_day or "").split("-")[0] or None
-            self._click_btn(shop, f"[进商店 精力{self.stamina} 看货架]", frame)
-            return True
-        if not shop:
-            day = self._day_key(items) or ""
-            if self.shop_week != day.split("-")[0]:
-                self.log_info(f"每日页没找到「商店」按钮（本周期还没看过货架）"
-                              f"｜文字 {[it['t'] for it in items][:12]}")
 
         # 探笔记：2026-11-23 22:14 玩家反馈「周日没有检查笔记，直接去公园了」。
         #   旧逻辑把探笔记塞在「有训练且精力够」分支里，周日没有训练（休息日），
@@ -1815,28 +1889,459 @@ class AutoTask(MyBaseTask):
         return True
 
     def _do_choice(self, items, frame):
-        """居中竖排选项页：选一个。没有偏好就从上往下依次试（点过的下次换下一个）。"""
+        """居中竖排选项页：**按内容优先级选**，不按位置轮。
+
+        玩家 2026-11-28：「现在这页是 精力恢复 / 属性上限 / 资金援助 三选一，
+        就按我们那些优先级来选，不是默认第一个」。
+        以前是 `choice_idx` 从上往下轮着点 —— 等于永远先选最上面那个。
+        现在先排序再点；同一页点了没反应（下一帧还停在这一页）才降级到下一名。
+        """
+        self._shot(frame, "choice") if frame is not None else None
         pills = self._pills(items, frame)
         if not pills:
+            # 文字一个都没读出来（随机事件/随机角色的选项）→ 退回图形找框
+            if self._do_pick_by_boxes(frame, tag="选项"):
+                return True
             return self._do_story(items, frame)
-        idx = self.choice_idx % len(pills)
-        it = pills[idx]
-        self._click_item(it, f"[选项 {idx + 1}/{len(pills)}]")
+        ranked = self._rank_options(pills)
+        idx = min(self.choice_idx, len(ranked) - 1)   # 上一名点了没反应 → 换下一名
+        it, why = ranked[idx]
         self.choice_idx = idx + 1
+        self._click_item(it, f"[选项 {idx + 1}/{len(ranked)} {why}]「{it['t']}」")
+        return True
+
+    def _rank_options(self, pills):
+        """把一页选项按收益从高到低排好，每项附一句人话理由。
+
+        只有一份优先级：`event.priority`（笔记 > 技能 > 精力 > 属性 > 零用钱）。
+        以前这里另开了一张「无数值 = 属性 > 精力 > 金钱」的表，跟上面这份自相矛盾，
+        而且找不到依据 —— 玩家 2026-11-28 直接否掉：「为什么属性大于精力？没道理」。
+        现在统一成一份，唯一的特例是**精力已经满了**（补了也白补）时跳过精力这档。
+
+        带数值的选项还要按缺口截断：只差 21 时 +70 和 +30 都只吃 21，
+        这时带属性的 +30 更值（`_reward_key` 里做的）。
+        """
+        cfg = self._event_cfg()
+        prio = [str(x) for x in (cfg.get("priority") or
+                                 ["笔记", "技能", "精力", "属性", "零用钱"])]
+        keys = {id(p): self._reward_key(p["t"]) for p in pills}
+        if any(k != (0, 0, 0, 0) for k in keys.values()) \
+                and any(re.search(r"\d", p["t"] or "") for p in pills):
+            def label(p):
+                t = p["t"] or ""
+                name = next((n for n in prio
+                             if any(k in t for k in self._keywords(n))), "其他")
+                eff, at, _ = keys[id(p)][1:]
+                if eff:
+                    return f"{name}+{eff}"
+                if at:
+                    return f"{name}+{at}"
+                return name
+
+            return [(p, label(p)) for p in
+                    sorted(pills, key=lambda x: -self._key_value(keys[id(x)]))]
+
+        gap = self._gap()
+
+        def rank(p):
+            t = p["t"] or ""
+            for i, name in enumerate(prio):
+                if not any(k in t for k in self._keywords(name)):
+                    continue
+                if name == "精力" and gap <= 0:
+                    continue          # 精力已满：补了也是溢出，往下看
+                return i
+            return len(prio)          # 认不出的排最后
+
+        ranked = sorted(pills, key=rank)
+        if rank(ranked[0]) < len(prio):
+            return [(p, f"{prio[rank(p)]}优先" if rank(p) < len(prio) else "认不出")
+                    for p in ranked]
+
+        # ③ 什么都认不出 → 位置（竖排最上 / 横排最右）
+        h = max(p["cy"] for p in pills) - min(p["cy"] for p in pills)
+        w = max(p["cx"] for p in pills) - min(p["cx"] for p in pills)
+        horiz = w > h * 2
+        seq = sorted(pills, key=lambda p: -p["cx"]) if horiz \
+            else sorted(pills, key=lambda p: p["cy"])
+        return [(p, "横排最右" if horiz else "竖排最上") for p in seq]
+
+    def _do_shop_pick(self, items, frame):
+        """周四抽奖第一步「请选择要前往的店铺」：三家店横排 + 底部「确定」。
+
+        玩家 2026-11-28：「抽奖啦的前一页有三个选项，根据你选的不同它的转盘会不一样」。
+        规则跟其它不明选项页一致：**横排选最右、竖排选最上**，不看店名内容。
+
+        实拍（092611_shop_choice.png）：
+          · 三张卡横排：风格过时的杂货铺 / 设计时尚的百货商场 / 装修奢华的玩偶店
+          · 卡片下方标价 0 / 5 / 10，选中的那张亮黄角标
+          · 底部一个黄色「确定」——**点完店不会自动走，必须再点确定**
+
+        降级链（玩家 2026-11-28）：「这种左中右排列的，如果点了右边点不了确定、
+        或者点右边点确定之后没反应，再试一下点中间点确定，然后点左边点确定」。
+        所以做成三步状态机：
+            pick（按 cx 从右往左取第 N 家）→ confirm（点确定）→
+            若下一步还停在选店铺页 = 这家没生效 → N+1 换下一家，最多试完三家。
+        """
+        if frame is not None:
+            self._shot(frame, "shop_choice")
+        step = getattr(self, "_shop_step", "pick")
+        tries = getattr(self, "_shop_try", 0)
+
+        # 上一步点过「确定」，这一帧还停在选店铺页 → 那家没生效，退到下一家
+        if step == "verify":
+            self._shop_try = tries + 1
+            self._shop_step = "pick"
+            self.log_warning(f"[选店铺] 第 {tries + 1} 家点「确定」没反应 → "
+                             f"降级换第 {tries + 2} 家重试")
+            step = "pick"
+            tries += 1
+
+        if step == "confirm":
+            it = self._find(items, ["确定", "出发", "前往"], exact=True)
+            self._shop_step = "verify"
+            if it:
+                self._click_item(it, "[选店铺-确定]")
+            else:
+                self.log_warning("选完店没读到「确定」→ 点底部中间按钮位置")
+                self.click_relative(0.5, 0.895)
+            return True
+
+        # 店名比其他文字稳（标题/描述都在，但只有店名带「铺/商场/店」）
+        shop_words = ("杂货铺", "百货", "商场", "玩偶店", "超市", "小店",
+                      "杂货店", "商店", "道具屋", "专卖店", "铺子")
+        names = [it for it in items
+                 if any(w in it["t"] for w in shop_words) and 2 <= len(it["t"]) <= 14]
+        if names:
+            names.sort(key=lambda i: -i["cx"])       # 从右往左排
+            if tries >= len(names):
+                # 右→中→左 全试过还是走不了，别再死磕，点右下角退出这页
+                self.log_warning(f"[选店铺] {len(names)} 家全试过都没生效 → 点右下角退出")
+                self._shop_step = "pick"
+                self._shop_try = 0
+                self._click_corner()
+                return True
+            best = names[tries]
+            self._shop_step = "confirm"
+            self.log_info(f"[选店铺] 共 {len(names)} 家，按「右→中→左」取第 {tries + 1} 家"
+                          f"「{best['t']}」@({best['cx']:.0f},{best['cy']:.0f}) → 下一步点确定")
+            self._click_item(best, f"[选店铺-第{tries + 1}家]")
+            return True
+        # 认不出店名 → 图形兜底（横排最右 / 竖排最上）
+        if self._do_pick_by_boxes(frame, tag="选店铺"):
+            self._shop_step = "confirm"
+            return True
+        self.log_warning("选店铺页没认出店名也没框 → 点右下角推进（不点中心，别乱选）")
+        self._click_corner()
         return True
 
     def _do_wheel(self, items, frame):
-        """幸运大抽奖：点「转一转」。抽完会弹结果，交给下一轮判页处理。
+        """抽奖 / 转盘类页面：**结果是注定的，唯一目标是让画面往后走**。
 
-        实测（22:18）：事件选「热情答应（随机比赛技能）」之后进这一屏，
-        底部中间一个黄色「转一转」，点屏幕中间没用。
+        玩家 2026-11-28 两次澄清：
+          · 周四训练后的抽奖（抓娃娃那种）和技能转盘是两码事，但逻辑一样；
+          · 「你点什么和转盘结果无关，可能要点一下进入下一页就是」。
+        也就是说这页既不用选、也不用瞄准转盘圆心，只需要：
+            1. 有明确按钮（转一转 / 抽一次 / 领取 / 确定 / 继续）→ 点它；
+            2. 在播动画（读不到按钮）→ **只等不点**；
+            3. 等久了还没走 → 点右下角轻推一下，也不碰转盘中心。
+        以前「读不到按钮就点圆心」，等于每抽一次乱点三四下，纯属污染。
         """
-        it = self._find(items, ["转一转", "转一次"], exact=True) or self._find(items, ["转一转"])
-        if it:
-            self._click_item(it, "[抽奖-转一转]")
+        limit = int((self._tuning().get("wheel") or {}).get("wait_rounds") or 8)
+        # 1) 明确按钮：开抽 / 关结果 / 进下一页
+        btn = (self._find(items, ["转一转", "转一次", "抽一次", "抽一发", "开始抽奖"], exact=True)
+               or self._find(items, ["领取奖励", "领取", "确定", "继续", "下一步"], exact=True))
+        if btn:
+            self.wheel_spun = True
+            self.wheel_waits = 0
+            self._click_item(btn, f"[抽奖-{btn['t']}]")
             return True
-        self.log_info("没读到大转盘按钮，点底部中间的黄色按钮位置")
-        self.click_relative(0.49, 0.875)
+        # 2) 没有按钮 = 动画中，等
+        n = getattr(self, "wheel_waits", 0) + 1
+        self.wheel_waits = n
+        if frame is not None and n == 1:
+            self._shot(frame, "wheel")
+        if n <= limit:
+            self.log_info(f"[抽奖] 动画中，只等不点（{n}/{limit}）")
+            self.sleep(1.2)
+            return True
+        # 3) 等太久：右下角轻推，绝不点转盘中心
+        self.log_warning(f"[抽奖] 等了 {n} 步仍无按钮 → 点右下角轻推")
+        self._click_corner()
+        return True
+
+    def _do_lottery_pick(self, items, frame):
+        """抽奖的三选一：看不清是什么内容，按**位置**选（玩家 2026-11-28）。
+
+            左中右（横排）→ 选最右边那一个
+            上中下（竖排）→ 选最上面那一个
+
+        以前这页没人认识，落到未知页兜底乱点，等于每次都白抽。
+        """
+        self._shot(frame, "lottery_pick") if frame is not None else None
+        # 先靠图形找框（不读文字），找不到再用文字框的位置兜底
+        if self._do_pick_by_boxes(frame, tag="抽奖"):
+            return True
+        idx = self._pick_by_pos(items, frame)
+        if idx is None:
+            self.log_warning("抽奖三选一没认出三个卡片 → 按最右兜底点一下")
+            h, w = (frame.shape[0], frame.shape[1]) if frame is not None else (1080, 1920)
+            self.click(int(w * 0.80), int(h * 0.55))
+            return True
+        it, why = idx
+        self.log_info(f"[抽奖三选一] 按位置选（{why}）：「{it['t']}」"
+                      f"@({it['cx']},{it['cy']})")
+        self._click_item(it, f"[抽奖-{why}]")
+        return True
+
+    def _pick_by_pos(self, items, frame):
+        """在一堆不明所以的文字里挑出「三选一」并给出要点的那个。
+
+        返回 (item, 说明) 或 None。规则：
+          · 横排（三张卡左右并排）→ 取 cx 最大的那一组
+          · 竖排（三张卡上下叠着）→ 取 cy 最小的那一组
+        判断依据是**分组后的排布**，不依赖卡片上的文字内容。
+        """
+        if frame is None or not items:
+            return None
+        h = float(frame.shape[0])
+        skip = ("抽奖啦", "抽奖", "确定", "领取", "继续", "跳过", "关闭",
+                "比赛", "商店", "能力详情", "点击屏幕继续")
+        cand = []
+        for it in items:
+            t = (it["t"] or "").strip()
+            if len(t) < 2 or any(k in t for k in skip):
+                continue
+            if re.fullmatch(r"[\d\s\.\+\-%×xX〇一二三四五六七八九十]+", t):
+                continue                      # 纯数字/符号，是价格或数量
+            cand.append(it)
+        if len(cand) < 2:
+            return None
+
+        # 按 y 聚行：同行的框 cy 差不超过 6% 屏高
+        cand.sort(key=lambda it: it["cy"])
+        rows, cur = [], [cand[0]]
+        for it in cand[1:]:
+            if it["cy"] - cur[-1]["cy"] <= 0.06 * h:
+                cur.append(it)
+            else:
+                rows.append(cur)
+                cur = [it]
+        rows.append(cur)
+
+        wide = max(r["cx"] for r in cand) - min(r["cx"] for r in cand)
+        tall = max(r["cy"] for r in cand) - min(r["cy"] for r in cand)
+
+        # 横排：同一行里有 ≥3 个、且左右跨度明显大于上下
+        if len(rows) <= 2 and wide > tall * 0.8:
+            flat = max(rows, key=len)
+            if len(flat) >= 2:
+                best = max(flat, key=lambda i: i["cx"])
+                return best, "横排→选最右"
+        # 竖排：≥3 行、每行 1~2 个框，且上下跨度更大
+        if len(rows) >= 3 and tall >= wide * 0.8:
+            top = min(rows, key=lambda g: min(i["cy"] for i in g))
+            best = max(top, key=lambda i: i["cx"])
+            return best, "竖排→选最上"
+        # 兜底：按跨度决定方向
+        if wide > tall:
+            return max(cand, key=lambda i: i["cx"]), "跨度偏宽→选最右"
+        top = min(rows, key=lambda g: min(i["cy"] for i in g))
+        return max(top, key=lambda i: i["cx"]), "跨度偏高→选最上"
+
+    # ---------- 纯图形：找「几个选项卡」 ----------
+    CARD_ROI = (0.10, 0.18, 0.90, 0.82)   # 找卡片的范围：去掉顶栏 HUD、右上角图标、底部按钮
+
+    def _find_card_boxes(self, frame):
+        """不看文字，只看画面里能框出几个**大小相近、等距排开**的矩形。
+
+        玩家 2026-11-28：「未知的选项页必须靠图形识别知道有几个框、每个框在哪，
+        不能靠文字，因为每次随机事件不同角色，选项都不同」。
+
+        做法：ROI 内 Canny 边缘 → 闭运算把断边接成整框 → 找外轮廓 →
+        只留「够大、够方、轮廓填满度高」的 → 按面积取中间那撮（同尺寸）→
+        要求**成行或成列、间距相近**（选项列表一定等距，背景花纹/零散按钮不会）。
+        """
+        import cv2
+        import numpy as np
+        if frame is None:
+            return []
+        h, w = frame.shape[:2]
+        x1, y1 = int(self.CARD_ROI[0] * w), int(self.CARD_ROI[1] * h)
+        x2, y2 = int(self.CARD_ROI[2] * w), int(self.CARD_ROI[3] * h)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return []
+        g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        g = cv2.GaussianBlur(g, (5, 5), 0)
+        e = cv2.Canny(g, 40, 120)
+        e = cv2.morphologyEx(
+            e, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)), iterations=2)
+        cnts, _ = cv2.findContours(e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        rh, rw = g.shape
+        roi_area = float(rw * rh)
+        raw = []
+        for c in cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            a = float(bw * bh)
+            if not (roi_area * 0.012 <= a <= roi_area * 0.92):
+                continue
+            # Canny 出来的是「边线」，轮廓面积没有意义（空心框 fill 接近 0）。
+            # 改判「四条边上真的有边」，这才是矩形卡片该有的样子。
+            if self._frame_edge_score(e, (bx, by, bw, bh)) < 0.45:
+                continue
+            # 一排卡片常被边缘线连成一个大长条 → 按内部缝隙切开再看
+            for part in self._split_by_gaps(g, (bx, by, bw, bh)):
+                px, py, pw, ph = part
+                pa = float(pw * ph)
+                if not (roi_area * 0.012 <= pa <= roi_area * 0.50):
+                    continue
+                if not (0.32 <= pw / max(ph, 1) <= 6.0):
+                    continue
+                raw.append((px + x1, py + y1, pw, ph, pa))
+        if len(raw) < 2:
+            return []
+        med = float(np.median([r[4] for r in raw]))
+        same = sorted([r for r in raw if abs(r[4] - med) / med <= 0.35],
+                      key=lambda r: -r[4])[:4]
+        if len(same) < 2:
+            return []
+
+        def centers(bs, horiz):
+            # 横排按 x 排、竖排按 y 排，返回主轴中心与另一轴中心
+            if horiz:
+                return sorted([b[0] + b[2] / 2.0 for b in bs]), [b[1] + b[3] / 2.0 for b in bs]
+            return sorted([b[1] + b[3] / 2.0 for b in bs]), [b[0] + b[2] / 2.0 for b in bs]
+
+        def evenly(bs):
+            """同组框必须等距、等宽：max间距/min间距 < 2.2，宽度差 < 30%。"""
+            if len(bs) < 2:
+                return False
+            ws = [b[2] for b in bs]
+            if (max(ws) - min(ws)) / max(max(ws), 1) > 0.30:
+                return False
+            if len(bs) < 3:
+                return True
+            for horiz in (True, False):
+                main, _ = centers(bs, horiz)
+                gaps = [main[i + 1] - main[i] for i in range(len(main) - 1)]
+                if min(gaps) > 0 and max(gaps) / min(gaps) < 2.2:
+                    return True
+            return False
+
+        for horiz in (True, False):
+            main, cross = centers(same, horiz)
+            span_main, span_cross = main[-1] - main[0], max(cross) - min(cross)
+            if horiz:
+                ok_shape = span_cross < 0.14 * (y2 - y1) and span_main > 0.12 * (x2 - x1)
+            else:
+                ok_shape = span_cross < 0.14 * (x2 - x1) and span_main > 0.12 * (y2 - y1)
+            if ok_shape and evenly(same):
+                out = []
+                for b in same:
+                    out.append({"cx": b[0] + b[2] / 2.0, "cy": b[1] + b[3] / 2.0,
+                                "w": b[2], "h": b[3], "area": b[4], "horiz": horiz})
+                return out
+        return []
+
+    @staticmethod
+    def _frame_edge_score(edge_img, box, band=3):
+        """这个框的四条边上到底有没有线。返回四条边中最差那条的覆盖率（0~1）。
+
+        Canny 图里一张实心卡片只剩边线，所以不能看「轮廓面积」，
+        要看「上/下/左/右四条边是不是真的画着线」。
+        贴着 ROI 边界的边不算（卡片被截掉时那条边本来就没有线）。
+        """
+        x, y, w, h = box
+        if w < 8 or h < 8:
+            return 0.0
+        hh, ww = edge_img.shape[:2]
+        band = max(2, min(band, h // 4, w // 4))
+        sides = []
+        if y > 1:
+            sides.append(edge_img[y:y + band, x:x + w])
+        if y + h < hh - 1:
+            sides.append(edge_img[y + h - band:y + h, x:x + w])
+        if x > 1:
+            sides.append(edge_img[y:y + h, x:x + band])
+        if x + w < ww - 1:
+            sides.append(edge_img[y:y + h, x + w - band:x + w])
+        if not sides:
+            return 0.0
+        return min(float((s > 0).mean()) for s in sides)
+
+    @staticmethod
+    def _split_by_gaps(gray, box, min_frac=0.15):
+        """把一个「长条」候选按内部暗缝切成几块。
+
+        相邻卡片之间的背景缝在灰度投影上是一个低谷；被边缘线连成一排的三张卡，
+        外接矩形是一个宽条，切完就变回三张。返回 [(x, y, w, h)]（ROI 内坐标）。
+        """
+        import numpy as np
+        x, y, w, h = box
+        if w <= 2 or h <= 2:
+            return [box]
+        sub = gray[y:y + h, x:x + w]
+        if sub.size == 0:
+            return [box]
+        wide = w >= h
+        prof = sub.mean(axis=0 if wide else 1).astype(float)
+        n = len(prof)
+        if n < 12:
+            return [box]
+        lo, hi = float(prof.min()), float(prof.max())
+        if hi - lo < 8:                       # 没起伏 → 就是一块，别切
+            return [box]
+        thr = lo + (hi - lo) * 0.45
+        # 找连续「暗缝」段（比阈值低）
+        segs, start = [], None
+        for i, v in enumerate(prof):
+            if v <= thr and start is None:
+                start = i
+            elif v > thr and start is not None:
+                segs.append((start, i))
+                start = None
+        if start is not None:
+            segs.append((start, n))
+        # 只留「不在两端、且有点宽度」的缝
+        cuts = [(a, b) for a, b in segs if a > 0 and b < n and (b - a) >= max(3, int(n * 0.01))]
+        if not cuts:
+            return [box]
+        bounds, prev = [], 0
+        for a, b in cuts:
+            if a - prev > n * min_frac:
+                bounds.append((prev, a))
+            prev = b
+        if n - prev > n * min_frac:
+            bounds.append((prev, n))
+        if len(bounds) < 2:
+            return [box]
+        out = []
+        for a, b in bounds:
+            if wide:
+                out.append((x + a, y, b - a, h))
+            else:
+                out.append((x, y + a, w, b - a))
+        return out
+
+    def _pick_box_by_pos(self, boxes):
+        """图形框的位置规则：横排选最右、竖排选最上（玩家 2026-11-28）。"""
+        if boxes[0]["horiz"]:
+            return max(boxes, key=lambda b: b["cx"]), "横排→最右"
+        return min(boxes, key=lambda b: b["cy"]), "竖排→最上"
+
+    def _do_pick_by_boxes(self, frame, tag="选项"):
+        """认不出内容的三选一：靠图形找框，按位置点。返回 True=点了。"""
+        boxes = self._find_card_boxes(frame)
+        if len(boxes) < 2:
+            return False
+        box, why = self._pick_box_by_pos(boxes)
+        self._shot(frame, f"{tag}_box")
+        self.log_info(f"[图形{tag}] 认出 {len(boxes)} 个框"
+                      f"（{'横排' if boxes[0]['horiz'] else '竖排'}）→ {why}"
+                      f" @({box['cx']:.0f},{box['cy']:.0f})")
+        self.click(box["cx"], box["cy"])
         return True
 
     def _do_pretrain(self, items, frame):
@@ -2074,7 +2579,7 @@ class AutoTask(MyBaseTask):
         fallback = {"笔记": ("笔记",), "技能": ("技能", "专属", "绝技"),
                     "精力": ("精力",),
                     "属性": ("属性", "体能", "运控", "意识", "弹跳", "防守", "投射"),
-                    "零用钱": ("零用钱", "金钱", "金币")}
+                    "零用钱": ("零用钱", "金钱", "金币", "资金", "现金")}
         return list(fallback.get(tier_name, ()))
 
     def _tier_index(self, name):
@@ -2198,6 +2703,24 @@ class AutoTask(MyBaseTask):
         w, d = self._read_week(items)
         return f"{w}-{d}" if (w and d) else None
 
+    def _shop_day_key(self, items):
+        """商店的记账键：'第N周-星期X'；星期几读不到就退成 '第N周-?'，周次也读不到才用 '?'。
+
+        玩家 2026-11-28：「他不是根据上新这个字判断要不要进的吗？关星期几什么事啊？」
+
+        对 —— 进店只看两件事「精力 <50」「图标挂新品上市」，跟星期几无关。
+        星期几只做两件事：按天记账（一天最多进一次）、判「周日不进店」。
+        以前把 `_day_key()` 的结果当成了第一道闸门（None 就直接判不进店），
+        结果第 4 周星期一那帧只读到「第4周」、星期几丢了，整天的上新被这条闸门挡掉，
+        `_shop_new_badge()` 压根没机会执行。记账字段不该有否决权。
+        """
+        w, d = self._read_week(items)
+        if w and d:
+            return f"{w}-{d}"
+        if w:
+            return f"{w}-?"
+        return "?"
+
     def _goal_cfg(self):
         """玩家三条终局目标的配置（strategy.yaml → tuning.goal）。"""
         return self._tuning().get("goal") or {}
@@ -2291,35 +2814,65 @@ class AutoTask(MyBaseTask):
         shop_cfg = self._tuning().get("shop") or {}
         if not self.config.get("商店自动购买", True):
             return self._shop_verdict(items, False, "配置里关了「商店自动购买」")
-        day = self._day_key(items)
-        # 读不到「第N周-星期X」就没法记账，进去会每天反复进出 → 宁可不进。
-        if day is None:
-            return self._shop_verdict(items, False, "读不到「第N周-星期X」，没法按天记账")
+        # 记账键：星期几读不到只影响「一天最多进一次」的精度，**不影响要不要进**
+        # （玩家 2026-11-28：「关星期几什么事啊」，见 _shop_day_key 注释）
+        day = self._shop_day_key(items)
+        _, wd_read = self._read_week(items)
         if self.shop_day is not None and self.shop_day == day:
             return self._shop_verdict(items, False, "今天已经处理过（进过店，或按规则跳过）")
 
         # 玩家 2026-11-23 12:47：「周日就不要去商店了，周日能逛公园回复，
         # 再去商店买精力药不就溢出了」→ 周日（7）默认不进店。
-        _, wd = self._read_week(items)
-        if wd is None:
-            wd = self.weekday              # 这一帧没读到就用上一帧的结果，别留下周六的陈值
-        if wd is not None:
-            self.shop_weekday = wd         # 商店页顶栏不一定有「星期X」，先记下来
+        # 注意 self.weekday 每步都被当前帧覆盖（见主循环），所以这里读不到就是真读不到，
+        # 不存在「上一帧的值」可借；不知道星期几就当不知道，**不拿它拦进店**。
+        if wd_read is not None:
+            self.shop_weekday = wd_read   # 商店页顶栏不一定有「星期X」，先记下来
         skip_days = shop_cfg.get("skip_weekdays", [7])
-        if wd is not None and wd in [int(x) for x in skip_days]:
+        if wd_read is not None and wd_read in [int(x) for x in skip_days]:
             self.shop_day = day            # 记成今天已看过，免得每帧重复打日志
             return self._shop_verdict(items, False,
-                                      f"星期{wd} 不进店：这天靠公园回精力，买精力药会溢出")
+                                      f"星期{wd_read} 不进店：这天靠公园回精力，买精力药会溢出")
+
+        # 玩家 2026-11-28：第 7 周起是收尾期 —— 钱留着也没用了，属性道具能买就买。
+        # 「第 7 周第 1 天进一次，第 7 周第 3 天再进一次」，把能加属性的全买光。
+        end_week = int(shop_cfg.get("endgame_week", 7))
+        wk, _ = self._read_week(items)
+        if wk is not None and wk >= end_week:
+            force_days = [int(x) for x in (shop_cfg.get("endgame_days") or [1, 3])]
+            if wd_read is None or wd_read in force_days:
+                self.shop_bought_trip = 0
+                self.shop_bought_cats = set()
+                self.shop_tried_names = {}
+                return self._shop_verdict(
+                    items, True,
+                    f"第 {wk} 周收尾期（第{wd_read}天）→ 固定进店，把钱花在属性上")
 
         # 进店只有两条路（玩家 2026-11-27）：精力低（缺精力要补）、图标挂「新品上市」（上新了）。
-        st = self.stamina if self.stamina is not None else 999
+        st = self.stamina
+        if st is None:
+            # 每日页刚渲染完那一帧顶栏常读不到精力（实测第 11 步 None、第 12 步才读到 28），
+            # 直接拿 999 兜底会把「精力 28 该买药」判成「精力满不买」→ 整天漏进店。
+            # 重抓一帧再读一次，仍然读不到才退回 999（宁可少买，不瞎买）。
+            self.sleep(0.35)
+            f2 = self._frame()
+            if f2 is not None:
+                items2 = self._texts(f2)
+                self._read_stamina(items2, f2, page="每日页")
+                if self.stamina is not None:
+                    self.log_info(f"[商店] 每日页首帧没读到精力 → 重抓一帧补上："
+                                  f"{self.stamina}/{self.stamina_max}")
+            st = self.stamina if self.stamina is not None else 999
         below = int(((shop_cfg.get("rules") or {}).get("stamina") or {}).get("when_below", 50))
         if st < below:
             self.shop_bought_trip = 0      # 新的一次进店，件数从 0 数
+            self.shop_bought_cats = set()  # 本次进店已买过的类别（精力药只买一件）
+            self.shop_tried_names = {}
             return self._shop_verdict(items, True, f"精力 {st} < {below}")
         badge = self._shop_new_badge(items, frame, shop)
         if badge:
             self.shop_bought_trip = 0
+            self.shop_bought_cats = set()
+            self.shop_tried_names = {}
             return self._shop_verdict(items, True, "商店图标挂着「新品上市」")
         return self._shop_verdict(items, False, f"精力 {st} ≥ {below}、图标没有「新品上市」")
 
@@ -2329,7 +2882,7 @@ class AutoTask(MyBaseTask):
         以前每个分支各自 return，不进店时**什么都不打** —— 日志里看不出
         「为什么没进店」，只能靠猜（2026-11-27 玩家要求先做好埋点）。
         """
-        day = self._day_key(items) or "-"
+        day = self._shop_day_key(items)
         st = self.stamina
         key = (day, ok, why)
         if getattr(self, "_shop_verdict_key", None) != key:
@@ -2582,10 +3135,18 @@ class AutoTask(MyBaseTask):
             if re.fullmatch(r"[\d\s\.\+\-%]+", t):   # 纯数字 = 价格，不是商品
                 continue
             kind = self._shop_kind(t)
-            if kind == "other":
+            price = self._shop_price(items, it)
+            if price == 0:
+                # 玩家 2026-11-28：「第四周第一天进了商店，但是 0 元的东西没有买」。
+                # 0 元是本次训练专属的馈赠，白送就必须拿 —— 名字往往叫
+                # 「白神的笔记」这种分类器认不出的，不能因为 kind=other 就整个丢掉。
+                # 但价格本身也会被读成「①0」这种文本：名字必须含 ≥2 个汉字才算商品。
+                if len(re.findall(r"[\u4e00-\u9fa5]", t)) < 2:
+                    continue
+                kind = "free"
+            elif kind == "other":
                 continue
-            offers.append({"name": t, "kind": kind,
-                           "price": self._shop_price(items, it), "item": it})
+            offers.append({"name": t, "kind": kind, "price": price, "item": it})
         # 同一个商品名 OCR 可能重复给出（卡片名 + 效果区），按 (名字, 价格) 去重
         seen, uniq = set(), []
         for o in offers:
@@ -2596,6 +3157,117 @@ class AutoTask(MyBaseTask):
             uniq.append(o)
         return uniq
 
+    def _shop_find_now(self, name):
+        """在当前画面里按名字找商品框（滚动之后坐标会变，不能拿旧帧的坐标点）。"""
+        f = self._frame()
+        if f is None:
+            return None
+        best = None
+        for it in self._texts(f):
+            t = (it.get("t") or "").strip()
+            if not t:
+                continue
+            if t == name or (len(t) >= 2 and (t in name or name in t)):
+                if best is None or len(t) > len(best.get("t") or ""):
+                    best = it
+        return best
+
+    def _shop_zero_names(self, items):
+        """货架上标价 0 的商品名 —— 玩家说的「每次上新都有的、本次训练专属」那件。
+
+        两个用途：① 验证滚动扫到没扫到底（0 元那件常在最后一行）；
+        ② 它本身**是要买的**（白送），`_shop_offers` 里价格 0 会强制归成 `free`，
+           不依赖分类器认得出名字（实测叫「白神的笔记 / 白神的训练手册」，
+           `_shop_kind` 返回 other，以前就因此整件被丢掉 —— 玩家 2026-11-28 抓到）。
+        （2026-11-28：实测它卡在货架最下面一行，OCR 会认成「自神」。）
+        """
+        out = []
+        for it in items:
+            t = (it.get("t") or "").strip()
+            if len(t) < 3 or any(k in t for k in self.SHOP_NON_ITEM):
+                continue
+            if re.fullmatch(r"[\d\s\.\+\-%①-⑳]+", t):
+                continue
+            if self._shop_price(items, it) == 0:
+                out.append(t)
+        return out
+
+    def _shop_scan(self, items, frame):
+        """货架从头滚到底逐屏读，别只读第一屏。
+
+        玩家 2026-11-27：「商店也是一样可以滚轮上下拉的」。一次上新往往一屏放不下，
+        只读第一屏会把下半截的精力药整排漏掉。每次上新还有一件 0 元的本次训练
+        专属商品，它不一定在第一屏 —— 所以这里滚到底再滚回顶部，
+        并拿「0 元商品有没有读出来」来验证这一次上下滑是不是真的滚到底了。
+        """
+        cfg = self._tuning().get("shop") or {}
+        if not cfg.get("scroll_scan", True):
+            return self._shop_offers(items, frame)
+        pages = max(1, int(cfg.get("scan_pages", 4)))
+        down = max(1, int(cfg.get("wheel_notches", 3)))
+
+        # ① 先滚回顶部。进店时货架**不一定是停在最上面**的（上次点进商品详情、
+        #    或者上一次进来时滚过），如果直接往下滚，屏幕上方那半屏永远读不到
+        #    （2026-11-28 玩家：「白神的笔记应该在屏幕上面，没买到」）。
+        self._wheel(0.35, 0.38, -int(pages * down))
+        time.sleep(0.3)
+        f0 = self._frame()
+        if f0 is not None:
+            items, frame = self._texts(f0), f0
+            self._shot(f0, "shop_top")
+
+        got = list(self._shop_offers(items, frame))
+        seen = {(o["name"], o["price"]) for o in got}
+        first = len(got)
+        prev_sig = self._shop_sig(items)      # 上一屏的文本指纹，用来判断「到底有没有滚动」
+        pages_seen = 1
+        zero_at = {1: self._shop_zero_names(items)}
+        for i in range(pages - 1):
+            if not self._wheel(0.35, 0.38, down):
+                break
+            f = self._frame()
+            if f is None:
+                break
+            # 每一屏存张图：滚轮到底有没有让货架动，光看「有没有新商品」分不清
+            # 「滚了但本来就这些」和「压根没滚」（2026-11-28 要复盘这个）。
+            self._shot(f, f"shoppage{i + 2}")
+            pages_seen = i + 2
+            p_items = self._texts(f)
+            sig = self._shop_sig(p_items)
+            if sig == prev_sig:
+                self.log_info(f"[商店] 翻到第 {i + 2} 屏文字和上一屏一模一样 → 货架没动，到底了")
+                break
+            prev_sig = sig
+            zero_at[pages_seen] = self._shop_zero_names(p_items)
+            new = [o for o in self._shop_offers(p_items, f)
+                   if (o["name"], o["price"]) not in seen]
+            if not new:
+                self.log_info(f"[商店] 第 {i + 2} 屏没有新商品（货架动了但都是重名）")
+                continue
+            for o in new:
+                seen.add((o["name"], o["price"]))
+            got.extend(new)
+            self.log_info(f"[商店] 第 {i + 2} 屏 +{len(new)} 件："
+                          + "；".join(f"{o['name']}={o['price']}" for o in new))
+        self._wheel(0.35, 0.38, -int(pages * down))   # 滚回顶部，后面按第一屏坐标点
+        time.sleep(0.3)
+        hits = [(p, n) for p, names in sorted(zero_at.items()) if names for n in names]
+        self.log_info(f"[商店] 滚动扫描 {len(got)} 件（首屏 {first}，翻了 {pages_seen - 1} 屏）｜"
+                      + ("0 元锚点 " + "、".join(f"「{n}」在第 {p} 屏" for p, n in hits)
+                         if hits else "没读到 0 元锚点 → 这次可能没滚到底"))
+        return got
+
+    def _shop_sig(self, items):
+        """货架区的文本指纹：用来判断滚轮到底有没有让列表动。
+
+        只取货架可能出现的文字（排除顶栏/底部 tab），按内容排序拼串；
+        两屏指纹相同 = 画面没变 = 已经滚到头了。
+        """
+        skip = ("商店", "能力详情", "比赛", "上新时间", "购买", "关闭")
+        ts = sorted((it["t"] or "").strip() for it in items
+                    if (it["t"] or "").strip() and it["t"] not in skip)
+        return "|".join(ts)
+
     def _shop_plan(self, offers, cfg):
         """按白名单挑一件要买的，返回 (offer, 原因) 或 (None, 不买的原因)。
 
@@ -2604,7 +3276,21 @@ class AutoTask(MyBaseTask):
         牛奶和精力饮料都要求「精力 < when_below」，器材暴击还要求「上一场器材上有人」。
         """
         rules = cfg.get("rules") or {}
-        order = cfg.get("order") or ["free", "milk", "stamina", "crit", "book", "stat", "charm"]
+        # 收尾期（第 7 周起，玩家 2026-11-28）：钱留着没用了 → 属性道具优先、买光、不留底。
+        # 周次从 self.shop_week 取（进店那天记下的「第N周」），读不到就不算收尾期。
+        try:
+            wk = int(str(getattr(self, "shop_week", "") or "").split("-")[0])
+        except (TypeError, ValueError):
+            wk = None
+        endgame = wk is not None and wk >= int(cfg.get("endgame_week", 7))
+        if endgame:
+            # 收尾期只买加属性的：0 元馈赠（白拿）+ 属性秘籍 + 摇摆饮料（属性 +25~35）。
+            # 教科书 / 护符 / 器材类 / 精力药都不加属性，不买（玩家 2026-11-28）。
+            order = cfg.get("endgame_order") or ["free", "stat", "sway"]
+        else:
+            # 第 7 周前：秘籍/教科书/护符一律不买 —— 钱要留给笔记和精力药
+            # （玩家 2026-11-28：第一周第一天买了个 100 元的弹跳秘籍，只剩 90 块）。
+            order = cfg.get("order") or ["free", "milk", "stamina", "sway", "manual"]
         st = self.stamina
         eq = getattr(self, "last_equip_count", 0) or 0
 
@@ -2612,7 +3298,9 @@ class AutoTask(MyBaseTask):
         # 否则笔记刷出来买不起。看的是**购买后的金币**：买完剩的钱仍要 ≥ keep。
         # 0 元馈赠不花钱，永远放行；读不到金币时不敢乱花，跳过付费项。
         # 本轮已经拿到笔记 → 不用再为笔记留底（玩家 2026-11-27）。
-        keep = 0 if getattr(self, "notes_done", False) else int(cfg.get("keep_gold", self.GOLD_KEEP))
+        # 收尾期（第 7 周起）钱花完就花完，不再留底（玩家 2026-11-28）。
+        keep = 0 if (endgame or getattr(self, "notes_done", False)) else int(
+            cfg.get("keep_gold", self.GOLD_KEEP))
         gold = getattr(self, "gold", None)
 
         def payable(o):
@@ -2620,6 +3308,10 @@ class AutoTask(MyBaseTask):
             if o["kind"] == "free":
                 return True
             price = o["price"]
+            if price is None and endgame:
+                # 收尾期钱要花光：价格没读到也敢点，买贵了也不过是把剩下的钱花掉
+                self.log_info(f"「{o['name']}」价格没读到，但收尾期钱要花光 → 照买")
+                return True
             if price is None:
                 self.log_warning(f"「{o['name']}」价格没读到 → 不知道买完还剩多少"
                                  f"（要留 {keep}）→ 不买")
@@ -2627,6 +3319,9 @@ class AutoTask(MyBaseTask):
             if price <= 0:
                 return True
             if gold is None:
+                if endgame:
+                    self.log_info(f"「{o['name']}」金币读不到，但收尾期钱要花光 → 照买")
+                    return True
                 self.log_warning(f"「{o['name']}」要 {price} 元，但顶栏金币读不到 "
                                  f"→ 不敢花（要留 {keep}）")
                 return False
@@ -2651,10 +3346,14 @@ class AutoTask(MyBaseTask):
 
         # 紧急档：精力见底时先买饮料保命（否则今天直接练不动）。
         # 精力还宽裕时才按 order 走，牛奶（永久降低训练精力消耗）排在饮料前面。
+        # 已经买过一件精力类 → 不再重复买（顶栏精力不一定马上刷新，旧值会让人以为还缺）。
+        bought_cats = getattr(self, "shop_bought_cats", None) or set()
         urgent_rule = rules.get("stamina") or {}
         urgent = int(urgent_rule.get("urgent_below", 35))
         if st is not None and st < urgent:
-            if sat_skip:
+            if "stamina" in bought_cats:
+                self.log_info(f"本次进店已经买过精力药（顶栏还显示 {st}，可能没刷新）→ 不再重复买")
+            elif sat_skip:
                 self.log_info(f"精力 {st} 偏低，但今天是周六且 ≥ {sat_min}："
                               f"明天公园就能补 → 不买精力药")
             else:
@@ -2674,15 +3373,37 @@ class AutoTask(MyBaseTask):
             # `rule.get("on")` 永远读不到 → 之前的 on:false 全是摆设。改用 enabled，
             # 同时兼容历史文件里被解析成 True 键的写法。
             enabled = rule.get("enabled", rule.get(True, rule.get("on", True)))
+            if cat in ("stat", "book", "charm") and not endgame:
+                # 玩家 2026-11-28：第一周第一天就花 100 买「弹跳秘籍」，只剩 90 块 ——
+                # 第 7 周前不许碰属性道具，钱要留给笔记继承和精力药。
+                if any(o["kind"] == cat for o in offers):
+                    self.log_info(f"货架上有属性道具（{cat}），但现在是第 {wk} 周"
+                                  f"（< {cfg.get('endgame_week', 7)}）→ 不买，钱留着")
+                continue
+            if endgame and cat in ("stat", "sway"):
+                # 收尾期只买**真加属性的**：属性秘籍、摇摆专属饮料（推荐属性 +25~35）。
+                # 玩家 2026-11-28：「护符不加属性，加精力/加成功率的都不用买了」
+                # → 教科书（训练等级）、护符（表情一致）、器材暴击、器材手册、精力药一律不碰。
+                enabled = True
             if enabled is False:
                 continue
             pool = [o for o in offers if o["kind"] == cat]
+            if cat == "stat":
+                # 「精力上限+」被归进 stat 只是为了不当成精力药买，它加的是精力条不是属性
+                pool = [o for o in pool if "精力上限" not in o["name"]]
+            # 同一次进店里同一个名字试满 2 次（点开对不上 / 买失败）就别再点它
+            tried = getattr(self, "shop_tried_names", None) or {}
+            pool = [o for o in pool if (tried.get(o["name"]) or 0) < 2]
             if not pool:
                 continue
             # 便宜的优先；读不到价格的排最后（不敢乱花）
             pool.sort(key=lambda o: (o["price"] is None, o["price"] or 0))
 
             if cat in ("milk", "stamina"):
+                if cat in bought_cats:
+                    self.log_info(f"本次进店已买过{'精力饮料' if cat == 'stamina' else '特训牛奶'}"
+                                  f"（顶栏精力 {st} 可能还没刷新）→ 不重复买")
+                    continue
                 if sat_skip:
                     self.log_info(f"周六 精力 {st} ≥ {sat_min}：「{pool[0]['name']}」先不买，"
                                   f"明天去公园就能补")
@@ -2698,6 +3419,8 @@ class AutoTask(MyBaseTask):
 
             o = pool[0]
             cap = rule.get("max_price")
+            if endgame:
+                cap = None        # 收尾期不限价：钱花不完就浪费了
             if cap is not None and o["price"] is not None and o["price"] > float(cap):
                 self.log_warning(f"「{o['name']}」{o['price']} 元 > 上限 {cap} 元 → 不买")
                 continue
@@ -2723,7 +3446,10 @@ class AutoTask(MyBaseTask):
           ❌ 紫色/白色杂项、效率等级书（性价比极低）、高价回精力道具
         """
         cfg = self._tuning().get("shop") or {}
-        offers = self._shop_offers(items, frame)
+        # 断点续跑时 JSON 恢复回来的是 list，统一成 set 才能 add
+        if not isinstance(getattr(self, "shop_bought_cats", None), set):
+            self.shop_bought_cats = set(getattr(self, "shop_bought_cats", None) or ())
+        offers = self._shop_scan(items, frame)
         # 一件都没读出来 = 这页没解析成功，不能据此断言「店里没有精力道具」
         # （否则会把「高风险改练意识」那条规则带偏），保持 None。
         if offers:
@@ -2731,10 +3457,17 @@ class AutoTask(MyBaseTask):
         # 埋点：把货架的「名字/分类/价格」和当前金币、留底一起打出来 ——
         # 买不买是这些数字算出来的，日志里缺一个就没法复盘（2026-11-27）。
         keep = 0 if getattr(self, "notes_done", False) else int(cfg.get("keep_gold", self.GOLD_KEEP))
+        try:
+            _wk = int(str(getattr(self, "shop_week", "") or "").split("-")[0])
+        except (TypeError, ValueError):
+            _wk = None
+        endgame = _wk is not None and _wk >= int(cfg.get("endgame_week", 7))
+        if endgame:
+            keep = 0      # 第 7 周起钱要花光（玩家 2026-11-28）
         self.log_info("商店货架 " + "；".join(
             f"{o['name']}[{o['kind']}]={o['price']}" for o in offers)
             + f"｜精力 {self.stamina}｜金币 {getattr(self, 'gold', None)}"
-              f"（留底 {keep}{'，笔记已到手' if not keep else ''}）"
+              f"（留底 {keep}{'，收尾期清钱' if endgame else ('，笔记已到手' if not keep else '')}）"
               f"｜星期{getattr(self, 'shop_weekday', None)}")
         if cfg.get("snapshot", True):
             self._shot(frame, "shop")
@@ -2745,6 +3478,8 @@ class AutoTask(MyBaseTask):
         # 「一次进店最多买几件」——数的是这次进店，不是整轮。整轮买了多少只进统计
         # （self.shop_bought），不拿它拦下次上新。
         max_buy = int(cfg.get("max_buy_per_run", 4))
+        if endgame:
+            max_buy = int(cfg.get("max_buy_endgame", 99))   # 收尾期：手上有多少买多少
         if self.shop_bought_trip >= max_buy:
             self.log_info(f"本次进店已买 {self.shop_bought_trip} 件（上限 {max_buy}），先出去")
             return self._leave_shop(items, frame)
@@ -2754,12 +3489,21 @@ class AutoTask(MyBaseTask):
             self.log_info(f"商店：{why}")
             return self._leave_shop(items, frame)
 
-        self.shop_bought_trip += 1
-        self.shop_bought += 1
-        self.stat["buy"].append((why, o["name"], o["price"]))
-        self._click_item(o["item"], f"[商店-{why} 「{o['name']}」{o['price']}元]")
+        # 滚动扫描会把画面挪过，坐标要以「现在这一帧」重新定位的为准
+        hit = self._shop_find_now(o["name"]) or o["item"]
+        tried = getattr(self, "shop_tried_names", None)
+        if not isinstance(tried, dict):
+            tried = self.shop_tried_names = {}
+        tried[o["name"]] = (tried.get(o["name"]) or 0) + 1
+        self._click_item(hit, f"[商店-{why} 「{o['name']}」{o['price']}元]")
         self.sleep(0.9)
         f2 = self._frame()
+        if f2 is not None and not self._shop_detail_ok(f2, o["name"]):
+            # 点开的不是想买的那张卡（实拍 195626：想点「白神的馈赠」，面板却是「弹跳秘籍+」
+            # 100 元）→ 不买，按右上角 X 退掉，别把钱花错地方。
+            self.log_warning(f"点开「{o['name']}」后详情面板对不上 → 不买，关掉详情")
+            self.click_relative(0.843, 0.155)
+            return True
         if f2 is not None:
             # 点开商品后右侧滑出详情面板，底部是**黄色大按钮**，上面写的是价格数字
             # （不是「购买」两个字），OCR 拿不到关键词，只能按色块定位。
@@ -2771,7 +3515,35 @@ class AutoTask(MyBaseTask):
             else:
                 self.log_warning("没找到右侧的黄色购买按钮，改按 OCR 确认词找")
                 self._click_confirm(self._texts(f2), f2)
+        self.shop_bought_trip += 1
+        self.shop_bought += 1
+        self.shop_bought_cats.add(o["kind"])
+        self.stat["buy"].append((why, o["name"], o["price"]))
         return True
+
+    def _shop_detail_ok(self, frame, name):
+        """核对商品详情面板的标题，防止点错卡片买错东西。
+
+        实拍 195626_shop.png：面板标题在右半区上方（「弹跳秘籍+」），是全页最大的字。
+        OCR 一个字都没读到 → 返回 True：读不到不等于点错，不能因此拦掉正常购买。
+        只要读到候选标题、且没有一个片段能和商品名对上，就判为点错。
+        """
+        h, w = frame.shape[:2]
+        core = re.sub(r"[+\-＋－\s]", "", name or "")
+        if len(core) < 2:
+            return True
+        cands = [it for it in self._texts(frame)
+                 if it["cx"] > w * 0.62 and it["cy"] < h * 0.40
+                 and len((it["t"] or "").strip()) >= 2]
+        if not cands:
+            return True
+        for it in cands:
+            t = re.sub(r"[+\-＋－\s]", "", it["t"] or "")
+            for i in range(len(t) - 1):
+                if t[i:i + 2] in core:
+                    return True
+        self.log_warning(f"详情面板标题 {[it['t'] for it in cands][:3]} 与「{name}」对不上")
+        return False
 
     def _yellow_rect_center(self, frame, roi=(0.55, 0.55, 0.98, 0.95)):
         """在指定区域里找**面积最大的黄色实心矩形**并返回中心（商店的购买按钮）。"""
@@ -2993,8 +3765,10 @@ class AutoTask(MyBaseTask):
             self.log_info("提议页没读到「那就开始吧」，选「稍等一下」跳过")
             self._click_item(it, "[训练提议-稍等]")
             return True
-        self.log_warning("训练提议页没读到按钮，点下方中间推进")
-        self.click_relative(0.5, 0.62)
+        self.log_warning("训练提议页没读到按钮 → 点底部黄色「继续」箭头")
+        # 2026-11-28 08:38 实测：这类页面其实是剧情对话（正文 + 底部黄色 V 形箭头），
+        # 原先是点 (0.5, 0.62)，落在对话框里没用，连点 6 步不动。箭头在 0.82。
+        self.click_relative(0.5, 0.82)
         return False
 
     def _do_train_confirm(self, items, frame):
@@ -3212,9 +3986,28 @@ class AutoTask(MyBaseTask):
         现在放宽到 `a <= cap * 2`（够容纳溢出，又不至于把乱码当数值）。
         """
         s = (text or "").replace(" ", "").replace("＋", "+")
-        # 斜杠还在：用 search 不用 ^$，因为实测 OCR 会在后面粘噪音
-        # 「221/150+ü三」（2026-11-23 06:50 探针原样输出），锚定结尾必然匹配失败
-        # (?!\d) 防止把 284/1784 截断成 284/178 —— 属性条大数被当成资源上限
+        # 斜杠还在：从每个「/」往前取 1~3 位，取第一个数值合法的组合。
+        # 不能用「从头贪婪匹配」——OCR 常把 ⚡ 图标读成杂字粘在前面，
+        # 实测顶栏「91/130」读成「3 91/130」，去掉空格后是「391/130」，
+        # 贪婪正则给出 a=391，被 `a <= b*2` 拒掉 → 精力这一帧不更新、沿用旧值 130
+        # → 「精力已满」误判 → 三选一跳过精力去选属性（玩家 2026-11-28 抓到）。
+        # 所以从斜杠往左逐个长度试，先短后长，找到合法的就收。
+        for pos in (m.start() for m in re.finditer("/", s)):
+            tail = s[pos + 1:]
+            mt = re.match(r"(\d{2,3})(?!\d)", tail)
+            if not mt:
+                continue
+            b = int(mt.group(1))
+            for ln in (3, 2, 1):          # 先长后短：391/130 先试 391（非法），再试 91（对）
+                st = pos - ln
+                if st < 0:
+                    continue
+                head = s[st:pos]
+                if not head.isdigit():
+                    continue
+                a = int(head)
+                if 0 <= a <= b * 2:
+                    return a, b
         m = re.search(r"(\d{1,3})/(\d{2,3})(?!\d)", s)
         if m:
             a, b = int(m.group(1)), int(m.group(2))
@@ -4740,8 +5533,12 @@ class AutoTask(MyBaseTask):
                     and 2 <= len(it["t"]) <= 16 and not re.match(r"^[\d/\.\+%]+$", it["t"])]
             opts = sorted(opts, key=lambda x: -x["cy"])[:3]
         if not opts:
-            self.log_warning("事件页没识别到选项，点屏幕中间推进")
-            self.click_relative(0.5, 0.5)
+            # 文字全读不出来时，先按图形找 2~4 个整齐的框（横排最右 / 竖排最上），
+            # 再不行也只点右下角 —— 中心往往就是选项本身，点一下就替玩家选了。
+            if self._do_pick_by_boxes(frame, tag="事件"):
+                return True
+            self.log_warning("事件页没识别到选项 → 点右下角推进（不点屏幕中心）")
+            self._click_corner()
             return True
         scored = [(self._score_option(o["t"]), o) for o in opts]
         scored.sort(key=lambda x: -x[0])
@@ -4988,7 +5785,7 @@ class AutoTask(MyBaseTask):
         """通用推进器：不认识这页，也要自己走出去。
 
         以前的兜底是 fallback=pause（停下等人工），每冒一个新事件就断一次。
-        改成：OCR 认识的安全按钮 → 视觉色块按钮 → ESC → 右上角 X → 屏幕中间，
+        改成：OCR 认识的安全按钮 → 视觉色块按钮 → ESC → 右上角 X → 右下角，
         每点一次都验证画面到底变没变，没变就换下一个候选。
         连续 give_up_after 次全都推不动才停（有上限，不会无限刷）。
 
@@ -5041,11 +5838,14 @@ class AutoTask(MyBaseTask):
                 return True
             self.log_info(f"[推进] 点「{label}」画面没变（{d:.1f}%），换下一个候选")
 
-        # 逃生链：键盘 → 右上角 X → 屏幕中间。只等一次，别把每次点击都算进 max_clicks
+        # 逃生链：键盘 → 右上角 X → **右下角**（不再点屏幕中间）。
+        # 玩家 2026-11-28：「未知页面改成往角落点，别每次点中心，不小心就把选项点掉了」——
+        # 屏幕中心往往是三选一/选项卡/奖池卡片，点一下就替你选了；右下角基本只有
+        # 继续/跳过这类推进按钮，或干脆是空白。只等一次，别把每次点击都算进 max_clicks
         escapes = [
             ("ESC", lambda: self.send_key("esc")),
             ("右上角X", lambda: self._click_close_x(frame)),
-            ("屏幕中间", lambda: self.click_relative(0.5, 0.5)),
+            ("右下角", lambda: self._click_corner()),
         ]
         for name, act in escapes:
             try:
@@ -5073,6 +5873,15 @@ class AutoTask(MyBaseTask):
         self.log_warning(f"[推进] 这一屏所有候选都没推动（{n}/{give_up}），下一步重试")
         return True
 
+    def _click_corner(self):
+        """未知页兜底：点右下角，绝不点屏幕中心。
+
+        玩家 2026-11-28：未知页点中心会「不小心把选项点掉」。中心通常是三选一卡片、
+        抽奖奖池、选项卡；右下角基本只有「继续 / 跳过」这类推进按钮，或者空白，
+        点错了也只是少看一屏，不会替玩家做选择。
+        """
+        self.click_relative(0.94, 0.93)
+
     def _click_close_x(self, frame):
         """点右上角的关闭 X：先模板匹配，认不到就用实测比例坐标。"""
         pos = self._match_template(frame, "x_close.png")
@@ -5093,18 +5902,20 @@ class AutoTask(MyBaseTask):
             self.sleep(wait_s)
             return True
 
-        # 0.5) 疑似过场/动画帧：给 4 步宽限，只等不点（也不记未知页）。
-        #      超时就不再等，按下面的正常未知页流程处理，避免真实页面被跳过。
+        # 0.5) 疑似过场/动画帧：多给几步宽限，只等不点（也不记未知页）。
+        #      玩家 2026-11-28：「一些未知页先多等一会，其实不用点」——
+        #      实测过场动画最长播 6 步（每步 2s），4 步就动手属于抢跑。
         if self._looks_transient(items, frame):
+            grace = int(cfg.get("transient_rounds") or 6)
             n = getattr(self, "_transient_frames", 0) + 1
             self._transient_frames = n
-            if n <= 4:
+            if n <= grace:
                 wait_s = float(cfg.get("wait_seconds") or 2.0)
                 self.log_info(f"[过场宽限] 疑似动画帧（文字 {len(items)} 段、顶栏 HUD 未出现）"
-                              f"→ 等 {wait_s}s 让它自己播完（{n}/4）")
+                              f"→ 等 {wait_s}s 让它自己播完（{n}/{grace}）")
                 self.sleep(wait_s)
                 return True
-            self.log_warning("[过场宽限] 连续 4 步仍是疑似动画帧 → 不再等待，按未知页处理")
+            self.log_warning(f"[过场宽限] 连续 {grace} 步仍是疑似动画帧 → 不再等待，按未知页处理")
         else:
             self._transient_frames = 0
 
@@ -5143,6 +5954,34 @@ class AutoTask(MyBaseTask):
         if self._click_confirm(items, frame):
             return True
 
+        # 2.5) 图形选项页：认不出文字内容，但画面里有 2~4 个大小相近、排得整齐的框
+        #      → 按位置选（横排最右 / 竖排最上），别让通用推进器把选项点掉。
+        #      玩家 2026-11-28：未知选项页每次角色/事件随机，文字不可靠，必须靠图形。
+        if self._do_pick_by_boxes(frame, tag="未知页"):
+            return True
+
+        # 2.7) 静观：未知页先多等一会儿，很多页其实根本不用点。
+        #      玩家 2026-11-28：「一些未知页可不可以先试一下，多等一会，其实不用点」。
+        #      过场动画 / 抽奖开奖 / 奖励展示这类页面每一帧都在变，点一下就替玩家
+        #      把奖励或选项点掉了。做法：跟上一帧未知页比，还在动就只等不动手，
+        #      最多等 settle_rounds 步（动画播完页面会自己变）；画面静止了才推进。
+        settle = int(cfg.get("settle_rounds") or 3)
+        if settle > 0 and frame is not None:
+            prev = getattr(self, "_unknown_prev_frame", None)
+            waits = getattr(self, "_unknown_waits", 0)
+            thr = float(cfg.get("settle_diff") or 5.0)
+            if prev is not None and prev.shape == frame.shape:
+                d = self._frame_diff(prev, frame)
+                if d >= thr and waits < settle:
+                    self._unknown_prev_frame = frame.copy()
+                    self._unknown_waits = waits + 1
+                    wait_s = float(cfg.get("wait_seconds") or 2.0)
+                    self.log_info(f"[静观] 未知页画面还在变（{d:.1f}% ≥ {thr:.0f}%）→ "
+                                  f"再等 {wait_s}s，先不点（{waits + 1}/{settle}）")
+                    self.sleep(wait_s)
+                    return True
+            self._unknown_prev_frame = frame.copy()
+
         # 老配置「未知页面兜底」= 暂停 仍优先（兼容）；否则用新配置 fallback
         old = str(self.config.get("未知页面兜底") or "")
         fallback = ("pause" if old == "暂停"
@@ -5165,9 +6004,9 @@ class AutoTask(MyBaseTask):
 
         limit = int(cfg.get("max_center_clicks") or 10)
         if self.unknown_count <= limit:
-            self.log_warning(f"未知页面（第 {self.unknown_count} 次），点屏幕中间推进。"
+            self.log_warning(f"未知页面（第 {self.unknown_count} 次），点右下角推进。"
                              f"文字: {texts[:8]}")
-            self.click_relative(0.5, 0.5)
+            self._click_corner()
             return True
         p = self._shot(frame, f"unknown_{self.unknown_count}")
         self.log_error(f"未知页面连续 {self.unknown_count} 次没有可点主按钮，暂停。"
@@ -5283,6 +6122,12 @@ class AutoTask(MyBaseTask):
         self.shop_has_stamina = None
         self.shop_bought = 0
         self.shop_bought_trip = 0        # 本次进店买了几件（每次进店清零）
+        # 本次进店已经买过的类别。精力药/牛奶只买第一件：买完顶栏精力不一定立刻刷新，
+        # 旧值会让下一轮又判成「精力见底」重复买（2026-11-28 周六 7→47 还接着买第二瓶）。
+        self.shop_bought_cats = set()
+        # 本次进店每个商品名试过几次。点开详情面板对不上名字时记为失败，试满 2 次就跳过 ——
+        # 防止「白神的馈赠」这种 OCR 定位歪了的情况反复点同一张卡（2026-11-28 实测连点 4 次）。
+        self.shop_tried_names = {}
         # 进店当天是星期几（1~7）：周六不囤精力药，商店页本身读不到星期X
         self.shop_weekday = None
         # 本轮主训人员（每局会换，由 _main_char_of_round 从画面上认，不写死名字）
@@ -5515,7 +6360,8 @@ class AutoTask(MyBaseTask):
         "trip_picked", "trip_probe", "trip_probe_done",
         "trip_probe_retry", "trip_probe_retry_day",
         "trip_back_tries", "shop_day", "shop_week", "shop_bought",
-        "shop_has_stamina", "shop_weekday", "shop_bought_trip", "notes_done",
+        "shop_has_stamina", "shop_weekday", "shop_bought_trip", "shop_bought_cats",
+        "notes_done",
         "minigame_tries", "stock_idx",
         "stock_tries", "stock_picked", "stamina_refills", "stamina_misses",
         "last_equip_count", "rounds_done", "stat",
@@ -5829,6 +6675,19 @@ class AutoTask(MyBaseTask):
                 self.unknown_count = 0
             if page != "训练项页":
                 self.item_checked = False
+            # 离开抽奖/转盘页就复位：否则下一周的抽奖会被当成「这一轮已经开抽过」，
+            # 站在台上干等，白等到上限才点右下角。
+            if page not in ("抽奖", "抽奖转盘", "抽奖三选一"):
+                self.wheel_spun = False
+                self.wheel_waits = 0
+            if page != "选店铺":
+                self.shop_picked = False
+                self._shop_step = "pick"
+                self._shop_try = 0
+            # 未知页的「静观」计数也按页复位：换了页面就该重新观察，不要带着旧帧比。
+            if page != "未知":
+                self._unknown_prev_frame = None
+                self._unknown_waits = 0
             # 离开炒股页就把计数和「已选卡」清掉，否则下一轮进选股页会残留 True，
             # 直点「确定」白费一步（08:26 实测）。
             if page != "炒股小游戏":
@@ -5932,8 +6791,12 @@ class AutoTask(MyBaseTask):
                 self._do_pretrain(items, frame)
             elif page == "行程结果":
                 self._do_next("行程结果")(items, frame)
-            elif page == "抽奖":
+            elif page in ("抽奖", "抽奖转盘"):
                 self._do_wheel(items, frame)
+            elif page == "选店铺":
+                self._do_shop_pick(items, frame)
+            elif page == "抽奖三选一":
+                self._do_lottery_pick(items, frame)
             elif page == "选项":
                 self._do_choice(items, frame)
             elif page == "比赛MVP":

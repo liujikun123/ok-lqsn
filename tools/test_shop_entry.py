@@ -20,6 +20,7 @@ class Stub:
     _want_shop = AutoTask._want_shop
     _shop_verdict = AutoTask._shop_verdict
     _shop_new_badge = AutoTask._shop_new_badge
+    _shop_day_key = AutoTask._shop_day_key
 
     # 默认状态
     stamina = 100
@@ -27,11 +28,13 @@ class Stub:
     shop_week = None
     shop_bought_trip = 0
     shop_weekday = None
+    weekday = None       # 「上一帧读到的星期几」，_want_shop 在当天读不到时用它兜底
     _shop_verdict_key = None
     logs = []
 
     # 假的页面读数（用例里改）
     day = "2-3"          # 与真实 _day_key 一致：f"{week}-{weekday}"
+    week_no = 2
     wd = 3
     badge = None
     cfg = {"enable": True, "skip": [7], "when_below": 50}
@@ -55,10 +58,10 @@ class Stub:
                          "rules": {"stamina": {"when_below": self.cfg["when_below"]}}}}
 
     def _day_key(self, items):
-        return self.day
+        return self.day if (self.week_no and self.wd) else None
 
     def _read_week(self, items):
-        return (2, self.wd)
+        return (self.week_no, self.wd)
 
     def _shop_button(self, items, frame=None):
         return SHOP
@@ -93,6 +96,7 @@ def run(**kw):
     s._shop_verdict_key = None
     s.badge = None
     s.day = "2-3"
+    s.week_no = 2
     s.wd = 3
     s.stamina = 100
     for k, v in kw.items():
@@ -167,10 +171,41 @@ def _():
     assert ok is False, s.logs
 
 
-@case("读不到「第N周-星期X」→ 不进")
+@case("读不到星期几 + 图标挂「新品上市」→ 照进（记账降级成 4-?）")
 def _():
-    ok, s = run(day=None, stamina=10)
+    # 玩家 2026-11-28：第 4 周星期一这天只读到「第4周」，星期几丢了，
+    # 旧代码把「读不到日期」当闸门，整天的上新直接错过。进店只看上新和精力。
+    ok, s = run(week_no=4, wd=None, stamina=130, badge="ocr")
+    assert ok is True, s.logs
+    assert any("4-?" in m for m in s.logs), s.logs
+
+
+@case("读不到星期几 + 精力 40 → 照进")
+def _():
+    ok, s = run(week_no=4, wd=None, stamina=40)
+    assert ok is True, s.logs
+
+
+@case("读不到星期几 + 精力够 + 没上新 → 不进，且日志写明降级键")
+def _():
+    ok, s = run(week_no=4, wd=None, stamina=130)
     assert ok is False, s.logs
+    assert any("4-?" in m and "新品上市" in m for m in s.logs), s.logs
+
+
+@case("连第几周都读不到 → 记账键退成 ?，判断照旧")
+def _():
+    ok, s = run(week_no=None, wd=None, stamina=130, badge="ocr")
+    assert ok is True, s.logs
+    ok2, s2 = run(week_no=None, wd=None, stamina=130)
+    assert ok2 is False, s2.logs
+
+
+@case("日期降级后同一天不重复进店（shop_day='4-?'）")
+def _():
+    ok, s = run(week_no=4, wd=None, stamina=130, badge="ocr", shop_day="4-?")
+    assert ok is False, s.logs
+    assert any("已经处理过" in m for m in s.logs), s.logs
 
 
 @case("配置关了商店自动购买 → 不进")
@@ -179,6 +214,45 @@ def _():
     s.cfg["enable"] = False
     ok, s = run(stamina=10)
     assert ok is False, s.logs
+
+
+# --- 玩家 2026-11-28：第 7 周起收尾期，第 1 / 3 天固定进店清钱 ---
+
+@case("第 7 周第 1 天：精力满、没上新 → 也进（收尾期固定进店）")
+def _():
+    ok, s = run(week_no=7, wd=1, stamina=130)
+    assert ok is True, s.logs
+    assert any("收尾期" in m for m in s.logs), s.logs
+
+
+@case("第 7 周第 3 天：精力满、没上新 → 也进")
+def _():
+    ok, s = run(week_no=7, wd=3, stamina=130)
+    assert ok is True, s.logs
+
+
+@case("第 7 周第 2 天：精力满、没上新 → 不进（不是固定进店日）")
+def _():
+    ok, s = run(week_no=7, wd=2, stamina=130)
+    assert ok is False, s.logs
+
+
+@case("第 6 周第 1 天：还没到收尾期 → 不进")
+def _():
+    ok, s = run(week_no=6, wd=1, stamina=130)
+    assert ok is False, s.logs
+
+
+@case("第 7 周第 1 天但今天是周日 → 仍然不进（周日规则优先）")
+def _():
+    ok, s = run(week_no=7, wd=7, stamina=130)
+    assert ok is False, s.logs
+
+
+@case("第 7 周第 3 天读到星期几丢了 + 精力满 → 赚一次（收尾期不卡日期）")
+def _():
+    ok, s = run(week_no=7, wd=None, stamina=130)
+    assert ok is True, s.logs
 
 
 def main():

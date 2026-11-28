@@ -5,8 +5,10 @@ cache/
 logs/
 # 调试截图（约 300M）
 screenshots/
-# 录制分析产物里的大图（json/md 仍保留）
+# 录制分析产物里的大图 / 录屏（json/md 仍保留）
 demo/**/*.png
+demo/**/*.mp4
+demo/**/thumbs/
 
 # ── 根目录调试残留 ────────────────────────────────
 _*.log

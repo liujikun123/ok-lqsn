@@ -52,16 +52,24 @@ def game_client():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--save", action="store_true")
+    ap.add_argument("--file", help="对指定图片做 OCR（复盘历史截图用）；不给就读当前画面")
     args = ap.parse_args()
 
-    ws = game_client()
-    if not ws:
-        print("找不到游戏窗口（k3_windows_ob.exe / UnityWndClass）")
-        return 1
-    hwnd, rect = ws[0]
-    img = ImageGrab.grab(bbox=rect, all_screens=True)
-    frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    print(f"画面 {frame.shape[1]}x{frame.shape[0]}  rect={rect}")
+    if args.file:
+        frame = cv2.imread(args.file)
+        if frame is None:
+            print(f"读不到图片：{args.file}")
+            return 1
+        print(f"图片 {args.file} {frame.shape[1]}x{frame.shape[0]}")
+    else:
+        ws = game_client()
+        if not ws:
+            print("找不到游戏窗口（k3_windows_ob.exe / UnityWndClass）")
+            return 1
+        hwnd, rect = ws[0]
+        img = ImageGrab.grab(bbox=rect, all_screens=True)
+        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        print(f"画面 {frame.shape[1]}x{frame.shape[0]}  rect={rect}")
 
     if args.save:
         d = os.path.join(ROOT, "logs", "ocr_now")

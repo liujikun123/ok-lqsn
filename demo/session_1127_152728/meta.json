@@ -1,0 +1,19 @@
+{
+  "start": "2026-11-27 15:27:28",
+  "duration_s": 133.3,
+  "window": "篮球少女：飞跃巅峰",
+  "exe": "k3_windows_ob.exe",
+  "rect": [
+    160,
+    101,
+    1760,
+    1001
+  ],
+  "size": [
+    1600,
+    900
+  ],
+  "markers": 0,
+  "events": 76,
+  "video": "screen.mp4"
+}

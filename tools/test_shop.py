@@ -80,14 +80,20 @@ Stub.GOLD_KEEP = AutoTask.GOLD_KEEP
 import copy
 
 
-def plan(goods, stamina=80, equip=0, gold=500, enable=None, notes=False, weekday=None):
+def plan(goods, stamina=80, equip=0, gold=500, enable=None, notes=False, weekday=None,
+         bought=None, week=None):
     """enable: 要临时打开的白名单类别（如 ['stat','crit']）；notes: 本轮笔记已拿到；
-    weekday: 1~7（周一到周日），不传就是读不到星期几。"""
+    weekday: 1~7（周一到周日），不传就是读不到星期几；
+    week: 第几周（收尾期/第 7 周起才开始买属性道具）；
+    bought: 本次进店已经买过的类别（如 {'stamina'}），用来验「只买一件」。"""
     Stub.stamina = stamina
     Stub.last_equip_count = equip
     Stub.gold = gold
     Stub.notes_done = notes
     Stub.weekday = weekday
+    Stub.shop_week = str(week) if week is not None else None
+    Stub.shop_tried_names = {}
+    Stub.shop_bought_cats = set(bought or ())
     s = Stub()
     cfg = copy.deepcopy(s._tuning().get("shop") or {})
     for cat in (enable or []):
@@ -167,10 +173,58 @@ def _():
     assert name is None and not offers, (name, offers)
 
 
-@case("属性秘籍 60 元 → 显式开启时在 80 上限内，能买")
+@case("属性秘籍 60 元 → 收尾期（第 7 周）能买")
 def _():
-    name, _, _ = plan([("弹跳秘籍", 420, 420, 60)], enable=["stat"])
+    name, _, _ = plan([("弹跳秘籍", 420, 420, 60)], enable=["stat"], week=7)
     assert name == "弹跳秘籍", name
+
+
+@case("第 7 周前属性秘籍一律不买（第 1 周第一天 100 元只剩 90 的教训）")
+def _():
+    name, why, _ = plan([("弹跳秘籍", 420, 420, 60)], gold=500, enable=["stat"], week=1)
+    assert name is None, (name, why)
+
+
+@case("收尾期不留底：金币 130 买 60 秘籍剩 70 也买")
+def _():
+    name, _, _ = plan([("弹跳秘籍", 420, 420, 60)], gold=130, week=7)
+    assert name == "弹跳秘籍", name
+
+
+@case("收尾期不卡 max_price：100 元秘籍也买")
+def _():
+    name, _, _ = plan([("弹跳秘籍+", 420, 420, 100)], gold=300, week=7)
+    assert name == "弹跳秘籍+", name
+
+
+@case("收尾期不买教科书（提升训练等级，不加属性）")
+def _():
+    name, why, _ = plan([("体能教科书", 420, 420, 100)], gold=300, week=7)
+    assert name is None, (name, why)
+
+
+@case("收尾期不买护符（表情一致加成，不加属性）")
+def _():
+    name, why, _ = plan([("表情提升护符", 420, 420, 80)], gold=300, week=7)
+    assert name is None, (name, why)
+
+
+@case("收尾期不买「精力上限+」（加的是精力条，不是属性）")
+def _():
+    name, why, _ = plan([("精力上限+", 420, 420, 60)], gold=300, week=7)
+    assert name is None, (name, why)
+
+
+@case("收尾期不买精力药（哪怕精力见底也不在清钱清单里）")
+def _():
+    name, why, _ = plan([("怪味饮料+", 420, 420, 40)], gold=300, week=7, stamina=80)
+    assert name is None, (name, why)
+
+
+@case("收尾期买摇摆专属饮料（推荐属性 +25~35，算加属性）")
+def _():
+    name, _, _ = plan([("摇摆专属饮料", 420, 420, 60)], gold=300, week=7)
+    assert name == "摇摆专属饮料", name
 
 
 @case("价格超出上限的课本不买")
@@ -187,15 +241,15 @@ def _():
     assert name is None, (name, why, "stat 默认 on:false")
 
 
-@case("金币 155：买 60 元秘籍会剩 95<120 → 不买（哪怕显式开启 stat）")
+@case("金币 155：第 7 周前买 60 元秘籍会剩 95<120 → 不买（哪怕显式开启 stat）")
 def _():
-    name, why, _ = plan([("弹跳秘籍", 420, 420, 60)], gold=155, enable=["stat"])
+    name, why, _ = plan([("弹跳秘籍", 420, 420, 60)], gold=155, enable=["stat"], week=3)
     assert name is None, (name, why)
 
 
-@case("金币 200：买 60 元秘籍剩 140≥120 → 可以买（显式开启 stat）")
+@case("金币 200：买 60 元秘籍剩 140≥120 → 可以买（显式开启 stat，第 7 周）")
 def _():
-    name, _, _ = plan([("弹跳秘籍", 420, 420, 60)], gold=200, enable=["stat"])
+    name, _, _ = plan([("弹跳秘籍", 420, 420, 60)], gold=200, enable=["stat"], week=7)
     assert name == "弹跳秘籍", name
 
 
@@ -280,6 +334,15 @@ def _():
 def _():
     name, why, _ = plan([("怪味饮料+", 420, 420, 40)], stamina=5, weekday=6)
     assert name == "怪味饮料+", (name, why)
+
+
+@case("周六 5→买过一瓶后顶栏还显示 5 → 不再买第二瓶（2026-11-28 实跑：7 买成 47 还接着买）")
+def _():
+    name, why, _ = plan([
+        ("怪味饮料+", 420, 420, 40),
+        ("精力饮料", 900, 420, 30),
+    ], stamina=5, weekday=6, bought={"stamina"})
+    assert name is None, (name, why)
 
 
 @case("周六 精力 20：不买精力药，但摇摆专属饮料照买（不是整店不进）")
